@@ -2,8 +2,8 @@
 
 use crate::config::{AppConfig, ModelQuality};
 use crate::processing::{
-    DepthToFlatConfig, EdgeConfig, FeaturePreserveConfig, PaletteConfig, ProcessingConfig,
-    ProcessingState, ProcessingStatus, TransformConfig, ProcessingPipeline,
+    DepthToFlatConfig, EdgeConfig, FeaturePreserveConfig, PaletteConfig,
+    ProcessingState, ProcessingStatus, TransformConfig,
 };
 use crate::ml::{MLAnalysis, MLConfig, MLResults};
 use crate::models::ModelManager;

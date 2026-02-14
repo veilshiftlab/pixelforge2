@@ -74,7 +74,7 @@ pub fn batch_dialog(ui: &mut egui::Ui, _images: &[std::path::PathBuf], _processi
 
     ui.horizontal(|ui| {
         ui.label("Output Folder:");
-        ui.button("Browse...");
+        let _ = ui.button("Browse...");
     });
 
     ui.add_space(16.0);

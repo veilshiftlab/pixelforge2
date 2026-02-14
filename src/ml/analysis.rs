@@ -1,6 +1,6 @@
 //! ML Analysis orchestration
 
-use super::{MLConfig, MLResults, FaceLandmarks, FaceDetectionResult, FaceBounds, SegmentationResult, SegmentationRegion, LandmarkRegion};
+use super::{MLConfig, MLResults, FaceDetectionResult, SegmentationResult};
 use super::{FaceDetector, PlaceholderDetector, DepthEstimator, PlaceholderDepthEstimator, Segmenter, PlaceholderSegmenter};
 use crate::models::ModelManager;
 use anyhow::Result;
