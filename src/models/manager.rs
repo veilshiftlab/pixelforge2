@@ -105,6 +105,34 @@ impl ModelManager {
         available
     }
 
+    /// Get path to a specific model file
+    pub fn get_model_path(&self, model_type: &str) -> Option<PathBuf> {
+        let model_name = match model_type {
+            "face_detection" => match self.loaded_quality {
+                Some(ModelQuality::Minimal) => "yunet_2023.onnx",
+                _ => "mediapipe_face.onnx",
+            },
+            "depth" => match self.loaded_quality {
+                Some(ModelQuality::Minimal) => "midas_small_q8.onnx",
+                Some(ModelQuality::High) | Some(ModelQuality::Sequential) => "dpt_large.onnx",
+                _ => "midas_small.onnx",
+            },
+            "segmentation" => match self.loaded_quality {
+                Some(ModelQuality::Minimal) => "segformer_b0.onnx",
+                Some(ModelQuality::High) | Some(ModelQuality::Sequential) => "sam_vit_b.onnx",
+                _ => "segformer_b2.onnx",
+            },
+            _ => return None,
+        };
+
+        let path = self.models_dir.join(model_name);
+        if path.exists() {
+            Some(path)
+        } else {
+            None
+        }
+    }
+
     /// List required models for each quality level
     pub fn required_models(quality: ModelQuality) -> &'static [&'static str] {
         match quality {

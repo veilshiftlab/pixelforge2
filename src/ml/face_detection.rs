@@ -1,209 +1,186 @@
-//! Face detection implementation using ONNX Runtime
+//! Face detection using ONNX Runtime
 
+use super::{FaceBounds, FaceDetectionResult, FaceLandmarks, LandmarkRegion};
 use anyhow::Result;
-use image::DynamicImage;
-use ndarray::{Array2, Array3, Axis};
-use ort::session::{Session, builder::GraphOptimizationLevel};
-use std::path::Path;
+use image::{DynamicImage, GenericImageView};
+use ort::session::builder::GraphOptimizationLevel;
 
-/// Face detection result
-#[derive(Debug, Clone)]
-pub struct FaceDetectionResult {
-    /// Detected face bounds
-    pub bounds: Option<super::FaceBounds>,
-    
-    /// Facial landmarks
-    pub landmarks: Option<FaceLandmarks>,
-    
-    /// Detection confidence
-    pub confidence: f32,
-}
-
-/// Facial landmarks
-#[derive(Debug, Clone)]
-pub struct FaceLandmarks {
-    /// All landmark points (normalized 0.0-1.0)
-    pub points: Vec<(f32, f32)>,
-    
-    /// Left eye region
-    pub left_eye: Option<LandmarkRegion>,
-    
-    /// Right eye region
-    pub right_eye: Option<LandmarkRegion>,
-    
-    /// Nose region
-    pub nose: Option<LandmarkRegion>,
-    
-    /// Lips region
-    pub lips: Option<LandmarkRegion>,
-    
-    /// Face outline
-    pub face_outline: Vec<(f32, f32)>,
-}
-
-/// A landmark region with bounds
-#[derive(Debug, Clone)]
-pub struct LandmarkRegion {
-    /// Center X (normalized)
-    pub center_x: f32,
-    
-    /// Center Y (normalized)
-    pub center_y: f32,
-    
-    /// Width (normalized)
-    pub width: f32,
-    
-    /// Height (normalized)
-    pub height: f32,
-}
-
-/// Face detector using ONNX
+/// Face detector using ONNX model
 pub struct FaceDetector {
-    session: Session,
+    session: ort::session::Session,
+    input_name: String,
+    output_name: String,
 }
 
 impl FaceDetector {
-    /// Load face detector from model file
-    pub fn load(model_path: &Path) -> Result<Self> {
-        let session = Session::builder()?
+    /// Create a new face detector
+    pub fn new(model_path: &std::path::Path) -> Result<Self> {
+        let session = ort::session::builder::SessionBuilder::new()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_intra_threads(4)?
             .commit_from_file(model_path)?;
-        
-        Ok(Self { session })
+
+        // Get input/output names from model
+        let input_name = session.inputs()[0].name().to_string();
+        let output_name = session.outputs()[0].name().to_string();
+
+        Ok(Self { session, input_name, output_name })
     }
-    
+
     /// Detect faces in an image
-    pub fn detect(&self, image: &DynamicImage) -> Result<FaceDetectionResult> {
-        // Preprocess image for the model
-        let input = self.preprocess(image)?;
-        
-        // Run inference
-        let outputs = self.session.run(ort::inputs![input]?)?;
-        
-        // Parse outputs
-        self.parse_outputs(&outputs, image)
-    }
-    
-    /// Preprocess image for model input
-    fn preprocess(&self, image: &DynamicImage) -> Result<Array3<f32>> {
-        let target_size = 320; // YuNet input size
-        
-        // Resize image
+    pub fn detect(&mut self, image: &DynamicImage) -> Result<FaceDetectionResult> {
+        let (orig_w, orig_h) = image.dimensions();
+
+        // Preprocess
+        let target_size = 160u32;
         let resized = image.resize(target_size, target_size, image::imageops::FilterType::Triangle);
-        let rgb = resized.to_rgb8();
+        let rgba = resized.to_rgba8();
+
+        // Create input tensor as flat vec (NCHW format)
+        let mut input_data = vec![0.0f32; 1 * 3 * target_size as usize * target_size as usize];
         
-        // Convert to CHW format and normalize
-        let mut input = Array3::<f32>::zeros((1, 3, target_size as usize, target_size as usize));
-        
-        for (y, row) in rgb.enumerate_rows() {
-            for (x, pixel) in row.enumerate() {
-                let values = pixel.2;
-                input[[0, 0, y as usize, x as usize]] = values[0] as f32 / 255.0;
-                input[[0, 1, y as usize, x as usize]] = values[1] as f32 / 255.0;
-                input[[0, 2, y as usize, x as usize]] = values[2] as f32 / 255.0;
+        for y in 0..target_size as usize {
+            for x in 0..target_size as usize {
+                let pixel = rgba.get_pixel(x as u32, y as u32);
+                let values = pixel.0;
+                let base_idx = y * target_size as usize + x;
+                // Channel 0
+                input_data[base_idx] = values[0] as f32 / 255.0;
+                // Channel 1
+                input_data[target_size as usize * target_size as usize + base_idx] = values[1] as f32 / 255.0;
+                // Channel 2
+                input_data[2 * target_size as usize * target_size as usize + base_idx] = values[2] as f32 / 255.0;
             }
         }
+
+        // Create input value
+        let input_tensor = ort::value::Value::from_array((
+            [1, 3, target_size as i64, target_size as i64],
+            input_data.clone(),
+        ))?;
+
+        // Run inference
+        let outputs = self.session.run(ort::inputs![
+            &self.input_name => input_tensor
+        ])?;
+
+        // Get output
+        let output = outputs.get(&self.output_name)
+            .ok_or_else(|| anyhow::anyhow!("No output from model"))?;
+
+        // Extract tensor data
+        let (shape, data) = output.try_extract_tensor::<f32>()?;
         
-        Ok(input)
-    }
-    
-    /// Parse model outputs
-    fn parse_outputs(
-        &self,
-        outputs: &ort::SessionOutputs,
-        original_image: &DynamicImage,
-    ) -> Result<FaceDetectionResult> {
-        // This is a simplified implementation
-        // In reality, you'd parse the specific output format of YuNet or whatever model you use
-        
-        let (orig_w, orig_h) = original_image.dimensions();
-        
-        // Placeholder: return a centered face for demo purposes
-        let face_bounds = super::FaceBounds {
-            x: 0.25,
-            y: 0.15,
-            width: 0.5,
-            height: 0.6,
-        };
-        
-        // Generate placeholder landmarks
-        let landmarks = FaceLandmarks {
-            points: generate_placeholder_landmarks(),
-            left_eye: Some(LandmarkRegion {
-                center_x: 0.35,
-                center_y: 0.35,
-                width: 0.1,
-                height: 0.05,
-            }),
-            right_eye: Some(LandmarkRegion {
-                center_x: 0.65,
-                center_y: 0.35,
-                width: 0.1,
-                height: 0.05,
-            }),
-            nose: Some(LandmarkRegion {
-                center_x: 0.5,
-                center_y: 0.5,
-                width: 0.08,
-                height: 0.1,
-            }),
-            lips: Some(LandmarkRegion {
-                center_x: 0.5,
-                center_y: 0.7,
-                width: 0.15,
-                height: 0.05,
-            }),
-            face_outline: vec![],
-        };
-        
+        // Parse detections - shape is typically [batch, num_detections, detection_data]
+        let num_detections = if shape.len() >= 2 { shape[1] as usize } else { 0 };
+
+        let mut best_detection: Option<(f32, f32, f32, f32, f32)> = None;
+        let mut best_confidence = 0.0f32;
+
+        for i in 0..num_detections {
+            let base = i * 15; // Each detection has multiple values
+            if base + 4 < data.len() {
+                let confidence = data[base + 4];
+                if confidence > best_confidence && confidence > 0.5 {
+                    best_confidence = confidence;
+                    let x1 = data[base];
+                    let y1 = data[base + 1];
+                    let x2 = data[base + 2];
+                    let y2 = data[base + 3];
+                    best_detection = Some((x1, y1, x2, y2, confidence));
+                }
+            }
+        }
+
+        // Convert to original image coordinates
+        let face_bounds = best_detection.map(|(x1, y1, x2, y2, _conf)| {
+            FaceBounds {
+                x: x1 / orig_w as f32,
+                y: y1 / orig_h as f32,
+                width: (x2 - x1) / orig_w as f32,
+                height: (y2 - y1) / orig_h as f32,
+            }
+        });
+
+        let landmarks = face_bounds.as_ref().map(|bounds| {
+            generate_landmarks_from_bounds(bounds)
+        });
+
         Ok(FaceDetectionResult {
-            bounds: Some(face_bounds),
-            landmarks: Some(landmarks),
-            confidence: 0.95,
+            bounds: face_bounds,
+            landmarks,
+            confidence: best_confidence,
         })
     }
 }
 
-/// Generate placeholder landmarks for demo
-fn generate_placeholder_landmarks() -> Vec<(f32, f32)> {
-    // 68-point landmark template (dlib-style)
-    vec![
-        // Jaw line (0-16)
-        (0.15, 0.45), (0.17, 0.55), (0.20, 0.63), (0.24, 0.70),
-        (0.29, 0.76), (0.35, 0.82), (0.42, 0.86), (0.50, 0.88),
-        (0.58, 0.86), (0.65, 0.82), (0.71, 0.76), (0.76, 0.70),
-        (0.80, 0.63), (0.83, 0.55), (0.85, 0.45),
-        
-        // Left eyebrow (17-21)
-        (0.25, 0.30), (0.28, 0.27), (0.33, 0.26), (0.38, 0.27), (0.42, 0.30),
-        
-        // Right eyebrow (22-26)
-        (0.58, 0.30), (0.62, 0.27), (0.67, 0.26), (0.72, 0.27), (0.75, 0.30),
-        
-        // Nose bridge (27-30)
-        (0.50, 0.35), (0.50, 0.42), (0.50, 0.48), (0.50, 0.54),
-        
-        // Nose bottom (31-35)
-        (0.44, 0.55), (0.47, 0.56), (0.50, 0.57), (0.53, 0.56), (0.56, 0.55),
-        
-        // Left eye (36-41)
-        (0.30, 0.35), (0.33, 0.33), (0.37, 0.33), (0.40, 0.35),
-        (0.37, 0.37), (0.33, 0.37),
-        
-        // Right eye (42-47)
-        (0.60, 0.35), (0.63, 0.33), (0.67, 0.33), (0.70, 0.35),
-        (0.67, 0.37), (0.63, 0.37),
-        
-        // Outer lips (48-59)
-        (0.40, 0.68), (0.44, 0.66), (0.48, 0.65), (0.50, 0.66),
-        (0.52, 0.65), (0.56, 0.66), (0.60, 0.68),
-        (0.56, 0.72), (0.52, 0.74), (0.50, 0.75),
-        (0.48, 0.74), (0.44, 0.72),
-        
-        // Inner lips (60-67)
-        (0.44, 0.68), (0.48, 0.67), (0.50, 0.68),
-        (0.52, 0.67), (0.56, 0.68),
-        (0.52, 0.70), (0.50, 0.71), (0.48, 0.70),
-    ]
+/// Generate approximate landmarks from face bounds
+fn generate_landmarks_from_bounds(bounds: &FaceBounds) -> FaceLandmarks {
+    let cx = bounds.x + bounds.width / 2.0;
+    let cy = bounds.y + bounds.height / 2.0;
+    let w = bounds.width;
+    let h = bounds.height;
+
+    FaceLandmarks {
+        points: vec![
+            (cx - w * 0.15, cy - h * 0.1),
+            (cx - w * 0.1, cy - h * 0.12),
+            (cx - w * 0.05, cy - h * 0.1),
+            (cx + w * 0.05, cy - h * 0.1),
+            (cx + w * 0.1, cy - h * 0.12),
+            (cx + w * 0.15, cy - h * 0.1),
+            (cx, cy + h * 0.05),
+            (cx - w * 0.08, cy + h * 0.2),
+            (cx, cy + h * 0.18),
+            (cx + w * 0.08, cy + h * 0.2),
+        ],
+        left_eye: Some(LandmarkRegion {
+            center_x: cx - w * 0.1,
+            center_y: cy - h * 0.1,
+            width: w * 0.1,
+            height: h * 0.05,
+        }),
+        right_eye: Some(LandmarkRegion {
+            center_x: cx + w * 0.1,
+            center_y: cy - h * 0.1,
+            width: w * 0.1,
+            height: h * 0.05,
+        }),
+        nose: Some(LandmarkRegion {
+            center_x: cx,
+            center_y: cy + h * 0.05,
+            width: w * 0.08,
+            height: h * 0.1,
+        }),
+        lips: Some(LandmarkRegion {
+            center_x: cx,
+            center_y: cy + h * 0.2,
+            width: w * 0.15,
+            height: h * 0.05,
+        }),
+        face_outline: vec![],
+    }
+}
+
+/// Placeholder detector for when models aren't available
+pub struct PlaceholderDetector;
+
+impl PlaceholderDetector {
+    pub fn detect(&self, image: &DynamicImage) -> Result<FaceDetectionResult> {
+        let (width, height) = image.dimensions();
+        let _ = (width, height);
+
+        Ok(FaceDetectionResult {
+            bounds: Some(FaceBounds {
+                x: 0.25,
+                y: 0.15,
+                width: 0.5,
+                height: 0.6,
+            }),
+            landmarks: Some(generate_landmarks_from_bounds(
+                &FaceBounds { x: 0.25, y: 0.15, width: 0.5, height: 0.6 },
+            )),
+            confidence: 0.95,
+        })
+    }
 }

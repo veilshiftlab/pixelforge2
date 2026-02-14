@@ -3,28 +3,32 @@
 use super::{SegmentationRegion, SegmentationResult};
 use anyhow::Result;
 use image::{DynamicImage, GenericImageView};
-use ndarray::Array4;
+use ort::session::builder::GraphOptimizationLevel;
 use std::collections::HashMap;
 
 /// Semantic segmenter using ONNX model
 pub struct Segmenter {
-    #[allow(dead_code)]
     session: ort::session::Session,
+    input_name: String,
+    output_name: String,
 }
 
 impl Segmenter {
     /// Create a new segmenter
     pub fn new(model_path: &std::path::Path) -> Result<Self> {
-        let session = ort::session::SessionBuilder::new()?
-            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
+        let session = ort::session::builder::SessionBuilder::new()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_intra_threads(4)?
             .commit_from_file(model_path)?;
 
-        Ok(Self { session })
+        let input_name = session.inputs()[0].name().to_string();
+        let output_name = session.outputs()[0].name().to_string();
+
+        Ok(Self { session, input_name, output_name })
     }
 
     /// Segment an image into semantic regions
-    pub fn segment(&self, image: &DynamicImage) -> Result<SegmentationResult> {
+    pub fn segment(&mut self, image: &DynamicImage) -> Result<SegmentationResult> {
         let (orig_w, orig_h) = image.dimensions();
 
         // SegFormer typically expects 512x512
@@ -32,43 +36,49 @@ impl Segmenter {
         let resized = image.resize(size, size, image::imageops::FilterType::Triangle);
         let rgba = resized.to_rgba8();
 
-        // Create input tensor (NCHW format)
-        let mut input = Array4::<f32>::zeros((1, 3, size as usize, size as usize));
-
+        // Create input tensor as flat vec (NCHW format)
+        let mut input_data = vec![0.0f32; 1 * 3 * size as usize * size as usize];
+        
         for y in 0..size as usize {
             for x in 0..size as usize {
                 let pixel = rgba.get_pixel(x as u32, y as u32);
                 let values = pixel.0;
+                let base_idx = y * size as usize + x;
                 // Normalize using ImageNet mean/std
-                input[[0, 0, y, x]] = (values[0] as f32 / 255.0 - 0.485) / 0.229;
-                input[[0, 1, y, x]] = (values[1] as f32 / 255.0 - 0.456) / 0.224;
-                input[[0, 2, y, x]] = (values[2] as f32 / 255.0 - 0.406) / 0.225;
+                input_data[base_idx] = (values[0] as f32 / 255.0 - 0.485) / 0.229;
+                input_data[size as usize * size as usize + base_idx] = (values[1] as f32 / 255.0 - 0.456) / 0.224;
+                input_data[2 * size as usize * size as usize + base_idx] = (values[2] as f32 / 255.0 - 0.406) / 0.225;
             }
         }
 
-        // Run inference using ort 2.0 API
-        let input_values = vec![ort::value::Value::from_array(input)?];
-        let outputs = self.session.run(input_values)?;
+        // Create input value
+        let input_tensor = ort::value::Value::from_array((
+            [1i64, 3, size as i64, size as i64],
+            input_data,
+        ))?;
+
+        // Run inference
+        let outputs = self.session.run(ort::inputs![
+            &self.input_name => input_tensor
+        ])?;
 
         // Get output
-        let output = outputs.get(0)
+        let output = outputs.get(&self.output_name)
             .ok_or_else(|| anyhow::anyhow!("No output from model"))?;
 
-        let view = output.try_extract_tensor::<f32>()?;
-        let seg_data = view.view();
+        // Extract tensor data
+        let (shape, seg_data) = output.try_extract_tensor::<f32>()?;
 
-        // Parse segmentation output
-        // Usually [1, num_classes, H, W] or [1, H, W]
-        let shape = seg_data.shape();
+        // Parse segmentation output - usually [1, num_classes, H, W] or [1, H, W]
         let (seg_h, seg_w) = match shape.len() {
-            4 => (shape[2], shape[3]),
-            3 => (shape[1], shape[2]),
+            4 => (shape[2] as usize, shape[3] as usize),
+            3 => (shape[1] as usize, shape[2] as usize),
             _ => (size as usize, size as usize),
         };
 
         let num_classes = match shape.len() {
-            4 => shape[1],
-            _ => 20, // Default for face parsing
+            4 => shape[1] as usize,
+            _ => 20,
         };
 
         let mut regions = HashMap::new();
@@ -77,7 +87,6 @@ impl Segmenter {
 
         for orig_y in 0..orig_h as usize {
             for orig_x in 0..orig_w as usize {
-                // Map to segmentation map coordinates
                 let seg_y = (orig_y * seg_h / orig_h as usize).min(seg_h - 1);
                 let seg_x = (orig_x * seg_w / orig_w as usize).min(seg_w - 1);
 
@@ -86,13 +95,13 @@ impl Segmenter {
                 let mut best_prob = 0.0f32;
 
                 for c in 0..num_classes {
-                    let idx: [usize; 4] = [0, c, seg_y, seg_x];
-                    let prob = if c < shape.get(1).copied().unwrap_or(1) {
-                        seg_data[&idx]
+                    let idx = if shape.len() == 4 {
+                        c * seg_h * seg_w + seg_y * seg_w + seg_x
                     } else {
-                        0.0
+                        seg_y * seg_w + seg_x
                     };
-
+                    
+                    let prob = if idx < seg_data.len() { seg_data[idx] } else { 0.0 };
                     if prob > best_prob {
                         best_prob = prob;
                         best_class = c;
@@ -102,7 +111,7 @@ impl Segmenter {
                 let idx = (orig_y * orig_w as usize + orig_x) as u32;
                 let region = map_class_to_region(best_class);
                 regions.insert(idx, region);
-                confidence[(orig_y * orig_w as usize + orig_x)] = best_prob;
+                confidence[orig_y * orig_w as usize + orig_x] = best_prob;
 
                 // Update region bounds
                 let entry = region_bounds.entry(region).or_insert((
@@ -128,14 +137,12 @@ impl Segmenter {
 
 /// Map semantic class ID to region type
 fn map_class_to_region(class_id: usize) -> SegmentationRegion {
-    // Face parsing classes (typical BiSeNet format)
     match class_id {
         0 => SegmentationRegion::Background,
-        1..=2 => SegmentationRegion::Face,    // skin
-        3..=8 => SegmentationRegion::Eyes,    // eyebrows, eyes
-        9..=10 => SegmentationRegion::Eyes,   // eyes
-        11..=14 => SegmentationRegion::Nose,  // nose
-        15..=16 => SegmentationRegion::Lips,  // lips, mouth
+        1..=2 => SegmentationRegion::Face,
+        3..=10 => SegmentationRegion::Eyes,
+        11..=14 => SegmentationRegion::Nose,
+        15..=16 => SegmentationRegion::Lips,
         17 => SegmentationRegion::Hair,
         18 => SegmentationRegion::Ears,
         19 => SegmentationRegion::Neck,
@@ -152,7 +159,6 @@ impl PlaceholderSegmenter {
         let (width, height) = image.dimensions();
         let mut regions = HashMap::new();
 
-        // Simple segmentation based on position
         let face_y_start = (height as f32 * 0.15) as u32;
         let face_y_end = (height as f32 * 0.75) as u32;
         let face_x_start = (width as f32 * 0.25) as u32;
@@ -162,37 +168,28 @@ impl PlaceholderSegmenter {
             for x in 0..width {
                 let idx = (y * width + x) as u32;
 
-                let region = if y >= face_y_start && y <= face_y_end && x >= face_x_start && x <= face_x_end {
-                    // Within face region
+                let region = if y >= face_y_start && y <= face_y_end 
+                    && x >= face_x_start && x <= face_x_end 
+                {
                     let rel_y = (y - face_y_start) as f32 / (face_y_end - face_y_start).max(1) as f32;
                     let rel_x = (x - face_x_start) as f32 / (face_x_end - face_x_start).max(1) as f32;
 
-                    // Eye region (upper part)
                     if rel_y > 0.25 && rel_y < 0.4 {
-                        if rel_x > 0.2 && rel_x < 0.4 {
-                            SegmentationRegion::Eyes
-                        } else if rel_x > 0.6 && rel_x < 0.8 {
+                        if (rel_x > 0.2 && rel_x < 0.4) || (rel_x > 0.6 && rel_x < 0.8) {
                             SegmentationRegion::Eyes
                         } else {
                             SegmentationRegion::Face
                         }
-                    }
-                    // Nose region (middle)
-                    else if rel_y > 0.4 && rel_y < 0.6 && rel_x > 0.35 && rel_x < 0.65 {
+                    } else if rel_y > 0.4 && rel_y < 0.6 && rel_x > 0.35 && rel_x < 0.65 {
                         SegmentationRegion::Nose
-                    }
-                    // Lips region (lower middle)
-                    else if rel_y > 0.65 && rel_y < 0.8 && rel_x > 0.3 && rel_x < 0.7 {
+                    } else if rel_y > 0.65 && rel_y < 0.8 && rel_x > 0.3 && rel_x < 0.7 {
                         SegmentationRegion::Lips
-                    }
-                    else {
+                    } else {
                         SegmentationRegion::Face
                     }
                 } else if y < face_y_start {
-                    // Hair region (top)
                     SegmentationRegion::Hair
                 } else {
-                    // Background
                     SegmentationRegion::Background
                 };
 
