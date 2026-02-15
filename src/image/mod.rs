@@ -4,5 +4,5 @@ mod loader;
 mod transform;
 mod export;
 
-// Only export what's actually used elsewhere
 pub use transform::ImageTransform;
+pub use export::{ImageExporter, ExportConfig};

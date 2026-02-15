@@ -2,6 +2,15 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Downsampling method
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DownsamplingMethod {
+    #[default]
+    Weighted,       // Content-aware weighted downsampling
+    NearestNeighbor, // Simple nearest-neighbor
+    Bilinear,       // Bilinear interpolation
+}
+
 /// Transform configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransformConfig {
@@ -28,6 +37,9 @@ pub struct TransformConfig {
 
     /// Export scale multiplier
     pub export_scale: u32,
+
+    /// Downsampling method
+    pub downsampling_method: DownsamplingMethod,
 }
 
 impl Default for TransformConfig {
@@ -41,6 +53,7 @@ impl Default for TransformConfig {
             clip_to_face: false,
             clip_padding: 0.2,
             export_scale: 1,
+            downsampling_method: DownsamplingMethod::Weighted,
         }
     }
 }

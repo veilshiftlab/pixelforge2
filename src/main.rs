@@ -10,8 +10,6 @@ mod ml;
 mod models;
 mod preset;
 mod processing;
-mod ui;
-
 use eframe::egui;
 
 fn main() {

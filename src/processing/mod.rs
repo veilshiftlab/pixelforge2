@@ -9,7 +9,6 @@ mod edges;
 mod palette;
 
 pub use config::*;
-pub use pipeline::*;
 pub use depth_to_flat::*;
 pub use downsampling::*;
 pub use feature_preserve::*;

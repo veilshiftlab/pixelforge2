@@ -10,6 +10,9 @@ pub struct AppConfig {
     /// Model quality setting
     pub model_quality: ModelQuality,
 
+    /// Use sequential processing (for low VRAM)
+    pub sequential_processing: bool,
+
     /// UI preferences
     pub ui: UiConfig,
 
@@ -18,6 +21,9 @@ pub struct AppConfig {
 
     /// Last used directories
     pub directories: DirectoryConfig,
+
+    /// Model management
+    pub models: ModelConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -26,7 +32,42 @@ pub enum ModelQuality {
     Minimal,
     Standard,
     High,
-    Sequential,
+}
+
+impl ModelQuality {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ModelQuality::Minimal => "minimal",
+            ModelQuality::Standard => "standard",
+            ModelQuality::High => "high",
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            ModelQuality::Minimal => "Minimal (Fast)",
+            ModelQuality::Standard => "Standard",
+            ModelQuality::High => "High Quality",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelConfig {
+    /// Auto-download missing models
+    pub auto_download: bool,
+
+    /// Check for model updates on startup
+    pub check_updates: bool,
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            auto_download: true,
+            check_updates: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,9 +160,11 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             model_quality: ModelQuality::default(),
+            sequential_processing: false,
             ui: UiConfig::default(),
             processing: ProcessingDefaults::default(),
             directories: DirectoryConfig::default(),
+            models: ModelConfig::default(),
         }
     }
 }

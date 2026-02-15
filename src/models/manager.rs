@@ -1,8 +1,11 @@
 //! Model manager for loading and managing ML models
 
 use crate::config::{AppConfig, ModelQuality};
+use crate::models::{ModelDownloader, AsyncDownloader};
 use anyhow::Result;
 use std::path::PathBuf;
+use std::sync::Arc;
+use parking_lot::RwLock;
 
 /// Model manager
 pub struct ModelManager {
@@ -14,6 +17,24 @@ pub struct ModelManager {
     
     /// Whether models are available
     models_available: bool,
+
+    /// Model downloader
+    downloader: Option<AsyncDownloader>,
+
+    /// Sequential processing mode (for low VRAM)
+    sequential_mode: bool,
+
+    /// Download progress
+    download_progress: Arc<RwLock<DownloadProgress>>,
+}
+
+/// Download progress tracking
+#[derive(Debug, Clone, Default)]
+pub struct DownloadProgress {
+    pub current_model: String,
+    pub progress: f32,
+    pub is_downloading: bool,
+    pub last_error: Option<String>,
 }
 
 impl ModelManager {
@@ -22,10 +43,15 @@ impl ModelManager {
         let models_dir = Self::get_models_dir();
         let models_available = models_dir.exists();
         
+        let downloader = AsyncDownloader::new(&models_dir).ok();
+
         Ok(Self {
             loaded_quality: None,
             models_dir,
             models_available,
+            downloader,
+            sequential_mode: false,
+            download_progress: Arc::new(RwLock::new(DownloadProgress::default())),
         })
     }
 
@@ -50,9 +76,20 @@ impl ModelManager {
 
     /// Set model quality
     pub fn set_quality(&mut self, quality: ModelQuality) -> Result<()> {
-        // In a real implementation, this would load/unload models
         self.loaded_quality = Some(quality);
+        log::info!("Model quality set to: {:?}", quality);
         Ok(())
+    }
+
+    /// Set sequential processing mode
+    pub fn set_sequential_mode(&mut self, enabled: bool) {
+        self.sequential_mode = enabled;
+        log::info!("Sequential processing: {}", enabled);
+    }
+
+    /// Check if sequential mode is enabled
+    pub fn is_sequential(&self) -> bool {
+        self.sequential_mode
     }
 
     /// Check if models are loaded
@@ -68,9 +105,23 @@ impl ModelManager {
     /// Get estimated VRAM usage
     pub fn estimated_vram_usage(&self) -> u64 {
         match self.loaded_quality {
-            Some(ModelQuality::High) => 2 * 1024 * 1024 * 1024, // 2GB
-            Some(ModelQuality::Standard) => 512 * 1024 * 1024, // 512MB
-            Some(ModelQuality::Minimal) | Some(ModelQuality::Sequential) => 256 * 1024 * 1024, // 256MB
+            Some(ModelQuality::High) => {
+                if self.sequential_mode {
+                    512 * 1024 * 1024 // 512MB when sequential
+                } else {
+                    2 * 1024 * 1024 * 1024 // 2GB
+                }
+            }
+            Some(ModelQuality::Standard) => {
+                if self.sequential_mode {
+                    256 * 1024 * 1024 // 256MB
+                } else {
+                    512 * 1024 * 1024 // 512MB
+                }
+            }
+            Some(ModelQuality::Minimal) => {
+                128 * 1024 * 1024 // 128MB
+            }
             None => 0,
         }
     }
@@ -107,68 +158,129 @@ impl ModelManager {
 
     /// Get path to a specific model file
     pub fn get_model_path(&self, model_type: &str) -> Option<PathBuf> {
-        let model_name = match model_type {
-            "face_detection" => match self.loaded_quality {
-                Some(ModelQuality::Minimal) => "yunet_2023.onnx",
-                _ => "mediapipe_face.onnx",
-            },
-            "depth" => match self.loaded_quality {
-                Some(ModelQuality::Minimal) => "midas_small_q8.onnx",
-                Some(ModelQuality::High) | Some(ModelQuality::Sequential) => "dpt_large.onnx",
-                _ => "midas_small.onnx",
-            },
-            "segmentation" => match self.loaded_quality {
-                Some(ModelQuality::Minimal) => "segformer_b0.onnx",
-                Some(ModelQuality::High) | Some(ModelQuality::Sequential) => "sam_vit_b.onnx",
-                _ => "segformer_b2.onnx",
-            },
-            _ => return None,
-        };
+        let quality = self.loaded_quality?;
+        let quality_str = quality.as_str();
 
-        let path = self.models_dir.join(model_name);
-        if path.exists() {
-            Some(path)
-        } else {
-            None
+        if let Some(info) = ModelDownloader::get_model_info(model_type, quality_str) {
+            let path = self.models_dir.join(&info.filename);
+            if path.exists() {
+                return Some(path);
+            }
         }
+
+        None
     }
 
-    /// List required models for each quality level
-    pub fn required_models(quality: ModelQuality) -> &'static [&'static str] {
-        match quality {
-            ModelQuality::Minimal => &[
-                "yunet_2023.onnx",
-                "midas_small_q8.onnx",
-                "segformer_b0.onnx",
-            ],
-            ModelQuality::Standard => &[
-                "mediapipe_face.onnx",
-                "midas_small.onnx",
-                "segformer_b2.onnx",
-            ],
-            ModelQuality::High => &[
-                "mediapipe_face.onnx",
-                "dpt_large.onnx",
-                "sam_vit_b.onnx",
-            ],
-            ModelQuality::Sequential => &[
-                "mediapipe_face.onnx",
-                "dpt_large.onnx",
-                "sam_vit_b.onnx",
-            ],
-        }
+    /// List required models for current quality
+    pub fn list_required_models(&self) -> Vec<ModelStatus> {
+        let quality = self.loaded_quality.unwrap_or(ModelQuality::Minimal);
+        let quality_str = quality.as_str();
+
+        let required = ModelDownloader::get_required_models(quality_str);
+        
+        required
+            .into_iter()
+            .map(|(model_type, info)| {
+                let path = self.models_dir.join(&info.filename);
+                ModelStatus {
+                    model_type: model_type.to_string(),
+                    name: info.name,
+                    filename: info.filename,
+                    downloaded: path.exists(),
+                    size_mb: info.size_mb,
+                    description: info.description,
+                }
+            })
+            .collect()
     }
 
-    /// Download a model (placeholder - would use reqwest in production)
-    pub fn download_model(&self, model_name: &str) -> Result<()> {
-        log::info!("Would download model: {}", model_name);
-        // In production, this would:
-        // 1. Check if model already exists
-        // 2. Download from remote URL
-        // 3. Verify checksum
-        // 4. Save to models directory
+    /// Get missing models for current quality
+    pub fn get_missing_models(&self) -> Vec<ModelStatus> {
+        self.list_required_models()
+            .into_iter()
+            .filter(|m| !m.downloaded)
+            .collect()
+    }
+
+    /// Download missing models
+    pub fn download_missing_models(&self) -> Result<()> {
+        if let Some(ref downloader) = self.downloader {
+            let quality = self.loaded_quality.unwrap_or(ModelQuality::Minimal);
+            
+            // Set up progress callback
+            let progress = self.download_progress.clone();
+            downloader.set_progress_callback(move |name, prog| {
+                let mut p = progress.write();
+                p.current_model = name.to_string();
+                p.progress = prog;
+                p.is_downloading = prog < 1.0;
+            });
+
+            // Download
+            {
+                let mut p = self.download_progress.write();
+                p.is_downloading = true;
+                p.last_error = None;
+            }
+
+            let result = downloader.download_all(quality.as_str());
+
+            {
+                let mut p = self.download_progress.write();
+                p.is_downloading = false;
+                if let Err(ref e) = result {
+                    p.last_error = Some(e.to_string());
+                }
+            }
+
+            result?;
+        }
+
         Ok(())
     }
+    
+    /// Set HuggingFace token for downloads
+    pub fn set_huggingface_token(&self, token: String) {
+        if let Some(ref downloader) = self.downloader {
+            downloader.set_huggingface_token(token);
+        }
+    }
+
+    /// Download a specific model
+    pub fn download_model(&self, model_type: &str) -> Result<PathBuf> {
+        if let Some(ref downloader) = self.downloader {
+            let quality = self.loaded_quality.unwrap_or(ModelQuality::Minimal);
+            return downloader.download_model(model_type, quality.as_str());
+        }
+
+        Err(anyhow::anyhow!("Downloader not available"))
+    }
+
+    /// Get download progress
+    pub fn get_download_progress(&self) -> DownloadProgress {
+        self.download_progress.read().clone()
+    }
+
+    /// Get total download size for a quality level
+    pub fn get_download_size(quality: ModelQuality) -> f64 {
+        ModelDownloader::get_total_download_size(quality.as_str())
+    }
+
+    /// Check if all required models are downloaded
+    pub fn all_models_downloaded(&self) -> bool {
+        self.get_missing_models().is_empty()
+    }
+}
+
+/// Status of a model
+#[derive(Debug, Clone)]
+pub struct ModelStatus {
+    pub model_type: String,
+    pub name: String,
+    pub filename: String,
+    pub downloaded: bool,
+    pub size_mb: f64,
+    pub description: String,
 }
 
 impl Default for ModelManager {
@@ -177,6 +289,9 @@ impl Default for ModelManager {
             loaded_quality: None,
             models_dir: std::path::PathBuf::from("models"),
             models_available: false,
+            downloader: None,
+            sequential_mode: false,
+            download_progress: Arc::new(RwLock::new(DownloadProgress::default())),
         })
     }
 }

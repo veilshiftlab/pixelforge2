@@ -74,6 +74,7 @@ impl Preset {
                     clip_to_face: false,
                     clip_padding: 0.2,
                     export_scale: 1,
+                    downsampling_method: crate::processing::DownsamplingMethod::Weighted,
                 },
                 depth_to_flat: DepthToFlatConfig {
                     skin_tone_bands: 3,
@@ -122,6 +123,7 @@ impl Preset {
                     clip_to_face: false,
                     clip_padding: 0.2,
                     export_scale: 1,
+                    downsampling_method: crate::processing::DownsamplingMethod::Weighted,
                 },
                 depth_to_flat: DepthToFlatConfig {
                     skin_tone_bands: 5,
@@ -170,6 +172,7 @@ impl Preset {
                     clip_to_face: false,
                     clip_padding: 0.2,
                     export_scale: 2,
+                    downsampling_method: crate::processing::DownsamplingMethod::NearestNeighbor,
                 },
                 depth_to_flat: DepthToFlatConfig {
                     skin_tone_bands: 2,
