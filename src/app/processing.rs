@@ -4,7 +4,7 @@ use super::state::{PixelForgeApp, AspectRatioMode, OutputImage};
 use crate::image::{ImageTransform, ImageExporter, ExportConfig};
 use crate::processing::{
     depth_to_flat, weighted_downsample, bilinear_downsample, nearest_neighbor_downsample,
-    compute_importance_map, preserve_features, draw_edges, generate_palette, apply_palette, 
+    compute_combined_importance_map, preserve_features, draw_edges, generate_palette, apply_palette, 
     apply_palette_with_regions, Palette,
     ProcessingState, ProcessingStatus, DownsamplingMethod,
 };
@@ -136,13 +136,9 @@ pub fn load_preset(app: &mut PixelForgeApp) {
 }
 
 /// Update model settings
-pub fn update_model_settings(app: &mut PixelForgeApp) {
-    let mut manager = app.model_manager.write();
-    if let Err(e) = manager.set_quality(app.config.model_quality) {
-        log::error!("Failed to set model quality: {}", e);
-    }
-    manager.set_sequential_mode(app.config.sequential_processing);
-    app.vram_usage = manager.estimated_vram_usage() / (1024 * 1024);
+pub fn update_model_settings(_app: &mut PixelForgeApp) {
+    // Models are now fixed - no quality settings to update
+    // VRAM estimation is now a static value
 }
 
 /// Get output dimensions based on aspect mode
@@ -199,8 +195,8 @@ pub fn run_ml_analysis(app: &mut PixelForgeApp, ctx: &egui::Context) {
             app.ml_results = Some(results);
             app.processing = ProcessingState::Complete;
             
-            let manager = app.model_manager.read();
-            app.vram_usage = manager.estimated_vram_usage() / (1024 * 1024);
+            // VRAM is fixed for the 3 models (~800MB peak during depth estimation)
+            app.vram_usage = crate::models::ModelManager::estimated_vram_usage() / (1024 * 1024);
         }
         Err(e) => {
             log::error!("ML analysis failed: {}", e);
@@ -241,6 +237,7 @@ fn run_full_pipeline(app: &mut PixelForgeApp, ctx: &egui::Context) {
 
     let mut current = input.clone();
     
+    // Apply scale transform
     if app.transform_config.scale != 1.0 {
         let new_w = (current.width() as f32 * app.transform_config.scale) as u32;
         let new_h = (current.height() as f32 * app.transform_config.scale) as u32;
@@ -249,15 +246,40 @@ fn run_full_pipeline(app: &mut PixelForgeApp, ctx: &egui::Context) {
         }
     }
 
+    // Apply rotation
     if app.transform_config.rotation != 0.0 {
         current = ImageTransform::rotate(&current, app.transform_config.rotation).unwrap_or(current);
     }
 
+    // Apply offset
     if app.transform_config.offset_x != 0.0 || app.transform_config.offset_y != 0.0 {
         current = ImageTransform::offset(&current, 
             app.transform_config.offset_x, 
             app.transform_config.offset_y
         ).unwrap_or(current);
+    }
+
+    // Apply flips
+    if app.transform_config.flip_horizontal {
+        current = ImageTransform::flip_horizontal(&current);
+    }
+    if app.transform_config.flip_vertical {
+        current = ImageTransform::flip_vertical(&current);
+    }
+
+    // Clip to face region if enabled
+    if app.transform_config.clip_to_face {
+        if let Some(ref ml) = app.ml_results {
+            if let Some(ref bounds) = ml.face_bounds {
+                let padding = app.transform_config.clip_padding;
+                let x = (bounds.x - bounds.width * padding / 2.0).max(0.0);
+                let y = (bounds.y - bounds.height * padding / 2.0).max(0.0);
+                let w = bounds.width * (1.0 + padding);
+                let h = bounds.height * (1.0 + padding);
+                
+                current = ImageTransform::clip(&current, x, y, w, h).unwrap_or(current);
+            }
+        }
     }
 
     app.preprocessed_image = Some(current.clone());
@@ -280,15 +302,14 @@ fn run_full_pipeline(app: &mut PixelForgeApp, ctx: &egui::Context) {
 
     app.flat_color_image = Some(flat_color.clone());
 
-    // Stage 3: Importance map
+    // Stage 3: Importance map (now includes edge detection)
     app.processing = ProcessingState::Running(ProcessingStatus {
         progress: 0.4,
         stage: "Computing importance map...".to_string(),
     });
     ctx.request_repaint();
 
-    let (prep_w, prep_h) = flat_color.dimensions();
-    let importance = compute_importance_map(prep_w, prep_h, app.ml_results.as_ref());
+    let importance = compute_combined_importance_map(&flat_color, app.ml_results.as_ref());
 
     // Stage 4: Downsampling
     app.processing = ProcessingState::Running(ProcessingStatus {

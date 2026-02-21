@@ -48,9 +48,8 @@ impl MLAnalysis {
 fn run_face_detection(image: &DynamicImage, model_manager: &Arc<RwLock<ModelManager>>) -> Result<FaceDetectionResult> {
     let manager = model_manager.read();
     
-    // Try to get the face detection model path
-    if let Some(model_path) = manager.get_model_path("face_detection") {
-        drop(manager); // Release lock before creating detector
+    if let Some(model_path) = manager.get_model_path("yolov8n-face") {
+        drop(manager);
         let mut detector = FaceDetector::new(&model_path)?;
         detector.detect(image)
     } else {
@@ -64,7 +63,7 @@ fn run_face_detection(image: &DynamicImage, model_manager: &Arc<RwLock<ModelMana
 fn run_depth_estimation(image: &DynamicImage, model_manager: &Arc<RwLock<ModelManager>>) -> Result<Vec<f32>> {
     let manager = model_manager.read();
     
-    if let Some(model_path) = manager.get_model_path("depth") {
+    if let Some(model_path) = manager.get_model_path("depth-anything-v2") {
         drop(manager);
         let mut estimator = DepthEstimator::new(&model_path)?;
         estimator.estimate(image)
@@ -79,7 +78,7 @@ fn run_depth_estimation(image: &DynamicImage, model_manager: &Arc<RwLock<ModelMa
 fn run_segmentation(image: &DynamicImage, model_manager: &Arc<RwLock<ModelManager>>) -> Result<SegmentationResult> {
     let manager = model_manager.read();
     
-    if let Some(model_path) = manager.get_model_path("segmentation") {
+    if let Some(model_path) = manager.get_model_path("bisenet") {
         drop(manager);
         let mut segmenter = Segmenter::new(&model_path)?;
         segmenter.segment(image)

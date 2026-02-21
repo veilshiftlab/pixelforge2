@@ -102,13 +102,16 @@ pub struct PixelForgeApp {
     /// UI state
     pub show_model_dialog: bool,
     pub show_about_dialog: bool,
+    pub show_token_dialog: bool,
+
+    /// HuggingFace API token for model downloads
+    pub huggingface_token: String,
+    
+    /// Temporary token input (for dialog)
+    pub token_input: String,
 
     /// File to load
     pub pending_file_load: Option<std::path::PathBuf>,
-
-    pub show_token_dialog: bool,
-    pub huggingface_token: String,
-    pub token_input: String,
 }
 
 impl PixelForgeApp {
@@ -119,12 +122,6 @@ impl PixelForgeApp {
         let model_manager = Arc::new(RwLock::new(
             ModelManager::new().unwrap_or_default()
         ));
-
-        {
-            let mut mgr = model_manager.write();
-            let _ = mgr.set_quality(config.model_quality);
-            mgr.set_sequential_mode(config.sequential_processing);
-        }
 
         Self {
             config,
@@ -154,10 +151,10 @@ impl PixelForgeApp {
             preview_zoom: 1.0,
             show_model_dialog: false,
             show_about_dialog: false,
-            pending_file_load: None,
             show_token_dialog: false,
             huggingface_token: String::new(),
             token_input: String::new(),
+            pending_file_load: None,
         }
     }
 }

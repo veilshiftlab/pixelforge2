@@ -1,0 +1,127 @@
+# PixelForge Model Configuration
+# This file contains URLs for downloading ONNX models with dynamic input support
+
+# =============================================================================
+# YOLOv8n-Face - Face Detection with 5 Landmarks
+# =============================================================================
+[models.face_detection]
+name = "YOLOv8n-Face"
+filename = "yolov8n-face.onnx"
+# HuggingFace ONNX community model
+url = "https://huggingface.co/onnx-community/yolov8n-face/resolve/main/onnx/model.onnx"
+size_mb = 6.2
+description = "Face detection with 5 landmarks, dynamic input (any size divisible by 32)"
+# SHA256 checksum for verification (fill in after first download)
+# sha256 = ""
+
+# =============================================================================
+# Depth-Anything V2 - Depth Estimation
+# =============================================================================
+
+# Base model (recommended for quality)
+[models.depth]
+name = "Depth-Anything V2 Base"
+filename = "depth_anything_v2_base.onnx"
+url = "https://huggingface.co/depth-anything/Depth-Anything-V2-Base/resolve/main/onnx/model.onnx"
+size_mb = 370
+description = "High quality depth estimation, dynamic input (any resolution)"
+# sha256 = ""
+
+# Small quantized model (alternative for low VRAM)
+[models.depth_small]
+name = "Depth-Anything V2 Small"
+filename = "depth_anything_v2_small.onnx"
+url = "https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/main/onnx/model.onnx"
+size_mb = 94
+description = "Smaller depth model for low VRAM systems, dynamic input"
+# sha256 = ""
+
+# =============================================================================
+# BiSeNet - Face Parsing Segmentation
+# =============================================================================
+
+[models.segmentation]
+name = "BiSeNet Face Parsing"
+filename = "bisenet_face_parsing.onnx"
+# Multiple potential sources for BiSeNet ONNX
+url = "https://huggingface.co/yakhyo/face-parsing/resolve/main/bisenet_face_parsing.onnx"
+size_mb = 48
+description = "Face parsing with 19 semantic classes, dynamic input"
+# sha256 = ""
+
+# Alternative: Face parsing from different source
+[models.segmentation_alt]
+name = "Face-Parsing.PyTorch"
+filename = "face_parsing.onnx"
+url = "https://huggingface.co/sayakpaul/face-parsing-segformer-b0/resolve/main/onnx/model.onnx"
+size_mb = 15
+description = "Alternative face parsing model (SegFormer B0)"
+# sha256 = ""
+
+# =============================================================================
+# Legacy Models (for backward compatibility - will be deprecated)
+# =============================================================================
+
+# Old face detection (fixed input size)
+[models.face_detection_legacy]
+name = "YuNet 2023 (Legacy)"
+filename = "yunet_2023.onnx"
+url = "https://github.com/opencv/opencv_zoo/raw/master/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+size_mb = 5.2
+description = "Legacy face detector with fixed input size"
+deprecated = true
+
+# Old depth estimation (fixed input size)
+[models.depth_legacy]
+name = "MiDaS Small (Legacy)"
+filename = "midas_small.onnx"
+url = "https://github.com/isl-org/MiDaS/releases/download/v3_1/midas_v21_small_256.onnx"
+size_mb = 42
+description = "Legacy depth estimation with fixed input size"
+deprecated = true
+
+# =============================================================================
+# Download Configuration
+# =============================================================================
+
+[download]
+# Max concurrent downloads
+max_concurrent = 1
+# Timeout in seconds (10 minutes for large files)
+timeout = 600
+# Retry attempts
+retries = 3
+# Chunk size for progress updates (1MB)
+chunk_size = 1048576
+# Verify checksums after download
+verify_checksums = true
+
+# =============================================================================
+# Model Sources / Mirrors
+# =============================================================================
+
+[mirrors]
+huggingface = "https://huggingface.co"
+github = "https://github.com"
+
+# =============================================================================
+# Model Quality Presets
+# =============================================================================
+
+[presets.fast]
+face_detection = "face_detection"
+depth = "depth_small"
+segmentation = "segmentation_alt"
+description = "Fast processing with smaller models"
+
+[presets.quality]
+face_detection = "face_detection"
+depth = "depth"
+segmentation = "segmentation"
+description = "High quality with larger models (recommended)"
+
+[presets.balanced]
+face_detection = "face_detection"
+depth = "depth_small"
+segmentation = "segmentation"
+description = "Balance between speed and quality"

@@ -1,7 +1,6 @@
 //! Side and bottom panels implementation
 
 use super::state::{PixelForgeApp, AspectRatioMode};
-use crate::config::ModelQuality;
 use crate::processing::{EyeSize, DetailLevel, PaletteMode, PresetPalette};
 use eframe::egui;
 use image::GenericImageView;
@@ -17,6 +16,8 @@ pub fn draw_left(app: &mut PixelForgeApp, ctx: &egui::Context) {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 4.0;
 
+                model_management_section(app, ui, ctx);
+                ui.add_space(8.0);
                 ml_analysis_section(app, ui, ctx);
                 ui.add_space(8.0);
                 depth_to_flat_section(app, ui);
@@ -28,6 +29,76 @@ pub fn draw_left(app: &mut PixelForgeApp, ctx: &egui::Context) {
         });
 }
 
+fn model_management_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, _ctx: &egui::Context) {
+    ui.collapsing("📦 Models", |ui| {
+        let manager = app.model_manager.read();
+        let models = manager.list_models();
+        let all_ready = models.iter().all(|m| m.downloaded);
+        
+        // Simple status display
+        if all_ready {
+            ui.label(egui::RichText::new("✅ All models ready").color(egui::Color32::GREEN));
+        } else {
+            let missing_count = models.iter().filter(|m| !m.downloaded).count();
+            ui.label(egui::RichText::new(format!("⚠ {} models need downloading", missing_count))
+                .color(egui::Color32::YELLOW));
+        }
+        
+        ui.separator();
+        
+        // Show the 3 fixed models
+        for model in &models {
+            ui.horizontal(|ui| {
+                if model.downloaded {
+                    ui.label(egui::RichText::new("✅").color(egui::Color32::GREEN));
+                } else {
+                    ui.label(egui::RichText::new("⬜").color(egui::Color32::GRAY));
+                }
+                ui.label(model.name);
+                ui.label(egui::RichText::new(format!("({:.0} MB)", model.size_mb)).small());
+            });
+        }
+        
+        let progress = manager.get_download_progress();
+        drop(manager);
+        
+        // Download button if models are missing
+        if !all_ready {
+            ui.separator();
+            
+            // Optional HuggingFace token
+            ui.collapsing("🔑 HuggingFace Token (optional)", |ui| {
+                ui.add(egui::TextEdit::singleline(&mut app.huggingface_token)
+                    .password(true)
+                    .hint_text("hf_xxx..."));
+                ui.label(egui::RichText::new("May help with rate limits").small().weak());
+            });
+            
+            if progress.is_downloading {
+                ui.label(format!("Downloading: {}", progress.current_model));
+                ui.add(egui::ProgressBar::new(progress.progress)
+                    .text(format!("{:.0}%", progress.progress * 100.0)));
+            } else {
+                let total_size: f64 = models.iter().filter(|m| !m.downloaded).map(|m| m.size_mb).sum();
+                
+                if ui.button(format!("⬇ Download Models ({:.0} MB)", total_size)).clicked() {
+                    if !app.huggingface_token.is_empty() {
+                        app.model_manager.read().set_huggingface_token(app.huggingface_token.clone());
+                    }
+                    if let Err(e) = app.model_manager.read().download_all_missing() {
+                        log::error!("Download failed: {}", e);
+                    }
+                }
+            }
+        }
+        
+        // Show any errors
+        if let Some(error) = &progress.last_error {
+            ui.label(egui::RichText::new(format!("Error: {}", error)).color(egui::Color32::RED));
+        }
+    });
+}
+
 fn ml_analysis_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.collapsing("🤖 ML Analysis", |ui| {
         ui.checkbox(&mut app.ml_config.face_detection_enabled, "Face Detection");
@@ -35,17 +106,14 @@ fn ml_analysis_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::C
         ui.checkbox(&mut app.ml_config.segmentation_enabled, "Segmentation");
 
         ui.separator();
-
-        ui.label("Model Quality:");
-        egui::ComboBox::from_id_salt("model_quality")
-            .selected_text(app.config.model_quality.display_name())
-            .show_ui(ui, |ui| {
-                for quality in [ModelQuality::Minimal, ModelQuality::Standard, ModelQuality::High] {
-                    ui.selectable_value(&mut app.config.model_quality, quality, quality.display_name());
-                }
-            });
-
-        ui.checkbox(&mut app.config.sequential_processing, "Sequential Mode (Low VRAM)");
+        
+        ui.label("Detection Thresholds:");
+        ui.add(egui::Slider::new(&mut app.ml_config.face_confidence_threshold, 0.1..=0.95)
+            .text("Face Confidence"));
+        ui.add(egui::Slider::new(&mut app.ml_config.depth_edge_sensitivity, 0.05..=0.5)
+            .text("Depth Sensitivity"));
+        ui.add(egui::Slider::new(&mut app.ml_config.segmentation_sensitivity, 0.1..=0.9)
+            .text("Segmentation Sensitivity"));
 
         ui.separator();
 
@@ -53,7 +121,6 @@ fn ml_analysis_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::C
             !matches!(app.processing, crate::processing::ProcessingState::Running(_));
 
         if ui.add_enabled(analysis_enabled, egui::Button::new("▶ Run ML Analysis")).clicked() {
-            super::processing::update_model_settings(app);
             super::processing::run_ml_analysis(app, ctx);
         }
     });
@@ -235,6 +302,19 @@ fn transform_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     ui.add(egui::Slider::new(&mut app.transform_config.rotation, -180.0..=180.0).text("Rotation (°)"));
     ui.add(egui::Slider::new(&mut app.transform_config.offset_x, -1.0..=1.0).text("Offset X"));
     ui.add(egui::Slider::new(&mut app.transform_config.offset_y, -1.0..=1.0).text("Offset Y"));
+    
+    ui.separator();
+    ui.label("Flip:");
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut app.transform_config.flip_horizontal, "Horizontal");
+        ui.checkbox(&mut app.transform_config.flip_vertical, "Vertical");
+    });
+    
+    ui.checkbox(&mut app.transform_config.clip_to_face, "Clip to Face")
+        .on_hover_text("Crop the image to focus on the detected face region");
+    if app.transform_config.clip_to_face {
+        ui.add(egui::Slider::new(&mut app.transform_config.clip_padding, 0.0..=1.0).text("Padding"));
+    }
 }
 
 fn export_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
@@ -292,7 +372,6 @@ fn palette_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
 fn preset_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     ui.heading("📁 Presets");
     
-    // Built-in presets dropdown
     ui.label("Built-in:");
     egui::ComboBox::from_id_salt("builtin_presets")
         .selected_text(app.current_preset.as_deref().unwrap_or("Select preset..."))
@@ -314,7 +393,6 @@ fn preset_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     
     ui.add_space(4.0);
     
-    // Save/Load buttons
     ui.horizontal(|ui| {
         if ui.button("Save...").clicked() {
             super::processing::save_preset(app);
@@ -443,13 +521,6 @@ pub fn draw_status(app: &mut PixelForgeApp, ctx: &egui::Context) {
                     0
                 };
                 ui.label(format!("VRAM: {}MB ({}%)", app.vram_usage, vram_percent));
-                
-                ui.separator();
-                ui.label(format!("Quality: {}", app.config.model_quality.display_name()));
-                
-                if app.config.sequential_processing {
-                    ui.label("[Sequential]");
-                }
             });
         });
 }
