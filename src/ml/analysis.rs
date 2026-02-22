@@ -1,18 +1,20 @@
-//! ML Analysis orchestration
+//! ML Analysis Orchestration Module
 
 use super::{MLConfig, MLResults, FaceDetectionResult, SegmentationResult};
-use super::{FaceDetector, PlaceholderDetector, DepthEstimator, PlaceholderDepthEstimator, Segmenter, PlaceholderSegmenter};
+use super::models::{
+    YoloV8FaceDetector, PlaceholderFaceDetector,
+    DepthAnythingEstimator, PlaceholderDepthEstimator,
+    BiSeNetSegmenter, PlaceholderSegmenter,
+};
 use crate::models::ModelManager;
 use anyhow::Result;
-use image::{DynamicImage, GenericImageView};
+use image::DynamicImage;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-/// ML Analysis orchestrator
 pub struct MLAnalysis;
 
 impl MLAnalysis {
-    /// Run full ML analysis on an image
     pub fn analyze(
         image: &DynamicImage,
         config: &MLConfig,
@@ -20,22 +22,25 @@ impl MLAnalysis {
     ) -> Result<MLResults> {
         let mut results = MLResults::default();
 
-        let (width, height) = image.dimensions();
-        let _total_pixels = (width * height) as usize;
-
-        // Run face detection first (provides bounds for other models)
+        // Step 1: Face Detection
         if config.face_detection_enabled {
             let detection = run_face_detection(image, model_manager)?;
+            // FaceBounds implements Copy, so no clone needed
             results.face_bounds = detection.bounds;
-            results.landmarks = detection.landmarks;
+            results.landmarks = detection.landmarks.clone();
+            results.face = Some(super::FaceDetectionOutput {
+                bounds: detection.bounds,
+                landmarks: detection.landmarks.clone().map(|l| l.points).unwrap_or_default(),
+                confidence: detection.confidence,
+            });
         }
 
-        // Run depth estimation
+        // Step 2: Depth Estimation
         if config.depth_estimation_enabled {
             results.depth_map = Some(run_depth_estimation(image, model_manager)?);
         }
 
-        // Run segmentation
+        // Step 3: Segmentation
         if config.segmentation_enabled {
             results.segmentation = Some(run_segmentation(image, model_manager)?);
         }
@@ -44,46 +49,58 @@ impl MLAnalysis {
     }
 }
 
-/// Run face detection (uses model if available, placeholder otherwise)
-fn run_face_detection(image: &DynamicImage, model_manager: &Arc<RwLock<ModelManager>>) -> Result<FaceDetectionResult> {
+fn run_face_detection(
+    image: &DynamicImage,
+    model_manager: &Arc<RwLock<ModelManager>>,
+) -> Result<FaceDetectionResult> {
     let manager = model_manager.read();
-    
-    if let Some(model_path) = manager.get_model_path("yolov8n-face") {
+
+    if let Some(model_path) = manager.get_model_path("yolov8_face") {
         drop(manager);
-        let mut detector = FaceDetector::new(&model_path)?;
+        log::info!("Running face detection with YOLOv8n-Face model");
+        let detector = YoloV8FaceDetector::new(&model_path)?;
         detector.detect(image)
     } else {
         drop(manager);
-        let detector = PlaceholderDetector;
+        log::warn!("Face detection model not available, using placeholder");
+        let detector = PlaceholderFaceDetector;
         detector.detect(image)
     }
 }
 
-/// Run depth estimation (uses model if available, placeholder otherwise)
-fn run_depth_estimation(image: &DynamicImage, model_manager: &Arc<RwLock<ModelManager>>) -> Result<Vec<f32>> {
+fn run_depth_estimation(
+    image: &DynamicImage,
+    model_manager: &Arc<RwLock<ModelManager>>,
+) -> Result<Vec<f32>> {
     let manager = model_manager.read();
-    
-    if let Some(model_path) = manager.get_model_path("depth-anything-v2") {
+
+    if let Some(model_path) = manager.get_model_path("depth_anything") {
         drop(manager);
-        let mut estimator = DepthEstimator::new(&model_path)?;
+        log::info!("Running depth estimation with Depth-Anything V2 Small model");
+        let estimator = DepthAnythingEstimator::new(&model_path)?;
         estimator.estimate(image)
     } else {
         drop(manager);
+        log::warn!("Depth estimation model not available, using placeholder");
         let estimator = PlaceholderDepthEstimator;
         estimator.estimate(image)
     }
 }
 
-/// Run segmentation (uses model if available, placeholder otherwise)
-fn run_segmentation(image: &DynamicImage, model_manager: &Arc<RwLock<ModelManager>>) -> Result<SegmentationResult> {
+fn run_segmentation(
+    image: &DynamicImage,
+    model_manager: &Arc<RwLock<ModelManager>>,
+) -> Result<SegmentationResult> {
     let manager = model_manager.read();
-    
+
     if let Some(model_path) = manager.get_model_path("bisenet") {
         drop(manager);
-        let mut segmenter = Segmenter::new(&model_path)?;
+        log::info!("Running segmentation with BiSeNet model");
+        let segmenter = BiSeNetSegmenter::new(&model_path)?;
         segmenter.segment(image)
     } else {
         drop(manager);
+        log::warn!("Segmentation model not available, using placeholder");
         let segmenter = PlaceholderSegmenter;
         segmenter.segment(image)
     }

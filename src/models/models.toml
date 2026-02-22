@@ -1,127 +1,78 @@
 # PixelForge Model Configuration
-# This file contains URLs for downloading ONNX models with dynamic input support
+# ================================
+# This file defines the ONNX models used by PixelForge.
+# Edit the URLs if you need to use mirrors or different model variants.
+#
+# To manually download models:
+# 1. Create a 'models/' folder next to the executable
+# 2. Download each model using the URL below
+# 3. Rename the downloaded file to match the 'filename' field
 
-# =============================================================================
-# YOLOv8n-Face - Face Detection with 5 Landmarks
-# =============================================================================
-[models.face_detection]
+[models.yolov8_face]
+# YOLOv8n-Face: Face detection with 5 landmarks
+# Output: Bounding box + 5 facial landmarks (eyes, nose, mouth corners)
 name = "YOLOv8n-Face"
 filename = "yolov8n-face.onnx"
-# HuggingFace ONNX community model
 url = "https://huggingface.co/onnx-community/yolov8n-face/resolve/main/onnx/model.onnx"
-size_mb = 6.2
-description = "Face detection with 5 landmarks, dynamic input (any size divisible by 32)"
-# SHA256 checksum for verification (fill in after first download)
-# sha256 = ""
+size_mb = 6.0
+description = "Face detection with 5 landmarks (eyes, nose, mouth corners)"
+enabled = true
 
-# =============================================================================
-# Depth-Anything V2 - Depth Estimation
-# =============================================================================
-
-# Base model (recommended for quality)
-[models.depth]
-name = "Depth-Anything V2 Base"
-filename = "depth_anything_v2_base.onnx"
-url = "https://huggingface.co/depth-anything/Depth-Anything-V2-Base/resolve/main/onnx/model.onnx"
-size_mb = 370
-description = "High quality depth estimation, dynamic input (any resolution)"
-# sha256 = ""
-
-# Small quantized model (alternative for low VRAM)
-[models.depth_small]
+[models.depth_anything]
+# Depth-Anything V2 Small: Monocular depth estimation
+# Output: Relative depth map (higher = farther from camera)
+# Using ViT-S (Small) for better 4GB VRAM compatibility
 name = "Depth-Anything V2 Small"
-filename = "depth_anything_v2_small.onnx"
-url = "https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/main/onnx/model.onnx"
-size_mb = 94
-description = "Smaller depth model for low VRAM systems, dynamic input"
-# sha256 = ""
+filename = "depth-anything-v2-small.onnx"
+url = "https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/main/depth_anything_v2_vits.onnx"
+size_mb = 100.0
+description = "Depth estimation for depth-to-flat color conversion (ViT-S)"
+enabled = true
 
-# =============================================================================
-# BiSeNet - Face Parsing Segmentation
-# =============================================================================
-
-[models.segmentation]
+[models.bisenet]
+# BiSeNet: Face parsing / semantic segmentation
+# Output: Per-pixel labels for 19 face regions (skin, hair, eyes, lips, etc.)
 name = "BiSeNet Face Parsing"
-filename = "bisenet_face_parsing.onnx"
-# Multiple potential sources for BiSeNet ONNX
-url = "https://huggingface.co/yakhyo/face-parsing/resolve/main/bisenet_face_parsing.onnx"
-size_mb = 48
-description = "Face parsing with 19 semantic classes, dynamic input"
-# sha256 = ""
+filename = "bisenet.onnx"
+# Alternative mirrors (uncomment one if primary fails):
+# url = "https://huggingface.co/YOLOPVN/bisenet_face_parsing/resolve/main/bisenet.onnx"
+url = "https://huggingface.co/szhubel/face-parsing-bisenet/resolve/main/bisenet.onnx"
+size_mb = 48.0
+description = "Face parsing for region-aware processing (19 classes)"
+enabled = true
 
-# Alternative: Face parsing from different source
-[models.segmentation_alt]
-name = "Face-Parsing.PyTorch"
-filename = "face_parsing.onnx"
-url = "https://huggingface.co/sayakpaul/face-parsing-segformer-b0/resolve/main/onnx/model.onnx"
-size_mb = 15
-description = "Alternative face parsing model (SegFormer B0)"
-# sha256 = ""
+# ============================================================================
+# ALTERNATIVE MODELS (disabled by default)
+# ============================================================================
+# Uncomment and set enabled = true to use alternative models
 
-# =============================================================================
-# Legacy Models (for backward compatibility - will be deprecated)
-# =============================================================================
+# [models.midas_small]
+# # MiDaS v2.1 Small: Alternative depth estimation
+# name = "MiDaS Small"
+# filename = "midas_small.onnx"
+# url = "https://github.com/isl-org/MiDaS/releases/download/v3_1/midas_v21_small_256.onnx"
+# size_mb = 42.0
+# description = "Alternative depth estimation model"
+# enabled = false
 
-# Old face detection (fixed input size)
-[models.face_detection_legacy]
-name = "YuNet 2023 (Legacy)"
-filename = "yunet_2023.onnx"
-url = "https://github.com/opencv/opencv_zoo/raw/master/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
-size_mb = 5.2
-description = "Legacy face detector with fixed input size"
-deprecated = true
+# [models.yunet]
+# # YuNet: Alternative face detection
+# name = "YuNet 2023"
+# filename = "yunet.onnx"
+# url = "https://github.com/opencv/opencv_zoo/raw/master/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+# size_mb = 5.2
+# description = "Lightweight alternative face detector"
+# enabled = false
 
-# Old depth estimation (fixed input size)
-[models.depth_legacy]
-name = "MiDaS Small (Legacy)"
-filename = "midas_small.onnx"
-url = "https://github.com/isl-org/MiDaS/releases/download/v3_1/midas_v21_small_256.onnx"
-size_mb = 42
-description = "Legacy depth estimation with fixed input size"
-deprecated = true
-
-# =============================================================================
-# Download Configuration
-# =============================================================================
-
+# ============================================================================
+# DOWNLOAD SETTINGS
+# ============================================================================
 [download]
-# Max concurrent downloads
-max_concurrent = 1
-# Timeout in seconds (10 minutes for large files)
-timeout = 600
-# Retry attempts
+# Maximum concurrent downloads
+max_concurrent = 2
+# Connection timeout in seconds
+timeout = 300
+# Number of retry attempts
 retries = 3
-# Chunk size for progress updates (1MB)
-chunk_size = 1048576
-# Verify checksums after download
-verify_checksums = true
-
-# =============================================================================
-# Model Sources / Mirrors
-# =============================================================================
-
-[mirrors]
-huggingface = "https://huggingface.co"
-github = "https://github.com"
-
-# =============================================================================
-# Model Quality Presets
-# =============================================================================
-
-[presets.fast]
-face_detection = "face_detection"
-depth = "depth_small"
-segmentation = "segmentation_alt"
-description = "Fast processing with smaller models"
-
-[presets.quality]
-face_detection = "face_detection"
-depth = "depth"
-segmentation = "segmentation"
-description = "High quality with larger models (recommended)"
-
-[presets.balanced]
-face_detection = "face_detection"
-depth = "depth_small"
-segmentation = "segmentation"
-description = "Balance between speed and quality"
+# Verify file exists after download
+verify_exists = true

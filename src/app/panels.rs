@@ -1,6 +1,7 @@
 //! Side and bottom panels implementation
 
 use super::state::{PixelForgeApp, AspectRatioMode};
+use crate::config::ModelQuality;
 use crate::processing::{EyeSize, DetailLevel, PaletteMode, PresetPalette};
 use eframe::egui;
 use image::GenericImageView;
@@ -30,71 +31,73 @@ pub fn draw_left(app: &mut PixelForgeApp, ctx: &egui::Context) {
 }
 
 fn model_management_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, _ctx: &egui::Context) {
-    ui.collapsing("📦 Models", |ui| {
+    ui.collapsing("📦 Model Management", |ui| {
+        // Show model status
         let manager = app.model_manager.read();
-        let models = manager.list_models();
-        let all_ready = models.iter().all(|m| m.downloaded);
+        let required_models = manager.list_models();
+        let missing_models: Vec<_> = required_models.iter().filter(|m| !m.downloaded).collect();
         
-        // Simple status display
-        if all_ready {
-            ui.label(egui::RichText::new("✅ All models ready").color(egui::Color32::GREEN));
-        } else {
-            let missing_count = models.iter().filter(|m| !m.downloaded).count();
-            ui.label(egui::RichText::new(format!("⚠ {} models need downloading", missing_count))
-                .color(egui::Color32::YELLOW));
-        }
+        ui.label(format!("Quality: {}", app.config.model_quality.display_name()));
+        ui.label(format!("Models directory: {}", manager.models_dir().display()));
         
         ui.separator();
         
-        // Show the 3 fixed models
-        for model in &models {
+        ui.label("Model Status:");
+        for model in &required_models {
             ui.horizontal(|ui| {
                 if model.downloaded {
                     ui.label(egui::RichText::new("✅").color(egui::Color32::GREEN));
                 } else {
-                    ui.label(egui::RichText::new("⬜").color(egui::Color32::GRAY));
+                    ui.label(egui::RichText::new("❌").color(egui::Color32::RED));
                 }
-                ui.label(model.name);
-                ui.label(egui::RichText::new(format!("({:.0} MB)", model.size_mb)).small());
+                ui.label(&model.name);
+                ui.label(egui::RichText::new(format!("({:.1} MB)", model.size_mb)).small());
             });
         }
         
-        let progress = manager.get_download_progress();
-        drop(manager);
+        drop(manager); // Release the lock before potential mutable operations
         
-        // Download button if models are missing
-        if !all_ready {
-            ui.separator();
+        ui.separator();
+        
+        // Download progress
+        let progress = app.model_manager.read().get_download_progress();
+        if progress.is_downloading {
+            ui.label(format!("Downloading: {}", progress.current_model));
+            ui.add(egui::ProgressBar::new(progress.progress).text(format!("{:.0}%", progress.progress * 100.0)));
+        } else if let Some(error) = &progress.last_error {
+            ui.label(egui::RichText::new(format!("Error: {}", error)).color(egui::Color32::RED));
+        }
+        
+        // HuggingFace Token input
+        ui.label("HuggingFace Token:");
+        ui.add(egui::TextEdit::singleline(&mut app.huggingface_token)
+            .password(true)
+            .hint_text("hf_xxx..."));
+        
+        // Download button
+        if !missing_models.is_empty() {
+            let total_size: f64 = missing_models.iter().map(|m| m.size_mb).sum();
+            let download_text = format!("⬇ Download {} models ({:.1} MB)", missing_models.len(), total_size);
             
-            // Optional HuggingFace token
-            ui.collapsing("🔑 HuggingFace Token (optional)", |ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.huggingface_token)
-                    .password(true)
-                    .hint_text("hf_xxx..."));
-                ui.label(egui::RichText::new("May help with rate limits").small().weak());
-            });
-            
-            if progress.is_downloading {
-                ui.label(format!("Downloading: {}", progress.current_model));
-                ui.add(egui::ProgressBar::new(progress.progress)
-                    .text(format!("{:.0}%", progress.progress * 100.0)));
-            } else {
-                let total_size: f64 = models.iter().filter(|m| !m.downloaded).map(|m| m.size_mb).sum();
-                
-                if ui.button(format!("⬇ Download Models ({:.0} MB)", total_size)).clicked() {
-                    if !app.huggingface_token.is_empty() {
-                        app.model_manager.read().set_huggingface_token(app.huggingface_token.clone());
-                    }
-                    if let Err(e) = app.model_manager.read().download_all_missing() {
-                        log::error!("Download failed: {}", e);
-                    }
+            if ui.button(&download_text).clicked() {
+                // Set token if provided
+                if !app.huggingface_token.is_empty() {
+                    app.model_manager.read().set_huggingface_token(app.huggingface_token.clone());
+                }
+                // Start download
+                if let Err(e) = app.model_manager.read().download_all_missing() {
+                    log::error!("Download failed: {}", e);
                 }
             }
+        } else {
+            ui.label(egui::RichText::new("✅ All models downloaded").color(egui::Color32::GREEN));
         }
         
-        // Show any errors
-        if let Some(error) = &progress.last_error {
-            ui.label(egui::RichText::new(format!("Error: {}", error)).color(egui::Color32::RED));
+        // Available model files
+        let available = app.model_manager.read().check_model_files();
+        if !available.is_empty() {
+            ui.add_space(4.0);
+            ui.label(format!("Found {} model files", available.len()));
         }
     });
 }
@@ -106,7 +109,21 @@ fn ml_analysis_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::C
         ui.checkbox(&mut app.ml_config.segmentation_enabled, "Segmentation");
 
         ui.separator();
+
+        ui.label("Model Quality:");
+        egui::ComboBox::from_id_salt("model_quality")
+            .selected_text(app.config.model_quality.display_name())
+            .show_ui(ui, |ui| {
+                for quality in [ModelQuality::Minimal, ModelQuality::Standard, ModelQuality::High] {
+                    ui.selectable_value(&mut app.config.model_quality, quality, quality.display_name());
+                }
+            });
+
+        ui.checkbox(&mut app.config.sequential_processing, "Sequential Mode (Low VRAM)");
+
+        ui.separator();
         
+        // ML Thresholds
         ui.label("Detection Thresholds:");
         ui.add(egui::Slider::new(&mut app.ml_config.face_confidence_threshold, 0.1..=0.95)
             .text("Face Confidence"));
@@ -121,6 +138,7 @@ fn ml_analysis_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::C
             !matches!(app.processing, crate::processing::ProcessingState::Running(_));
 
         if ui.add_enabled(analysis_enabled, egui::Button::new("▶ Run ML Analysis")).clicked() {
+            super::processing::update_model_settings(app);
             super::processing::run_ml_analysis(app, ctx);
         }
     });
@@ -310,6 +328,7 @@ fn transform_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
         ui.checkbox(&mut app.transform_config.flip_vertical, "Vertical");
     });
     
+    // Clip to face option
     ui.checkbox(&mut app.transform_config.clip_to_face, "Clip to Face")
         .on_hover_text("Crop the image to focus on the detected face region");
     if app.transform_config.clip_to_face {
@@ -372,6 +391,7 @@ fn palette_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
 fn preset_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     ui.heading("📁 Presets");
     
+    // Built-in presets dropdown
     ui.label("Built-in:");
     egui::ComboBox::from_id_salt("builtin_presets")
         .selected_text(app.current_preset.as_deref().unwrap_or("Select preset..."))
@@ -393,6 +413,7 @@ fn preset_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     
     ui.add_space(4.0);
     
+    // Save/Load buttons
     ui.horizontal(|ui| {
         if ui.button("Save...").clicked() {
             super::processing::save_preset(app);
@@ -521,6 +542,13 @@ pub fn draw_status(app: &mut PixelForgeApp, ctx: &egui::Context) {
                     0
                 };
                 ui.label(format!("VRAM: {}MB ({}%)", app.vram_usage, vram_percent));
+                
+                ui.separator();
+                ui.label(format!("Quality: {}", app.config.model_quality.display_name()));
+                
+                if app.config.sequential_processing {
+                    ui.label("[Sequential]");
+                }
             });
         });
 }

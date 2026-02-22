@@ -1,44 +1,43 @@
-//! ML analysis module
+//! ML Analysis Module
 //!
-//! Provides ML-based image analysis for pixel art style transfer:
-//! - Face detection and landmark estimation
-//! - Depth map estimation
-//! - Semantic segmentation
+//! This module provides machine learning capabilities for PixelForge:
 //!
-//! Uses ONNX Runtime with unified session management for efficient
-//! model caching and optional GPU acceleration.
+//! - **Face Detection**: YOLOv8n-Face with 5 facial landmarks
+//! - **Depth Estimation**: Depth-Anything V2 Small
+//! - **Segmentation**: BiSeNet face parsing (19 classes)
+//!
+//! # Module Structure
+//!
+//! ```text
+//! src/ml/
+//! ├── mod.rs           - Module exports and types
+//! ├── config.rs        - ML configuration structures
+//! ├── analysis.rs      - Pipeline orchestration
+//! ├── types.rs         - Result types
+//! └── models/
+//!     ├── mod.rs
+//!     ├── yolov8_face.rs    - Face detection model
+//!     ├── depth_anything.rs - Depth estimation model
+//!     └── bisenet.rs        - Segmentation model
+//! ```
 
-// Module declarations
 mod config;
-mod types;
-mod session;
-mod preprocess;
 mod analysis;
-mod visualization;
+mod types;
+pub mod models;
 
-// Legacy model wrappers
-mod face_detection;
-mod depth;
-mod segmentation;
+pub use config::*;
+pub use analysis::*;
+pub use types::*;
 
-// Public exports - Configuration
-pub use config::MLConfig;
-
-// Public exports - Types
-pub use types::{
-    FaceBounds,
-    FaceDetectionResult,
-    FaceLandmarks,
-    LandmarkRegion,
-    SegmentationRegion,
-    SegmentationResult,
-    MLResults,
+// Re-export model structs for convenience
+pub use models::{
+    YoloV8FaceDetector, PlaceholderFaceDetector,
+    DepthAnythingEstimator, PlaceholderDepthEstimator,
+    BiSeNetSegmenter, PlaceholderSegmenter,
 };
 
-// Public exports - Legacy Model Wrappers
-pub use face_detection::{FaceDetector, PlaceholderDetector};
-pub use depth::{DepthEstimator, PlaceholderDepthEstimator};
-pub use segmentation::{Segmenter, PlaceholderSegmenter};
-
-// Public exports - Analysis
-pub use analysis::MLAnalysis;
+// Legacy re-exports (for backward compatibility)
+pub use models::YoloV8FaceDetector as FaceDetector;
+pub use models::DepthAnythingEstimator as DepthEstimator;
+pub use models::BiSeNetSegmenter as Segmenter;

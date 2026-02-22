@@ -2,6 +2,7 @@
 
 use super::state::{PixelForgeApp, AspectRatioMode, OutputImage};
 use crate::image::{ImageTransform, ImageExporter, ExportConfig};
+use crate::models::ModelManager;
 use crate::processing::{
     depth_to_flat, weighted_downsample, bilinear_downsample, nearest_neighbor_downsample,
     compute_combined_importance_map, preserve_features, draw_edges, generate_palette, apply_palette, 
@@ -136,9 +137,9 @@ pub fn load_preset(app: &mut PixelForgeApp) {
 }
 
 /// Update model settings
-pub fn update_model_settings(_app: &mut PixelForgeApp) {
-    // Models are now fixed - no quality settings to update
-    // VRAM estimation is now a static value
+pub fn update_model_settings(app: &mut PixelForgeApp) {
+    let manager = app.model_manager.read();
+    app.vram_usage = manager.estimated_vram_usage() / (1024 * 1024);
 }
 
 /// Get output dimensions based on aspect mode
@@ -195,8 +196,8 @@ pub fn run_ml_analysis(app: &mut PixelForgeApp, ctx: &egui::Context) {
             app.ml_results = Some(results);
             app.processing = ProcessingState::Complete;
             
-            // VRAM is fixed for the 3 models (~800MB peak during depth estimation)
-            app.vram_usage = crate::models::ModelManager::estimated_vram_usage() / (1024 * 1024);
+            let manager = app.model_manager.read();
+            app.vram_usage = manager.estimated_vram_usage() / (1024 * 1024);
         }
         Err(e) => {
             log::error!("ML analysis failed: {}", e);

@@ -1,68 +1,99 @@
-//! Model downloader with progress reporting
+//! Model Downloader Module
 //!
-//! Downloads the 3 fixed models for PixelForge:
-//! - YOLOv8n-Face: Face detection with 5 landmarks (6MB)
-//! - Depth-Anything V2 Base: Depth estimation (370MB)  
-//! - BiSeNet: Face parsing/segmentation (48MB)
+//! Handles downloading ONNX models defined in models.toml.
 
 use anyhow::Result;
 use reqwest::blocking::Client;
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Fixed model information
+// =============================================================================
+// TOML Configuration Structures
+// =============================================================================
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ModelsConfig {
+    pub models: HashMap<String, ModelDefinition>,
+    pub download: Option<DownloadSettings>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelDefinition {
+    pub name: String,
+    pub filename: String,
+    pub url: String,
+    pub size_mb: f64,
+    pub description: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool { true }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DownloadSettings {
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: usize,
+    #[serde(default = "default_timeout")]
+    pub timeout: u64,
+    #[serde(default = "default_retries")]
+    pub retries: u32,
+    #[serde(default = "default_verify")]
+    pub verify_exists: bool,
+}
+
+fn default_max_concurrent() -> usize { 2 }
+fn default_timeout() -> u64 { 300 }
+fn default_retries() -> u32 { 3 }
+fn default_verify() -> bool { true }
+
+impl Default for DownloadSettings {
+    fn default() -> Self {
+        Self {
+            max_concurrent: default_max_concurrent(),
+            timeout: default_timeout(),
+            retries: default_retries(),
+            verify_exists: default_verify(),
+        }
+    }
+}
+
+// =============================================================================
+// Model Info
+// =============================================================================
+
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     pub id: &'static str,
-    pub name: &'static str,
-    pub filename: &'static str,
-    pub url: &'static str,
+    pub name: String,
+    pub filename: String,
+    pub url: String,
     pub size_mb: f64,
-    pub description: &'static str,
+    pub description: String,
 }
 
-/// The 3 fixed models used by PixelForge
-pub const MODELS: &[ModelInfo] = &[
-    ModelInfo {
-        id: "yolov8n-face",
-        name: "YOLOv8n-Face",
-        filename: "yolov8n-face.onnx",
-        url: "https://huggingface.co/onnx-community/yolov8n-face/resolve/main/onnx/model.onnx",
-        size_mb: 6.0,
-        description: "Face detection with 5 landmarks",
-    },
-    ModelInfo {
-        id: "depth-anything-v2",
-        name: "Depth-Anything V2 Base",
-        filename: "depth-anything-v2-base.onnx",
-        url: "https://huggingface.co/depth-anything/Depth-Anything-V2-Base/resolve/main/depth_anything_v2_vitb.onnx",
-        size_mb: 370.0,
-        description: "Depth estimation for depth-to-flat conversion",
-    },
-    ModelInfo {
-        id: "bisenet",
-        name: "BiSeNet Face Parsing",
-        filename: "bisenet.onnx",
-        url: "https://huggingface.co/yakhyo/face-parsing/resolve/main/face_parsing.onnx",
-        size_mb: 48.0,
-        description: "Face parsing for region-aware processing",
-    },
-];
+// =============================================================================
+// Progress Callback
+// =============================================================================
 
-/// Download progress callback
 pub type ProgressCallback = Box<dyn Fn(&str, f32) + Send + Sync>;
 
-/// Model downloader
+// =============================================================================
+// Model Downloader
+// =============================================================================
+
 pub struct ModelDownloader {
     client: Client,
     models_dir: PathBuf,
     progress_callback: Option<Arc<Mutex<ProgressCallback>>>,
     huggingface_token: Option<String>,
+    config: ModelsConfig,
 }
 
 impl ModelDownloader {
-    /// Create a new model downloader
     pub fn new(models_dir: &Path) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(600))
@@ -70,20 +101,27 @@ impl ModelDownloader {
             .user_agent("PixelForge/0.1.0")
             .build()?;
 
+        let config = Self::load_config()?;
+
         Ok(Self {
             client,
             models_dir: models_dir.to_path_buf(),
             progress_callback: None,
             huggingface_token: None,
+            config,
         })
     }
-    
-    /// Set HuggingFace API token
+
+    fn load_config() -> Result<ModelsConfig> {
+        let toml_content = include_str!("models.toml");
+        let config: ModelsConfig = toml::from_str(toml_content)?;
+        Ok(config)
+    }
+
     pub fn set_huggingface_token(&mut self, token: String) {
         self.huggingface_token = Some(token);
     }
 
-    /// Set progress callback
     pub fn set_progress_callback<F>(&mut self, callback: F)
     where
         F: Fn(&str, f32) + Send + Sync + 'static,
@@ -91,7 +129,6 @@ impl ModelDownloader {
         self.progress_callback = Some(Arc::new(Mutex::new(Box::new(callback))));
     }
 
-    /// Report progress
     fn report_progress(&self, model_name: &str, progress: f32) {
         if let Some(cb) = &self.progress_callback {
             if let Ok(guard) = cb.lock() {
@@ -100,100 +137,127 @@ impl ModelDownloader {
         }
     }
 
-    /// Get model info by ID
-    pub fn get_model_info(model_id: &str) -> Option<&'static ModelInfo> {
-        MODELS.iter().find(|m| m.id == model_id)
+    pub fn get_model_info(model_id: &str) -> Option<ModelInfo> {
+        let config = Self::load_config().ok()?;
+        let def = config.models.get(model_id)?;
+
+        Some(ModelInfo {
+            id: Box::leak(model_id.to_string().into_boxed_str()),
+            name: def.name.clone(),
+            filename: def.filename.clone(),
+            url: def.url.clone(),
+            size_mb: def.size_mb,
+            description: def.description.clone(),
+        })
     }
 
-    /// Get all models
-    pub fn get_all_models() -> &'static [ModelInfo] {
-        MODELS
+    pub fn get_all_models() -> Vec<ModelInfo> {
+        let config = match Self::load_config() {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+
+        config
+            .models
+            .iter()
+            .filter(|(_, def)| def.enabled)
+            .map(|(id, def)| ModelInfo {
+                id: Box::leak(id.clone().into_boxed_str()),
+                name: def.name.clone(),
+                filename: def.filename.clone(),
+                url: def.url.clone(),
+                size_mb: def.size_mb,
+                description: def.description.clone(),
+            })
+            .collect()
     }
 
-    /// Check if a model is already downloaded
     pub fn is_model_downloaded(&self, model_id: &str) -> bool {
-        if let Some(info) = Self::get_model_info(model_id) {
-            self.models_dir.join(info.filename).exists()
+        if let Some(def) = self.config.models.get(model_id) {
+            self.models_dir.join(&def.filename).exists()
         } else {
             false
         }
     }
 
-    /// Download a single model
     pub fn download_model(&self, model_id: &str) -> Result<PathBuf> {
-        let info = Self::get_model_info(model_id)
+        let def = self
+            .config
+            .models
+            .get(model_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown model: {}", model_id))?;
 
-        let output_path = self.models_dir.join(info.filename);
+        let output_path = self.models_dir.join(&def.filename);
 
-        // Check if already exists
         if output_path.exists() {
-            log::info!("Model {} already exists, skipping download", info.filename);
+            log::info!("Model {} already exists, skipping download", def.filename);
             return Ok(output_path);
         }
 
-        // Ensure models directory exists
         if !self.models_dir.exists() {
             std::fs::create_dir_all(&self.models_dir)?;
         }
 
-        log::info!("Downloading {} from {}", info.name, info.url);
-        self.report_progress(info.name, 0.0);
+        log::info!("Downloading {} from {}", def.name, def.url);
+        self.report_progress(&def.name, 0.0);
 
-        // Build request with optional Bearer token for HuggingFace URLs
-        let mut request = self.client.get(info.url);
-        
+        let mut request = self.client.get(&def.url);
+
         if let Some(ref token) = self.huggingface_token {
             if !token.is_empty() {
                 request = request.bearer_auth(token);
-                log::info!("Using HuggingFace Bearer token for authentication");
             }
         }
-        
+
         let response = request.send()?;
-        
+
         let status = response.status();
         if !status.is_success() {
-            let error_msg = format!("HTTP {} - {} for URL: {}", status.as_u16(), status.canonical_reason().unwrap_or("Unknown"), info.url);
+            let error_msg = format!(
+                "HTTP {} - {} for URL: {}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("Unknown"),
+                def.url
+            );
             log::error!("Download failed: {}", error_msg);
             return Err(anyhow::anyhow!("{}", error_msg));
         }
-        
-        let total_size = response.content_length().unwrap_or(0) as usize;
 
-        // Read entire response body
+        let total_size = response.content_length().unwrap_or(0) as usize;
         let bytes = response.bytes()?;
         let downloaded = bytes.len();
-        
+
         if downloaded == 0 {
-            return Err(anyhow::anyhow!("Empty response from {}", info.url));
+            return Err(anyhow::anyhow!("Empty response from {}", def.url));
         }
 
         if total_size > 0 {
             let progress = downloaded as f32 / total_size as f32;
-            self.report_progress(info.name, progress);
+            self.report_progress(&def.name, progress);
         } else {
-            self.report_progress(info.name, 0.5);
+            self.report_progress(&def.name, 0.5);
         }
 
         std::fs::write(&output_path, &bytes)?;
         log::info!("Saved model to {} ({} bytes)", output_path.display(), downloaded);
-        self.report_progress(info.name, 1.0);
+        self.report_progress(&def.name, 1.0);
 
         Ok(output_path)
     }
 
-    /// Download all missing models
     pub fn download_all_missing(&self) -> Result<Vec<PathBuf>> {
         let mut paths = Vec::new();
         let mut errors = Vec::new();
 
-        for info in MODELS {
-            if !self.is_model_downloaded(info.id) {
-                match self.download_model(info.id) {
+        for (id, def) in &self.config.models {
+            if !def.enabled {
+                continue;
+            }
+            if !self.is_model_downloaded(id) {
+                match self.download_model(id) {
                     Ok(path) => paths.push(path),
                     Err(e) => {
-                        let error_msg = format!("{}: {}", info.name, e);
+                        let error_msg = format!("{}: {}", def.name, e);
                         log::error!("Failed to download {}", error_msg);
                         errors.push(error_msg);
                     }
@@ -210,23 +274,32 @@ impl ModelDownloader {
         Ok(paths)
     }
 
-    /// Get total size of all models
     pub fn get_total_size() -> f64 {
-        MODELS.iter().map(|m| m.size_mb).sum()
+        let config = match Self::load_config() {
+            Ok(c) => c,
+            Err(_) => return 0.0,
+        };
+        config.models.values().filter(|def| def.enabled).map(|def| def.size_mb).sum()
     }
 
-    /// List models with their download status
-    pub fn list_models_status(&self) -> Vec<(&'static ModelInfo, bool)> {
-        MODELS.iter()
-            .map(|info| {
-                let downloaded = self.models_dir.join(info.filename).exists();
-                (*info, downloaded)
+    pub fn list_models_status(&self) -> Vec<(&'static str, bool)> {
+        self.config
+            .models
+            .iter()
+            .filter(|(_, def)| def.enabled)
+            .map(|(id, def)| {
+                let downloaded = self.models_dir.join(&def.filename).exists();
+                // Use Box::leak to get 'static lifetime
+                (Box::leak(id.clone().into_boxed_str()) as &str, downloaded)
             })
             .collect()
     }
 }
 
-/// Async model downloader for use in UI
+// =============================================================================
+// Async Downloader Wrapper
+// =============================================================================
+
 pub struct AsyncDownloader {
     downloader: Arc<Mutex<ModelDownloader>>,
 }
@@ -246,7 +319,7 @@ impl AsyncDownloader {
             d.set_progress_callback(callback);
         }
     }
-    
+
     pub fn set_huggingface_token(&self, token: String) {
         if let Ok(mut d) = self.downloader.lock() {
             d.set_huggingface_token(token);
@@ -277,7 +350,7 @@ impl AsyncDownloader {
         }
     }
 
-    pub fn list_models_status(&self) -> Vec<(&'static ModelInfo, bool)> {
+    pub fn list_models_status(&self) -> Vec<(&'static str, bool)> {
         if let Ok(d) = self.downloader.lock() {
             d.list_models_status()
         } else {

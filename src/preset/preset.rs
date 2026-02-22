@@ -12,19 +12,19 @@ use std::path::Path;
 pub struct Preset {
     /// Preset name
     pub name: String,
-    
+
     /// Transform settings
     pub transform: TransformConfig,
-    
+
     /// Depth-to-flat settings
     pub depth_to_flat: DepthToFlatConfig,
-    
+
     /// Feature preservation settings
     pub features: FeaturePreserveConfig,
-    
+
     /// Edge settings
     pub edges: EdgeConfig,
-    
+
     /// Palette settings
     pub palette: PaletteConfig,
 }
@@ -50,7 +50,7 @@ impl Preset {
         log::info!("Saved preset: {:?}", path);
         Ok(())
     }
-    
+
     /// Load preset from file
     pub fn load(path: &Path) -> Result<Self> {
         let json = std::fs::read_to_string(path)?;
@@ -58,7 +58,7 @@ impl Preset {
         log::info!("Loaded preset: {:?}", path);
         Ok(preset)
     }
-    
+
     /// Get built-in presets
     pub fn built_in_presets() -> Vec<Preset> {
         vec![
@@ -71,6 +71,8 @@ impl Preset {
                     rotation: 0.0,
                     offset_x: 0.0,
                     offset_y: 0.0,
+                    flip_horizontal: false,
+                    flip_vertical: false,
                     clip_to_face: false,
                     clip_padding: 0.2,
                     export_scale: 1,
@@ -107,10 +109,16 @@ impl Preset {
                     mode: crate::processing::PaletteMode::Auto,
                     max_colors: 12,
                     per_region_limit: true,
-                    ..Default::default()
+                    preset: crate::processing::PresetPalette::None,
+                    custom_colors: Vec::new(),
+                    skin_override: None,
+                    hair_override: None,
+                    eye_override: None,
+                    lip_override: None,
+                    background_override: None,
                 },
             },
-            
+
             // Portrait - Detailed
             Preset {
                 name: "Portrait - Detailed".to_string(),
@@ -120,6 +128,8 @@ impl Preset {
                     rotation: 0.0,
                     offset_x: 0.0,
                     offset_y: 0.0,
+                    flip_horizontal: false,
+                    flip_vertical: false,
                     clip_to_face: false,
                     clip_padding: 0.2,
                     export_scale: 1,
@@ -156,10 +166,16 @@ impl Preset {
                     mode: crate::processing::PaletteMode::Auto,
                     max_colors: 32,
                     per_region_limit: true,
-                    ..Default::default()
+                    preset: crate::processing::PresetPalette::None,
+                    custom_colors: Vec::new(),
+                    skin_override: None,
+                    hair_override: None,
+                    eye_override: None,
+                    lip_override: None,
+                    background_override: None,
                 },
             },
-            
+
             // Game Boy Style
             Preset {
                 name: "Game Boy Style".to_string(),
@@ -169,6 +185,8 @@ impl Preset {
                     rotation: 0.0,
                     offset_x: 0.0,
                     offset_y: 0.0,
+                    flip_horizontal: false,
+                    flip_vertical: false,
                     clip_to_face: false,
                     clip_padding: 0.2,
                     export_scale: 2,
@@ -203,9 +221,15 @@ impl Preset {
                 },
                 palette: PaletteConfig {
                     mode: crate::processing::PaletteMode::Preset,
-                    preset: crate::processing::PresetPalette::GameBoy,
                     max_colors: 4,
-                    ..Default::default()
+                    per_region_limit: false,
+                    preset: crate::processing::PresetPalette::GameBoy,
+                    custom_colors: Vec::new(),
+                    skin_override: None,
+                    hair_override: None,
+                    eye_override: None,
+                    lip_override: None,
+                    background_override: None,
                 },
             },
         ]
