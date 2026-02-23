@@ -189,7 +189,7 @@ fn generate_hybrid_palette(
     // Apply overrides
     if let Some(skin) = &config.skin_override {
         palette.regions.insert(
-            SegmentationRegion::Face,
+            SegmentationRegion::Skin,
             skin.iter().map(|&c| Rgba([c.r(), c.g(), c.b(), 255])).collect(),
         );
     }

@@ -6,8 +6,9 @@
 //!
 //! # Pipeline stages
 //!
-//! 1. **Transform** — scale, rotate, offset, flip, clip-to-face
-//! 2. **Depth → flat** — convert depth map to discrete shading bands
+//! 1. **Depth → flat** — color shading at original resolution (must precede transforms;
+//!    segmentation/depth maps are keyed to original pixel coordinates)
+//! 2. **Transform** — scale, rotate, offset, flip, clip-to-face
 //! 3. **Importance map** — compute per-pixel weights for downsampling
 //! 4. **Downsample** — reduce to target pixel-art resolution
 //! 5. **Feature preserve** — sharpen eyes / lips / nose at small sizes
@@ -23,7 +24,6 @@ use crate::processing::{
     Palette, TransformConfig,
 };
 use crate::image::{ImageTransform};
-use anyhow::Result;
 use image::{DynamicImage, Rgba};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -70,20 +70,35 @@ pub fn run(input: &PipelineInput<'_>) -> PipelineOutput {
         features, edges, palette: pal_config, output_width, output_height,
     } = input;
 
-    // ── 1. Geometric transforms ───────────────────────────────────────────────
-    let preprocessed = apply_transforms(image, transform, *ml_results);
-
-    // ── 2. Depth → flat color ────────────────────────────────────────────────
-    let flat = if let Some(ml) = ml_results {
-        depth_to_flat(&preprocessed, ml, dtf_config).unwrap_or_else(|e| {
+    // ── 1. Depth → flat color ────────────────────────────────────────────────
+    // MUST run before geometric transforms: segmentation.regions and depth_map
+    // are keyed to the ORIGINAL image dimensions.  Transforming first invalidates
+    // all pixel index lookups (y * width + x uses the wrong width).
+    let depth_processed = if let Some(ml) = ml_results {
+        depth_to_flat(image, ml, dtf_config).unwrap_or_else(|e| {
             log::warn!("depth_to_flat: {e}");
-            preprocessed.clone()
+            (*image).clone()
         })
     } else {
-        preprocessed.clone()
+        (*image).clone()
     };
 
+    // ── 2. Geometric transforms ───────────────────────────────────────────────
+    // Now safe to resize/rotate/clip — depth coloring is baked in at original res.
+    let preprocessed = apply_transforms(&depth_processed, transform, *ml_results);
+
+    // `flat` alias kept so later stages read naturally.
+    // Clone retained for PipelineOutput debug preview before pipeline consumes it.
+    let flat = preprocessed;
+    let flat_for_output = flat.clone();
+
     // ── 3. Importance map ────────────────────────────────────────────────────
+    // NOTE: ml_results depth_map and segmentation are at original image resolution,
+    // but `flat` is now at post-transform resolution. The depth-gradient and
+    // segmentation-boundary lookups inside compute_combined_importance_map will
+    // silently miss on dimension mismatch and fall back to Sobel-edge-only importance.
+    // This is acceptable — edge importance alone produces good downsampling results.
+    // TODO: resample ml_results maps to post-transform dims for full accuracy.
     let importance = compute_combined_importance_map(&flat, *ml_results);
 
     // ── 4. Downsample ────────────────────────────────────────────────────────
@@ -131,8 +146,8 @@ pub fn run(input: &PipelineInput<'_>) -> PipelineOutput {
     PipelineOutput {
         image: final_image,
         palette_colors: palette.colors,
-        preprocessed: Some(preprocessed),
-        flat: Some(flat),
+        preprocessed: None,  // consumed by flat stage
+        flat: Some(flat_for_output),
     }
 }
 

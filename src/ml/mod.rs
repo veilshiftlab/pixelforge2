@@ -34,8 +34,8 @@ pub use analysis::MLAnalysis;
 pub use config::*;
 pub use types::*;
 
-// Public model structs — needed by ModelManager and tests
-pub use models::yolov8_face::YoloV8FaceDetector;
-pub use models::depth_anything::DepthAnythingEstimator;
-pub use models::bisenet::BiSeNetSegmenter;
-pub use models::teed::TeedEdgeDetector;
+// // Public model structs — needed by ModelManager and tests
+// pub use models::yolov8_face::YoloV8FaceDetector;
+// pub use models::depth_anything::DepthAnythingEstimator;
+// pub use models::bisenet::BiSeNetSegmenter;
+// pub use models::teed::TeedEdgeDetector;

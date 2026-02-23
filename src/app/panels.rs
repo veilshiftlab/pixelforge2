@@ -170,12 +170,25 @@ fn badge(ui: &mut egui::Ui, label: &str, active: bool) {
 
 fn depth_to_flat_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     ui.collapsing("🎨 Depth → Flat", |ui| {
-        // Shading band counts per region — DragValue is best for small integers
+        let dtf = &mut app.depth_to_flat_config;
+
+        // ── Depth influence ───────────────────────────────────────────────────
+        ui.add(
+            egui::Slider::new(&mut dtf.depth_influence, 0.0..=1.0)
+                .text("Depth influence")
+                .fixed_decimals(2),
+        ).on_hover_text(
+            "How strongly depth shading overrides the photo's existing lighting.\n             0 = photo only  ·  0.4 = balanced blend  ·  1 = depth only"
+        );
+
+        ui.separator();
+
+        // ── Tonal bands ───────────────────────────────────────────────────────
+        ui.label(egui::RichText::new("Tonal bands").small().weak());
         for (label, val) in [
-            ("Skin",       &mut app.depth_to_flat_config.skin_tone_bands),
-            ("Hair",       &mut app.depth_to_flat_config.hair_bands),
-            ("Clothing",   &mut app.depth_to_flat_config.clothing_bands),
-            ("Background", &mut app.depth_to_flat_config.background_bands),
+            ("Skin",     &mut dtf.skin_tone_bands),
+            ("Hair",     &mut dtf.hair_bands),
+            ("Clothing", &mut dtf.clothing_bands),
         ] {
             ui.horizontal(|ui| {
                 ui.label(label);
@@ -186,9 +199,49 @@ fn depth_to_flat_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
         }
 
         ui.add_space(4.0);
-        ui.add(egui::Slider::new(&mut app.depth_to_flat_config.shadow_threshold,    0.0..=0.5).text("Shadow"));
-        ui.add(egui::Slider::new(&mut app.depth_to_flat_config.highlight_threshold, 0.5..=1.0).text("Highlight"));
-        ui.checkbox(&mut app.depth_to_flat_config.preserve_gradients, "Preserve gradients");
+        ui.add(egui::Slider::new(&mut dtf.shadow_threshold,    0.0..=0.5).text("Shadow"));
+        ui.add(egui::Slider::new(&mut dtf.highlight_threshold, 0.5..=1.0).text("Highlight"));
+
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut dtf.preserve_gradients, "Soft bands");
+            if dtf.preserve_gradients {
+                ui.add(
+                    egui::Slider::new(&mut dtf.gradient_preservation, 0.0..=1.0)
+                        .fixed_decimals(2)
+                        .text("Softness"),
+                );
+            }
+        });
+
+        ui.separator();
+
+        // ── Background separation ─────────────────────────────────────────────
+        ui.label(egui::RichText::new("Background separation").small().weak());
+
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut dtf.use_otsu_threshold, "Auto threshold");
+            ui.label(egui::RichText::new("(Otsu per-image)").small().weak());
+        });
+
+        if !dtf.use_otsu_threshold {
+            ui.add(
+                egui::Slider::new(&mut dtf.bg_depth_threshold, 0.1..=0.95)
+                    .text("BG threshold")
+                    .fixed_decimals(2),
+            ).on_hover_text("Depth value above which pixels are classified as background.\n0 = nearest · 1 = farthest");
+        }
+
+        ui.add(
+            egui::Slider::new(&mut dtf.bg_desaturation, 0.0..=1.0)
+                .text("BG desaturate")
+                .fixed_decimals(2),
+        );
+
+        ui.add(
+            egui::Slider::new(&mut dtf.bg_lightness_shift, -0.5..=0.2)
+                .text("BG darken")
+                .fixed_decimals(2),
+        ).on_hover_text("Negative = darken background, positive = lighten");
     });
 }
 
