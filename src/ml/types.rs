@@ -9,11 +9,14 @@ pub struct MLResults {
     /// Detected face landmarks
     pub landmarks: Option<FaceLandmarks>,
 
-    /// Depth map (normalized 0.0-1.0)
+    /// Depth map (normalized 0.0–1.0, row-major, same dims as input image)
     pub depth_map: Option<Vec<f32>>,
 
     /// Segmentation results
     pub segmentation: Option<SegmentationResult>,
+
+    /// Edge map from TEED (normalized 0.0–1.0, row-major, same dims as input image)
+    pub edge_map: Option<Vec<f32>>,
 
     /// Face bounding box
     pub face_bounds: Option<FaceBounds>,
@@ -22,7 +25,7 @@ pub struct MLResults {
     pub face: Option<FaceDetectionOutput>,
 }
 
-/// Face bounding box
+/// Face bounding box — coordinates normalized to 0.0–1.0 relative to original image
 #[derive(Debug, Clone, Copy)]
 pub struct FaceBounds {
     pub x: f32,
@@ -31,10 +34,21 @@ pub struct FaceBounds {
     pub height: f32,
 }
 
-/// Facial landmarks
+impl FaceBounds {
+    /// Convert normalized bounds to pixel coordinates for a given image size
+    pub fn to_pixels(&self, img_w: u32, img_h: u32) -> (u32, u32, u32, u32) {
+        let x = (self.x * img_w as f32) as u32;
+        let y = (self.y * img_h as f32) as u32;
+        let w = (self.width * img_w as f32) as u32;
+        let h = (self.height * img_h as f32) as u32;
+        (x, y, w, h)
+    }
+}
+
+/// Facial landmarks — all coordinates normalized to 0.0–1.0 relative to original image
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FaceLandmarks {
-    /// All landmark points (normalized 0.0-1.0)
+    /// All landmark points (normalized)
     pub points: Vec<(f32, f32)>,
 
     /// Left eye region
@@ -66,32 +80,25 @@ impl Default for FaceLandmarks {
     }
 }
 
-/// A landmark region with bounds
+/// A landmark region with center and approximate size (normalized)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LandmarkRegion {
-    /// Center X (normalized)
     pub center_x: f32,
-
-    /// Center Y (normalized)
     pub center_y: f32,
-
-    /// Width (normalized)
     pub width: f32,
-
-    /// Height (normalized)
     pub height: f32,
 }
 
-/// Segmentation results
+/// Per-pixel segmentation results at original image resolution
 #[derive(Debug, Clone)]
 pub struct SegmentationResult {
-    /// Region map (pixel index -> region type)
+    /// Per-pixel region labels (pixel index = y * width + x)
     pub regions: HashMap<u32, SegmentationRegion>,
 
-    /// Region bounding boxes
+    /// Bounding box per region (x_min, y_min, x_max, y_max) normalized
     pub region_bounds: HashMap<SegmentationRegion, (f32, f32, f32, f32)>,
-    
-    /// Confidence map
+
+    /// Per-pixel confidence scores
     pub confidence: Vec<f32>,
 }
 
@@ -105,31 +112,85 @@ impl Default for SegmentationResult {
     }
 }
 
-/// Segmentation region types
+/// Segmentation region types — maps to BiSeNet's 19 classes without discarding information.
+///
+/// Preserving fine-grained regions allows downstream pixel art processing to apply
+/// distinct palette, dithering, and detail strategies per region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SegmentationRegion {
     #[default]
     Background,
-    Face,
-    Hair,
-    Eyes,
+    /// General skin / face surface
+    Skin,
+    /// Left eyebrow
+    LeftEyebrow,
+    /// Right eyebrow
+    RightEyebrow,
+    /// Left eye (iris + sclera)
+    LeftEye,
+    /// Right eye (iris + sclera)
+    RightEye,
+    /// Eyeglasses frame and lenses
+    Eyeglasses,
+    /// Left ear
+    LeftEar,
+    /// Right ear
+    RightEar,
+    /// Earring / jewelry (generic)
+    Earring,
+    /// Nose
     Nose,
-    Lips,
-    Ears,
+    /// Inner mouth / teeth
+    InnerMouth,
+    /// Upper lip
+    UpperLip,
+    /// Lower lip
+    LowerLip,
+    /// Neck
     Neck,
-    Clothing,
+    /// Hair
+    Hair,
+    /// Hat or head covering
+    Hat,
+}
+
+impl SegmentationRegion {
+    /// Returns true for regions that contain fine detail important for pixel art fidelity
+    pub fn is_high_detail(&self) -> bool {
+        matches!(
+            self,
+            Self::LeftEye
+                | Self::RightEye
+                | Self::UpperLip
+                | Self::LowerLip
+                | Self::InnerMouth
+                | Self::Nose
+                | Self::LeftEyebrow
+                | Self::RightEyebrow
+        )
+    }
+
+    /// Returns true for regions that benefit from special hair-rendering treatment
+    pub fn is_hair_like(&self) -> bool {
+        matches!(self, Self::Hair | Self::Hat)
+    }
+
+    /// Returns true for skin-tone regions
+    pub fn is_skin_like(&self) -> bool {
+        matches!(self, Self::Skin | Self::Neck)
+    }
 }
 
 /// Face detection result
 #[derive(Debug, Clone)]
 pub struct FaceDetectionResult {
-    /// Detected face bounds
+    /// Detected face bounds (normalized)
     pub bounds: Option<FaceBounds>,
 
-    /// Facial landmarks
+    /// Facial landmarks (normalized)
     pub landmarks: Option<FaceLandmarks>,
 
-    /// Detection confidence
+    /// Detection confidence 0.0–1.0
     pub confidence: f32,
 }
 
@@ -143,15 +204,47 @@ impl Default for FaceDetectionResult {
     }
 }
 
-/// Face detection output for ML results
+/// Face detection output stored in MLResults
 #[derive(Debug, Clone, Default)]
 pub struct FaceDetectionOutput {
-    /// Detected face bounds
+    /// Detected face bounds (normalized)
     pub bounds: Option<FaceBounds>,
 
-    /// Facial landmark points
+    /// 5 facial landmark points in model order:
+    /// [left_eye, right_eye, nose_tip, left_mouth, right_mouth] (normalized)
     pub landmarks: Vec<(f32, f32)>,
 
     /// Detection confidence
     pub confidence: f32,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Compatibility aliases for existing call sites
+//
+// preview.rs, depth_to_flat.rs, and palette.rs use the old coarse region names.
+// Rather than updating all of those files now, we provide these type aliases
+// so they continue to compile unchanged.
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl SegmentationRegion {
+    /// Alias: any skin-surface region  (maps to `Skin`)
+    #[allow(non_upper_case_globals)]
+    pub const Face: Self = Self::Skin;
+
+    /// Alias: either eye (maps to `LeftEye`)
+    #[allow(non_upper_case_globals)]
+    pub const Eyes: Self = Self::LeftEye;
+
+    /// Alias: upper or lower lip (maps to `UpperLip`)
+    #[allow(non_upper_case_globals)]
+    pub const Lips: Self = Self::UpperLip;
+
+    /// Alias: either ear (maps to `LeftEar`)
+    #[allow(non_upper_case_globals)]
+    pub const Ears: Self = Self::LeftEar;
+
+    /// Alias: clothing / garments (maps to `Hat` as the closest remaining region)
+    /// TODO: add a dedicated `Clothing` variant when a scene-segmentation model is added
+    #[allow(non_upper_case_globals)]
+    pub const Clothing: Self = Self::Hat;
 }

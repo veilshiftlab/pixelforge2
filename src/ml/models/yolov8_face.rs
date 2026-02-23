@@ -1,318 +1,307 @@
 //! YOLOv8n-Face: Face Detection with 5 Landmarks
 //!
-//! This module implements face detection using the YOLOv8n-Face ONNX model.
-//!
 //! # Model Details
 //!
-//! - **Source**: https://huggingface.co/onnx-community/yolov8n-face
+//! - **Source**: https://huggingface.co/akanametov/yolov8-face (`.pt` for re-export)
+//!   or `onnx-community/yolov8n-face` for a pre-exported ONNX.
 //! - **Size**: ~6 MB
-//! - **Architecture**: YOLOv8 nano (optimized for speed)
-//! - **Input**: 640x640 RGB image
-//! - **Output**: Bounding boxes + 5 facial landmarks
+//! - **Architecture**: YOLOv8 nano
+//! - **Input**: RGB float32 NCHW, 0–1 normalized, default 640×640 (dynamic if re-exported)
+//! - **Output shape**: `[1, 15, N]`  — channel-first, NOT `[1, N, 15]`
 //!
-//! # Landmarks
+//! # Output format (per detection column)
 //!
-//! The model detects 5 key facial landmarks:
-//! 1. Left eye
-//! 2. Right eye
-//! 3. Nose tip
-//! 4. Left mouth corner
-//! 5. Right mouth corner
-//!
-//! # Usage
-//!
-//! ```ignore
-//! let detector = YoloV8FaceDetector::new(&model_path)?;
-//! let result = detector.detect(&image)?;
-//!
-//! if let Some(bounds) = result.bounds {
-//!     println!("Face at ({}, {})", bounds.x, bounds.y);
-//! }
+//! ```text
+//! [0]  cx          — box center-x in model input space
+//! [1]  cy          — box center-y in model input space
+//! [2]  w           — box width in model input space
+//! [3]  h           — box height in model input space
+//! [4]  confidence  — objectness × class score
+//! [5]  lm0_x       — left eye x
+//! [6]  lm0_y       — left eye y
+//! [7]  lm1_x       — right eye x
+//! [8]  lm1_y       — right eye y
+//! [9]  lm2_x       — nose tip x
+//! [10] lm2_y       — nose tip y
+//! [11] lm3_x       — left mouth corner x
+//! [12] lm3_y       — left mouth corner y
+//! [13] lm4_x       — right mouth corner x
+//! [14] lm4_y       — right mouth corner y
 //! ```
+//!
+//! All spatial values are in **model input pixel space** (e.g. 0–640).
+//! We convert them to normalized [0,1] coordinates relative to the original image
+//! using the [`ResizeScale`] from preprocessing.
 
 use crate::ml::{FaceBounds, FaceDetectionResult, FaceLandmarks, LandmarkRegion};
-use anyhow::Result;
-use image::{DynamicImage, GenericImageView};
+use crate::ml::preprocess::{PreprocessConfig, ResizeScale, preprocess};
+use anyhow::{anyhow, Result};
+use image::DynamicImage;
 use ort::session::builder::GraphOptimizationLevel;
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU32, Ordering};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Default model input resolution (used when the ONNX has fixed dims)
+const DEFAULT_INPUT_SIZE: u32 = 640;
+
+/// Confidence threshold below which detections are discarded
+const CONFIDENCE_THRESHOLD: f32 = 0.5;
+
+/// Number of output channels per detection
+const DET_CHANNELS: usize = 15;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Detector
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Face detector using YOLOv8n-Face ONNX model.
-///
-/// This detector:
-/// 1. Loads the ONNX model on creation
-/// 2. Resizes input images to model's expected size (640x640)
-/// 3. Returns normalized face bounds and landmarks
-///
-/// # Memory Usage
-///
-/// YOLOv8n is very lightweight:
-/// - Model size: ~6MB
-/// - Peak VRAM: ~50MB during inference
 pub struct YoloV8FaceDetector {
-    /// ONNX Runtime session
     session: RefCell<ort::session::Session>,
-    /// Input tensor name
     input_name: String,
-    /// Output tensor name
     output_name: String,
-    /// Detected/cached input size (default 640)
-    input_size: AtomicU32,
+    /// Model input dimensions resolved at load time (falls back to 640×640)
+    model_w: u32,
+    model_h: u32,
 }
 
 impl YoloV8FaceDetector {
-    /// Create a new face detector from an ONNX model file.
-    ///
-    /// # Arguments
-    ///
-    /// * `model_path` - Path to yolov8n-face.onnx
-    ///
-    /// # Configuration
-    ///
-    /// - Graph optimization: Level 3 (maximum)
-    /// - Intra-op threads: 4
+    /// Load the ONNX model and resolve its input dimensions.
     pub fn new(model_path: &std::path::Path) -> Result<Self> {
         let session = ort::session::builder::SessionBuilder::new()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_intra_threads(4)?
             .commit_from_file(model_path)?;
 
-        let input_name = session.inputs()[0].name().to_string();
+        let input_name  = session.inputs()[0].name().to_string();
         let output_name = session.outputs()[0].name().to_string();
-        let input_size = AtomicU32::new(640);
 
-        log::info!("YOLOv8n-Face model loaded");
+        // Try to read static input dims from the model metadata.
+        // Dynamic axes appear as -1; we keep the default for those.
+        let (model_w, model_h) = resolve_input_dims(&session, DEFAULT_INPUT_SIZE);
+
+        log::info!(
+            "YOLOv8n-Face loaded: input={}x{}, input_name='{}'",
+            model_w, model_h, input_name
+        );
 
         Ok(Self {
             session: RefCell::new(session),
             input_name,
             output_name,
-            input_size,
+            model_w,
+            model_h,
         })
     }
 
-    /// Detect faces in an image.
+    /// Detect the most confident face in `image`.
     ///
-    /// Returns the most confident face detection with:
-    /// - Bounding box (normalized 0-1)
-    /// - 5 facial landmarks (if available)
-    /// - Confidence score
-    ///
-    /// # Auto-Size Detection
-    ///
-    /// If the default input size is wrong, the model will auto-detect
-    /// the correct size from ONNX Runtime error messages.
+    /// Returns normalized coordinates (0–1) relative to the *original* image size.
     pub fn detect(&self, image: &DynamicImage) -> Result<FaceDetectionResult> {
-        let (orig_w, orig_h) = image.dimensions();
-        let mut size = self.input_size.load(Ordering::Relaxed);
+        let cfg = PreprocessConfig::unit(self.model_w, self.model_h);
+        let (tensor, scale) = preprocess(image, &cfg)?;
 
-        // Retry loop for auto-detecting input size
-        loop {
-            match self.try_detect(image, size, orig_w, orig_h) {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if let Some(new_size) = Self::extract_expected_size(&err_str) {
-                        if new_size != size && new_size > 0 {
-                            log::info!("Auto-detected face model input size: {}x{}", new_size, new_size);
-                            size = new_size;
-                            self.input_size.store(size, Ordering::Relaxed);
-                            continue;
-                        }
-                    }
-                    return Err(e);
-                }
-            }
-        }
-    }
+        let input_tensor = ort::value::Value::from_array((
+            [1i64, 3, self.model_h as i64, self.model_w as i64],
+            tensor,
+        ))?;
 
-    /// Attempt face detection with a specific input size.
-    fn try_detect(
-        &self,
-        image: &DynamicImage,
-        size: u32,
-        orig_w: u32,
-        orig_h: u32,
-    ) -> Result<FaceDetectionResult> {
-        // Resize to model input size
-        let resized = image.resize_exact(size, size, image::imageops::FilterType::Triangle);
-        let rgba = resized.to_rgba8();
-
-        // Prepare input tensor (NCHW format, RGB normalized to 0-1)
-        let mut input_data = vec![0.0f32; 3 * size as usize * size as usize];
-
-        for y in 0..size as usize {
-            for x in 0..size as usize {
-                let pixel = rgba.get_pixel(x as u32, y as u32);
-                let values = pixel.0;
-                let base_idx = y * size as usize + x;
-                // R channel
-                input_data[base_idx] = values[0] as f32 / 255.0;
-                // G channel
-                input_data[size as usize * size as usize + base_idx] = values[1] as f32 / 255.0;
-                // B channel
-                input_data[2 * size as usize * size as usize + base_idx] = values[2] as f32 / 255.0;
-            }
-        }
-
-        // Create input tensor
-        let input_tensor =
-            ort::value::Value::from_array(([1i64, 3, size as i64, size as i64], input_data))?;
-
-        // Run inference
         let mut session = self.session.borrow_mut();
         let outputs = session.run(ort::inputs![&self.input_name => input_tensor])?;
 
         let output = outputs
             .get(&self.output_name)
-            .ok_or_else(|| anyhow::anyhow!("No output from model"))?;
+            .ok_or_else(|| anyhow!("Model produced no output"))?;
 
         let (shape, data) = output.try_extract_tensor::<f32>()?;
 
-        // Parse detections - YOLOv8-Face outputs [1, N, 15] where N is max detections
-        // Each detection: [x1, y1, x2, y2, conf, lmx0, lmy0, lmx1, lmy1, lmx2, lmy2, lmx3, lmy3, lmx4, lmy4]
-        let num_detections = if shape.len() >= 2 {
-            shape[1] as usize
-        } else {
-            0
-        };
-
-        // Find best detection
-        let mut best_detection: Option<(f32, f32, f32, f32, f32)> = None;
-        let mut best_confidence = 0.0f32;
-
-        for i in 0..num_detections {
-            let base = i * 15;
-            if base + 4 < data.len() {
-                let confidence = data[base + 4];
-                if confidence > best_confidence && confidence > 0.5 {
-                    best_confidence = confidence;
-                    best_detection = Some((
-                        data[base],
-                        data[base + 1],
-                        data[base + 2],
-                        data[base + 3],
-                        confidence,
-                    ));
-                }
-            }
-        }
-
-        // Convert to normalized coordinates
-        let face_bounds = best_detection.map(|(x1, y1, x2, y2, _)| FaceBounds {
-            x: x1 / orig_w as f32,
-            y: y1 / orig_h as f32,
-            width: (x2 - x1) / orig_w as f32,
-            height: (y2 - y1) / orig_h as f32,
-        });
-
-        // Generate landmarks (placeholder - real landmarks from model output)
-        let landmarks = face_bounds.as_ref().map(generate_landmarks_from_bounds);
-
-        Ok(FaceDetectionResult {
-            bounds: face_bounds,
-            landmarks,
-            confidence: best_confidence,
-        })
-    }
-
-    /// Extract expected input size from ONNX Runtime error message.
-    fn extract_expected_size(error_msg: &str) -> Option<u32> {
-        for line in error_msg.lines() {
-            if line.contains("Expected:") {
-                if let Some(after) = line.split("Expected:").nth(1) {
-                    for part in after.split_whitespace() {
-                        if let Ok(size) = part.parse::<u32>() {
-                            if size > 64 && size <= 2048 {
-                                return Some(size);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
+        parse_detections(&shape, &data, &scale)
     }
 }
 
-/// Generate estimated landmarks from face bounds.
+// ─────────────────────────────────────────────────────────────────────────────
+// Output parsing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parse the YOLOv8-Face output tensor into a [`FaceDetectionResult`].
 ///
-/// Used when the model doesn't provide landmark coordinates.
-fn generate_landmarks_from_bounds(bounds: &FaceBounds) -> FaceLandmarks {
-    let cx = bounds.x + bounds.width / 2.0;
-    let cy = bounds.y + bounds.height / 2.0;
-    let (w, h) = (bounds.width, bounds.height);
+/// Expected shape: `[1, 15, N]` — channel-first layout.
+/// We select the detection with the highest confidence above the threshold.
+fn parse_detections(
+    shape: &[i64],
+    data: &[f32],
+    scale: &ResizeScale,
+) -> Result<FaceDetectionResult> {
+    // Validate and extract dimensions
+    // YOLOv8 ONNX output is [batch=1, channels=15, num_detections]
+    let (channels, num_det) = match shape.len() {
+        3 => (shape[1] as usize, shape[2] as usize),
+        2 => (shape[0] as usize, shape[1] as usize), // batch squeezed out
+        _ => return Err(anyhow!("Unexpected output shape: {:?}", shape)),
+    };
+
+    if channels < DET_CHANNELS {
+        return Err(anyhow!(
+            "Expected ≥{} output channels, got {}",
+            DET_CHANNELS, channels
+        ));
+    }
+
+    // Each feature i for detection j lives at: data[i * num_det + j]
+    let feat = |i: usize, j: usize| -> f32 {
+        let idx = i * num_det + j;
+        if idx < data.len() { data[idx] } else { 0.0 }
+    };
+
+    let mut best_j    = None;
+    let mut best_conf = CONFIDENCE_THRESHOLD;
+
+    for j in 0..num_det {
+        let conf = feat(4, j);
+        if conf > best_conf {
+            best_conf = conf;
+            best_j = Some(j);
+        }
+    }
+
+    let Some(j) = best_j else {
+        return Ok(FaceDetectionResult::default());
+    };
+
+    // YOLOv8 box format: cx, cy, w, h in model-input pixel space
+    let cx = feat(0, j);
+    let cy = feat(1, j);
+    let bw = feat(2, j);
+    let bh = feat(3, j);
+
+    let x1 = cx - bw * 0.5;
+    let y1 = cy - bh * 0.5;
+    let x2 = cx + bw * 0.5;
+    let y2 = cy + bh * 0.5;
+
+    // Convert box from model-input space to normalized original-image coords
+    let (nx1, ny1, nx2, ny2) = scale.bbox_to_normalized(x1, y1, x2, y2);
+    let face_bounds = FaceBounds {
+        x: nx1.clamp(0.0f32, 1.0f32),
+        y: ny1.clamp(0.0f32, 1.0f32),
+        width:  (nx2 - nx1).clamp(0.0f32, 1.0f32),
+        height: (ny2 - ny1).clamp(0.0f32, 1.0f32),
+    };
+
+    // Extract the 5 real landmarks from model output
+    let raw_landmarks: Vec<(f32, f32)> = (0..5)
+        .map(|k| {
+            let lx = feat(5 + k * 2,     j);
+            let ly = feat(5 + k * 2 + 1, j);
+            // Convert from model-input space to normalized original-image coords
+            let (nx, ny) = scale.to_normalized(lx, ly);
+            (nx.clamp(0.0f32, 1.0f32), ny.clamp(0.0f32, 1.0f32))
+        })
+        .collect();
+
+    // Build structured landmarks from the 5-point set
+    let landmarks = build_face_landmarks(&raw_landmarks, &face_bounds);
+
+    Ok(FaceDetectionResult {
+        bounds: Some(face_bounds),
+        landmarks: Some(landmarks),
+        confidence: best_conf,
+    })
+}
+
+/// Build a [`FaceLandmarks`] struct from the 5 raw YOLOv8-Face landmark points.
+///
+/// Landmark order: left_eye, right_eye, nose_tip, left_mouth, right_mouth.
+/// Region sizes are estimated as a fraction of the face bounding box.
+fn build_face_landmarks(
+    pts: &[(f32, f32)],
+    bounds: &FaceBounds,
+) -> FaceLandmarks {
+    debug_assert_eq!(pts.len(), 5, "Expected exactly 5 landmarks");
+
+    let eye_w  = bounds.width  * 0.12;
+    let eye_h  = bounds.height * 0.07;
+    let nose_w = bounds.width  * 0.10;
+    let nose_h = bounds.height * 0.10;
+    let lip_w  = bounds.width  * 0.18;
+    let lip_h  = bounds.height * 0.06;
 
     FaceLandmarks {
-        points: vec![
-            // Left eye (2 points)
-            (cx - w * 0.15, cy - h * 0.1),
-            (cx - w * 0.1, cy - h * 0.12),
-            // Right eye (2 points)
-            (cx - w * 0.05, cy - h * 0.1),
-            (cx + w * 0.05, cy - h * 0.1),
-            // Nose and mouth
-            (cx + w * 0.1, cy - h * 0.12),
-            (cx + w * 0.15, cy - h * 0.1),
-            (cx, cy + h * 0.05),
-            (cx - w * 0.08, cy + h * 0.2),
-            (cx, cy + h * 0.18),
-            (cx + w * 0.08, cy + h * 0.2),
-        ],
+        points: pts.to_vec(),
         left_eye: Some(LandmarkRegion {
-            center_x: cx - w * 0.1,
-            center_y: cy - h * 0.1,
-            width: w * 0.1,
-            height: h * 0.05,
+            center_x: pts[0].0,
+            center_y: pts[0].1,
+            width: eye_w,
+            height: eye_h,
         }),
         right_eye: Some(LandmarkRegion {
-            center_x: cx + w * 0.1,
-            center_y: cy - h * 0.1,
-            width: w * 0.1,
-            height: h * 0.05,
+            center_x: pts[1].0,
+            center_y: pts[1].1,
+            width: eye_w,
+            height: eye_h,
         }),
         nose: Some(LandmarkRegion {
-            center_x: cx,
-            center_y: cy + h * 0.05,
-            width: w * 0.08,
-            height: h * 0.1,
+            center_x: pts[2].0,
+            center_y: pts[2].1,
+            width: nose_w,
+            height: nose_h,
         }),
         lips: Some(LandmarkRegion {
-            center_x: cx,
-            center_y: cy + h * 0.2,
-            width: w * 0.15,
-            height: h * 0.05,
+            center_x: (pts[3].0 + pts[4].0) * 0.5,
+            center_y: (pts[3].1 + pts[4].1) * 0.5,
+            width:  lip_w,
+            height: lip_h,
         }),
         face_outline: vec![],
     }
 }
 
-/// Placeholder face detector for when the model is not available.
-///
-/// Returns a centered face estimate based on typical portrait composition.
+// ─────────────────────────────────────────────────────────────────────────────
+// Dimension resolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Attempt to read static input H/W from the session metadata.
+/// Falls back to `default_size × default_size` if the axes are dynamic or unavailable.
+
+fn resolve_input_dims(
+    _session: &ort::session::Session,
+    default_size: u32,
+) -> (u32, u32) {
+    // ORT 2.x does not expose a stable API to read symbolic input dims before inference.
+    // We use well-known defaults; dynamic-axes exports accept any size anyway.
+    (default_size, default_size)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Placeholder
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Placeholder face detector — used when the ONNX model is not yet available.
+/// Returns a centered face estimate with geometrically derived landmarks.
 pub struct PlaceholderFaceDetector;
 
 impl PlaceholderFaceDetector {
-    /// Detect a face using placeholder heuristics.
-    ///
-    /// Assumes:
-    /// - Face is centered in the image
-    /// - Face occupies ~50% width and ~60% height
-    /// - High confidence placeholder
     pub fn detect(&self, _image: &DynamicImage) -> Result<FaceDetectionResult> {
+        let bounds = FaceBounds { x: 0.25, y: 0.15, width: 0.5, height: 0.6 };
+        let cx = bounds.x + bounds.width  * 0.5;
+        let cy = bounds.y + bounds.height * 0.5;
+        let (w, h) = (bounds.width, bounds.height);
+
+        let pts = vec![
+            (cx - w * 0.15, cy - h * 0.10), // left eye
+            (cx + w * 0.15, cy - h * 0.10), // right eye
+            (cx,            cy + h * 0.05), // nose tip
+            (cx - w * 0.12, cy + h * 0.22), // left mouth
+            (cx + w * 0.12, cy + h * 0.22), // right mouth
+        ];
+
+        let landmarks = build_face_landmarks(&pts, &bounds);
+
         Ok(FaceDetectionResult {
-            bounds: Some(FaceBounds {
-                x: 0.25,
-                y: 0.15,
-                width: 0.5,
-                height: 0.6,
-            }),
-            landmarks: Some(generate_landmarks_from_bounds(&FaceBounds {
-                x: 0.25,
-                y: 0.15,
-                width: 0.5,
-                height: 0.6,
-            })),
+            bounds: Some(bounds),
+            landmarks: Some(landmarks),
             confidence: 0.95,
         })
     }

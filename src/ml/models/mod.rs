@@ -1,19 +1,18 @@
 //! ML Model Implementations
 //!
-//! This module contains the ONNX model implementations for each ML task:
+//! Each submodule provides:
+//! - A concrete model struct that loads and runs an ONNX model
+//! - A `Placeholder*` struct for testing when models are not yet downloaded
 //!
-//! - **yolov8_face**: Face detection with 5 landmarks
-//! - **depth_anything**: Monocular depth estimation
-//! - **bisenet**: Face parsing / semantic segmentation
-//!
-//! Each model module provides:
-//! - A detector/estimator struct that loads and runs the ONNX model
-//! - A placeholder implementation for when the model is not available
+//! All models use [`crate::ml::preprocess`] for consistent input preparation
+//! and coordinate remapping.
 
-pub mod yolov8_face;
-pub mod depth_anything;
 pub mod bisenet;
+pub mod depth_anything;
+pub mod teed;
+pub mod yolov8_face;
 
-pub use yolov8_face::{YoloV8FaceDetector, PlaceholderFaceDetector};
-pub use depth_anything::{DepthAnythingEstimator, PlaceholderDepthEstimator};
 pub use bisenet::{BiSeNetSegmenter, PlaceholderSegmenter};
+pub use depth_anything::{DepthAnythingEstimator, PlaceholderDepthEstimator};
+pub use teed::{PlaceholderEdgeDetector, TeedEdgeDetector};
+pub use yolov8_face::{PlaceholderFaceDetector, YoloV8FaceDetector};

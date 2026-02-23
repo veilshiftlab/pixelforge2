@@ -1,183 +1,155 @@
 //! Depth-Anything V2: Monocular Depth Estimation
+//!
+//! # Model Details
+//!
+//! - **Recommended**: `depth-anything-v2-small` (~100 MB) — `onnx-community/depth-anything-v2-small`
+//! - **Input**: RGB float32 NCHW, 0–1 normalized, default 518×518 (dynamic if re-exported)
+//! - **Output**: `[1, H, W]` or `[H, W]` — relative depth (higher = farther for ViT models)
+//!
+//! # Output semantics
+//!
+//! Depth-Anything produces *relative* depth. We normalize to [0, 1] post-inference
+//! (0 = nearest, 1 = farthest).
+//!
+//! # Coordinate mapping
+//!
+//! The output is bilinearly upsampled to original resolution using per-axis scale
+//! factors from [`ResizeScale`]. This is essential for non-square inputs — a 256×512
+//! image has different X/Y resize ratios when squashed to a square model input, and
+//! using a single shared scale factor introduces spatial distortion in the depth map.
 
-use anyhow::Result;
-use image::{DynamicImage, GenericImageView};
+use crate::ml::preprocess::{
+    normalize_min_max, upsample_map_to_original, PreprocessConfig, preprocess,
+};
+use anyhow::{anyhow, Result};
+use image::DynamicImage;
 use ort::session::builder::GraphOptimizationLevel;
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU32, Ordering};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Default input size (ViT-S/B/L all use 518; patch size 14 × 37 = 518)
+const DEFAULT_INPUT_SIZE: u32 = 518;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Estimator
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Depth estimator using Depth-Anything V2 ONNX model.
 pub struct DepthAnythingEstimator {
     session: RefCell<ort::session::Session>,
     input_name: String,
     output_name: String,
-    input_size: AtomicU32,
+    /// Model input width (static from export, or DEFAULT_INPUT_SIZE for dynamic models)
+    pub model_w: u32,
+    /// Model input height
+    pub model_h: u32,
 }
 
 impl DepthAnythingEstimator {
+    /// Load the ONNX model.
     pub fn new(model_path: &std::path::Path) -> Result<Self> {
         let session = ort::session::builder::SessionBuilder::new()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_intra_threads(4)?
             .commit_from_file(model_path)?;
 
-        let input_name = session.inputs()[0].name().to_string();
+        let input_name  = session.inputs()[0].name().to_string();
         let output_name = session.outputs()[0].name().to_string();
-        let input_size = AtomicU32::new(256);
 
-        log::info!("Depth-Anything V2 model loaded");
+        log::info!("Depth-Anything V2 loaded: input_name='{}'", input_name);
 
         Ok(Self {
             session: RefCell::new(session),
             input_name,
             output_name,
-            input_size,
+            model_w: DEFAULT_INPUT_SIZE,
+            model_h: DEFAULT_INPUT_SIZE,
         })
     }
 
+    /// Estimate a depth map for `image`.
+    ///
+    /// Returns a flat `Vec<f32>` in row-major order at the *original* image's resolution.
+    /// Values are normalized to [0.0, 1.0] where 0 = nearest, 1 = farthest.
     pub fn estimate(&self, image: &DynamicImage) -> Result<Vec<f32>> {
-        let (orig_w, orig_h) = image.dimensions();
-        let mut size = self.input_size.load(Ordering::Relaxed);
-
-        loop {
-            match self.try_estimate(image, size, orig_w, orig_h) {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if let Some(new_size) = Self::extract_expected_size(&err_str) {
-                        if new_size != size && new_size > 0 {
-                            log::info!("Auto-detected depth model input size: {}x{}", new_size, new_size);
-                            size = new_size;
-                            self.input_size.store(size, Ordering::Relaxed);
-                            continue;
-                        }
-                    }
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    fn try_estimate(
-        &self,
-        image: &DynamicImage,
-        size: u32,
-        orig_w: u32,
-        orig_h: u32,
-    ) -> Result<Vec<f32>> {
-        let resized = image.resize_exact(size, size, image::imageops::FilterType::Triangle);
-        let rgba = resized.to_rgba8();
-
-        let mut input_data = vec![0.0f32; 3 * size as usize * size as usize];
-
-        for y in 0..size as usize {
-            for x in 0..size as usize {
-                let pixel = rgba.get_pixel(x as u32, y as u32);
-                let values = pixel.0;
-                let base_idx = y * size as usize + x;
-                input_data[base_idx] = values[0] as f32 / 255.0;
-                input_data[size as usize * size as usize + base_idx] = values[1] as f32 / 255.0;
-                input_data[2 * size as usize * size as usize + base_idx] = values[2] as f32 / 255.0;
-            }
-        }
+        let cfg = PreprocessConfig::unit(self.model_w, self.model_h);
+        let (tensor, scale) = preprocess(image, &cfg)?;
 
         let input_tensor = ort::value::Value::from_array((
-            [1i64, 3, size as i64, size as i64],
-            input_data,
+            [1i64, 3, self.model_h as i64, self.model_w as i64],
+            tensor,
         ))?;
 
         let mut session = self.session.borrow_mut();
         let outputs = session.run(ort::inputs![&self.input_name => input_tensor])?;
 
-        // Get output by name (using String directly)
-        let output_name = self.output_name.clone();
-        let output = outputs.get(&output_name)
-            .ok_or_else(|| anyhow::anyhow!("No output from model"))?;
+        let output = outputs
+            .get(&self.output_name)
+            .ok_or_else(|| anyhow!("Model produced no depth output"))?;
 
-        let (shape, depth_data) = output.try_extract_tensor::<f32>()?;
+        let (shape, raw) = output.try_extract_tensor::<f32>()?;
 
-        let (dh, dw) = match shape.len() {
+        // Supported output shapes: [1,H,W], [H,W], [1,1,H,W]
+        let (map_h, map_w) = match shape.len() {
             4 => (shape[2] as usize, shape[3] as usize),
             3 => (shape[1] as usize, shape[2] as usize),
-            _ => (size as usize, size as usize),
+            2 => (shape[0] as usize, shape[1] as usize),
+            _ => return Err(anyhow!("Unexpected depth output shape: {:?}", shape)),
         };
 
-        let mut min_depth = f32::MAX;
-        let mut max_depth = f32::MIN;
-        for &d in depth_data.iter() {
-            min_depth = min_depth.min(d);
-            max_depth = max_depth.max(d);
+        let map_size = map_h * map_w;
+        if raw.len() < map_size {
+            return Err(anyhow!(
+                "Depth output too small: expected {} values, got {}",
+                map_size, raw.len()
+            ));
         }
-        let range = (max_depth - min_depth).max(0.001);
+        // Strip leading batch/channel dims (all size 1) by taking the last H*W elements
+        let map_slice = &raw[raw.len() - map_size..];
 
-        let mut depth_map = Vec::with_capacity((orig_w * orig_h) as usize);
+        let mut upsampled = upsample_map_to_original(map_slice, map_w, map_h, &scale);
+        normalize_min_max(&mut upsampled);
 
-        for orig_y in 0..orig_h as usize {
-            for orig_x in 0..orig_w as usize {
-                let depth_y = (orig_y * dh / orig_h as usize).min(dh - 1);
-                let depth_x = (orig_x * dw / orig_w as usize).min(dw - 1);
-
-                let idx = match shape.len() {
-                    4 => depth_y * dw + depth_x,
-                    3 => depth_y * dw + depth_x,
-                    _ => depth_y * dw + depth_x,
-                };
-
-                let d = if idx < depth_data.len() { depth_data[idx] } else { 0.5 };
-                depth_map.push(((d - min_depth) / range).clamp(0.0, 1.0));
-            }
-        }
-
-        Ok(depth_map)
-    }
-
-    fn extract_expected_size(error_msg: &str) -> Option<u32> {
-        for line in error_msg.lines() {
-            if line.contains("Expected:") {
-                if let Some(after) = line.split("Expected:").nth(1) {
-                    for part in after.split_whitespace() {
-                        if let Ok(size) = part.parse::<u32>() {
-                            if size > 64 && size <= 2048 {
-                                return Some(size);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
+        Ok(upsampled)
     }
 }
 
-/// Placeholder depth estimator.
+// ─────────────────────────────────────────────────────────────────────────────
+// Placeholder
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Placeholder depth estimator — radial gradient blended with inverted luminance.
+/// Gives visually plausible depth for testing without a real model.
 pub struct PlaceholderDepthEstimator;
 
 impl PlaceholderDepthEstimator {
     pub fn estimate(&self, image: &DynamicImage) -> Result<Vec<f32>> {
-        let (width, height) = image.dimensions();
-        let mut depth_map = vec![0.5f32; (width * height) as usize];
+        use image::GenericImageView;
 
-        let center_x = width as f32 / 2.0;
-        let center_y = height as f32 / 2.0;
-        let max_dist = center_x.hypot(center_y).max(1.0);
+        let (w, h) = image.dimensions();
+        let cx = w as f32 * 0.5;
+        let cy = h as f32 * 0.5;
+        let max_r = cx.hypot(cy).max(1.0);
 
-        for y in 0..height {
-            for x in 0..width {
-                let dist = ((x as f32 - center_x).powi(2) + (y as f32 - center_y).powi(2)).sqrt();
-                depth_map[(y * width + x) as usize] = 1.0 - (dist / max_dist * 0.5).min(1.0);
-            }
-        }
-
+        // Convert to luma once, index by flat offset
         let gray = image.to_luma8();
-        for (i, depth) in depth_map.iter_mut().enumerate() {
-            let x = (i % width as usize) as u32;
-            let y = (i / width as usize) as u32;
-            if x < width && y < height {
-                let luminance = gray.get_pixel(x, y)[0] as f32 / 255.0;
-                *depth = (*depth * 0.7 + (1.0 - luminance) * 0.3).clamp(0.0, 1.0);
-            }
-        }
+        let luma: Vec<f32> = gray.pixels().map(|p| p[0] as f32 / 255.0).collect();
 
-        Ok(depth_map)
+        let mut depth: Vec<f32> = (0..h)
+            .flat_map(|y| {
+                (0..w).map(move |x| {
+                    let r = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt();
+                    1.0 - (r / max_r * 0.5).min(1.0)
+                })
+            })
+            .zip(luma.iter())
+            .map(|(radial, &lum)| (radial * 0.7 + (1.0 - lum) * 0.3).clamp(0.0, 1.0))
+            .collect();
+
+        normalize_min_max(&mut depth);
+        Ok(depth)
     }
 }

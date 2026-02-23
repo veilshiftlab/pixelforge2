@@ -1,18 +1,20 @@
-//! Application state and types
+//! Application state
 
 use crate::config::AppConfig;
+use crate::ml::{MLConfig, MLResults};
+use crate::models::ModelManager;
 use crate::processing::{
     DepthToFlatConfig, EdgeConfig, FeaturePreserveConfig, PaletteConfig,
     ProcessingState, TransformConfig,
 };
-use crate::ml::{MLConfig, MLResults};
-use crate::models::ModelManager;
-use eframe::egui;
-use egui::TextureHandle;
+use eframe::egui::{self, TextureHandle};
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-/// Output aspect ratio mode
+// ─────────────────────────────────────────────────────────────────────────────
+// Sub-types
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AspectRatioMode {
     #[default]
@@ -21,54 +23,50 @@ pub enum AspectRatioMode {
     Custom,
 }
 
-/// Preview tab
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PreviewTab {
     #[default]
     Original,
-    MLAnalysis,
+    MLMaps,
     Output,
 }
 
-/// Wrapper for input image with texture
 pub struct InputImage {
     pub image: image::DynamicImage,
     pub texture: TextureHandle,
     pub path: Option<std::path::PathBuf>,
 }
 
-/// Wrapper for output image with texture
 pub struct OutputImage {
     pub image: image::DynamicImage,
     pub texture: TextureHandle,
     pub palette: Vec<egui::Color32>,
 }
 
-/// Main application state
-pub struct PixelForgeApp {
-    /// Application configuration
-    pub config: AppConfig,
+// ─────────────────────────────────────────────────────────────────────────────
+// Application state
+// ─────────────────────────────────────────────────────────────────────────────
 
-    /// Model manager
+pub struct PixelForgeApp {
+    // ── Core ─────────────────────────────────────────────────────────────────
+    pub config: AppConfig,
     pub model_manager: Arc<RwLock<ModelManager>>,
 
-    /// Currently loaded image
+    // ── Images ───────────────────────────────────────────────────────────────
     pub input_image: Option<InputImage>,
-
-    /// Intermediate processing results
+    /// Post-transform, pre-downsample (for debugging)
     pub preprocessed_image: Option<image::DynamicImage>,
+    /// Post depth-to-flat intermediate
     pub flat_color_image: Option<image::DynamicImage>,
-
-    /// ML analysis results
-    pub ml_results: Option<MLResults>,
-
-    /// Processing output
     pub output_image: Option<OutputImage>,
 
-    /// Processing state
+    // ── ML ───────────────────────────────────────────────────────────────────
+    pub ml_results: Option<MLResults>,
+
+    // ── Pipeline state ───────────────────────────────────────────────────────
     pub processing: ProcessingState,
 
-    /// Control configurations
+    // ── Configs ──────────────────────────────────────────────────────────────
     pub ml_config: MLConfig,
     pub transform_config: TransformConfig,
     pub depth_to_flat_config: DepthToFlatConfig,
@@ -76,51 +74,43 @@ pub struct PixelForgeApp {
     pub edge_config: EdgeConfig,
     pub palette_config: PaletteConfig,
 
-    /// Aspect ratio mode
+    // ── Output sizing ─────────────────────────────────────────────────────────
     pub aspect_mode: AspectRatioMode,
     pub custom_output_width: u32,
     pub custom_output_height: u32,
 
-    /// Preview toggles
-    pub show_landmarks: bool,
-    pub show_depth_heatmap: bool,
-    pub show_segmentation: bool,
-
-    /// Preview tab
+    // ── Preview ──────────────────────────────────────────────────────────────
     pub preview_tab: PreviewTab,
+    pub preview_zoom: f32,
+    pub show_landmarks: bool,
+    pub show_segmentation_overlay: bool,
 
-    /// Currently loaded preset name
+    // ── Presets ──────────────────────────────────────────────────────────────
     pub current_preset: Option<String>,
 
-    /// System info
-    pub vram_usage: u64,
-    pub total_vram: u64,
-    
-    /// Preview zoom
-    pub preview_zoom: f32,
-
-    /// UI state
+    // ── Dialogs ──────────────────────────────────────────────────────────────
     pub show_model_dialog: bool,
     pub show_about_dialog: bool,
     pub show_token_dialog: bool,
-
-    /// HuggingFace API token for model downloads
-    pub huggingface_token: String,
-    
-    /// Temporary token input (for dialog)
     pub token_input: String,
 
-    /// File to load
+    // ── Auth ─────────────────────────────────────────────────────────────────
+    pub huggingface_token: String,
+
+    // ── System info ──────────────────────────────────────────────────────────
+    pub vram_usage: u64,
+    pub total_vram: u64,
+
+    // ── Async helpers ────────────────────────────────────────────────────────
     pub pending_file_load: Option<std::path::PathBuf>,
 }
 
 impl PixelForgeApp {
-    /// Create a new application instance
     pub fn new(cc: &eframe::CreationContext<'_>, config: AppConfig) -> Self {
         super::theme::apply_theme(&cc.egui_ctx, &config.ui.theme);
 
         let model_manager = Arc::new(RwLock::new(
-            ModelManager::new().unwrap_or_default()
+            ModelManager::new().unwrap_or_default(),
         ));
 
         Self {
@@ -129,8 +119,8 @@ impl PixelForgeApp {
             input_image: None,
             preprocessed_image: None,
             flat_color_image: None,
-            ml_results: None,
             output_image: None,
+            ml_results: None,
             processing: ProcessingState::Idle,
             ml_config: MLConfig::default(),
             transform_config: TransformConfig::default(),
@@ -141,19 +131,18 @@ impl PixelForgeApp {
             aspect_mode: AspectRatioMode::Square,
             custom_output_width: 64,
             custom_output_height: 64,
-            show_landmarks: true,
-            show_depth_heatmap: false,
-            show_segmentation: false,
             preview_tab: PreviewTab::Original,
-            current_preset: None,
-            vram_usage: 0,
-            total_vram: 4096,
             preview_zoom: 1.0,
+            show_landmarks: true,
+            show_segmentation_overlay: false,
+            current_preset: None,
             show_model_dialog: false,
             show_about_dialog: false,
             show_token_dialog: false,
-            huggingface_token: String::new(),
             token_input: String::new(),
+            huggingface_token: String::new(),
+            vram_usage: 0,
+            total_vram: 4096,
             pending_file_load: None,
         }
     }
@@ -161,28 +150,22 @@ impl PixelForgeApp {
 
 impl eframe::App for PixelForgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Handle pending file load
         if let Some(path) = self.pending_file_load.take() {
             super::processing::load_image(self, &path, ctx);
         }
 
-        // Handle drag and drop
         ctx.input(|i| {
-            if !i.raw.dropped_files.is_empty() {
-                if let Some(file) = i.raw.dropped_files.first() {
-                    if let Some(path) = &file.path {
-                        super::processing::load_image(self, path, ctx);
-                    }
+            if let Some(file) = i.raw.dropped_files.first() {
+                if let Some(path) = &file.path {
+                    self.pending_file_load = Some(path.clone());
                 }
             }
         });
 
-        // Request repaint while processing
         if matches!(self.processing, ProcessingState::Running(_)) {
             ctx.request_repaint();
         }
 
-        // Draw UI
         super::menu::draw(self, ctx);
         super::panels::draw_left(self, ctx);
         super::panels::draw_right(self, ctx);
@@ -190,15 +173,8 @@ impl eframe::App for PixelForgeApp {
         super::panels::draw_status(self, ctx);
         super::preview::draw(self, ctx);
 
-        // Dialogs
-        if self.show_model_dialog {
-            super::dialogs::model_dialog(self, ctx);
-        }
-        if self.show_about_dialog {
-            super::dialogs::about_dialog(self, ctx);
-        }
-        if self.show_token_dialog {
-            super::dialogs::token_dialog(self, ctx);
-        }
+        if self.show_model_dialog { super::dialogs::model_dialog(self, ctx); }
+        if self.show_about_dialog { super::dialogs::about_dialog(self, ctx); }
+        if self.show_token_dialog { super::dialogs::token_dialog(self, ctx); }
     }
 }

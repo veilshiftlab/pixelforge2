@@ -1,359 +1,405 @@
-//! Central preview panel with tabs
+//! Central preview panel
 
 use super::state::{PixelForgeApp, PreviewTab};
+use crate::ml::SegmentationRegion;
 use eframe::egui;
 use image::GenericImageView;
+use std::cmp::Reverse;
+use std::collections::HashMap;
 
-/// Draw central preview panel
+// ─────────────────────────────────────────────────────────────────────────────
+// Entry point
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub fn draw(app: &mut PixelForgeApp, ctx: &egui::Context) {
     egui::CentralPanel::default().show(ctx, |ui| {
-        // Tab bar
         ui.horizontal(|ui| {
             for (tab, label) in [
                 (PreviewTab::Original, "📷 Original"),
-                (PreviewTab::MLAnalysis, "🤖 ML Analysis"),
-                (PreviewTab::Output, "🎨 Output"),
+                (PreviewTab::MLMaps,   "🤖 ML Maps"),
+                (PreviewTab::Output,   "🎨 Output"),
             ] {
                 if ui.selectable_label(app.preview_tab == tab, label).clicked() {
                     app.preview_tab = tab;
                 }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(egui::Slider::new(&mut app.preview_zoom, 0.25..=8.0).text("Zoom").logarithmic(true));
+            });
         });
-        
+
         ui.separator();
 
-        // Content based on selected tab
         match app.preview_tab {
-            PreviewTab::Original => original_panel(app, ui, ctx),
-            PreviewTab::MLAnalysis => ml_preview_panel(app, ui, ctx),
-            PreviewTab::Output => output_panel(app, ui, ctx),
+            PreviewTab::Original => original_panel(app, ui),
+            PreviewTab::MLMaps   => ml_panel(app, ui, ctx),
+            PreviewTab::Output   => output_panel(app, ui, ctx),
         }
     });
 }
 
-fn original_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, _ctx: &egui::Context) {
-    if let Some(input) = &app.input_image {
-        let (img_w, img_h) = input.image.dimensions();
-        let available = ui.available_size();
-        
-        let scale = calculate_fit_scale(img_w, img_h, available);
-        let display_w = (img_w as f32 * scale * app.preview_zoom) as f32;
-        let display_h = (img_h as f32 * scale * app.preview_zoom) as f32;
+// ─────────────────────────────────────────────────────────────────────────────
+// Original tab
+// ─────────────────────────────────────────────────────────────────────────────
 
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                ui.label(format!("{}×{} pixels", img_w, img_h));
-                ui.separator();
-                ui.label(format!("Zoom: {:.1}×", app.preview_zoom));
-                ui.separator();
-                if ui.button("Fit").clicked() {
-                    app.preview_zoom = 1.0;
-                }
-                if ui.button("2×").clicked() {
-                    app.preview_zoom = 2.0;
-                }
-                if ui.button("4×").clicked() {
-                    app.preview_zoom = 4.0;
-                }
-            });
-            
-            ui.separator();
-            
-            let remaining = ui.available_size();
-            let spacer_x = (remaining.x - display_w).max(0.0) / 2.0;
-            ui.add_space(spacer_x);
-            
-            let texture = &input.texture;
-            ui.image(egui::load::SizedTexture::new(texture.id(), egui::Vec2::new(display_w, display_h)));
-        });
-    } else {
+fn original_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
+    if app.input_image.is_none() {
         drop_zone(app, ui);
+        return;
     }
+    let input = app.input_image.as_ref().unwrap();
+    let (img_w, img_h) = input.image.dimensions();
+    let available = ui.available_size();
+    let scale = fit_scale(img_w, img_h, available) * app.preview_zoom;
+    let dw = img_w as f32 * scale;
+    let dh = img_h as f32 * scale;
+
+    // Info row
+    ui.horizontal(|ui| {
+        ui.label(format!("{}×{}", img_w, img_h));
+        if let Some(path) = &input.path {
+            if let Some(name) = path.file_name() {
+                ui.separator();
+                ui.label(egui::RichText::new(name.to_string_lossy()).weak());
+            }
+        }
+        ui.separator();
+        for (label, zoom) in [("Fit", 1.0f32), ("2×", 2.0), ("4×", 4.0)] {
+            if ui.small_button(label).clicked() { app.preview_zoom = zoom; }
+        }
+    });
+
+    ui.separator();
+
+    let tex_id = input.texture.id();
+    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+        // Centre the image when smaller than the scroll area
+        let avail = ui.available_size();
+        if dw < avail.x { ui.add_space((avail.x - dw) * 0.5); }
+        ui.image(egui::load::SizedTexture::new(tex_id, egui::Vec2::new(dw, dh)));
+    });
 }
 
-fn ml_preview_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
-    // Clone data BEFORE using in closure to avoid borrow conflicts
-    let ml_results = app.ml_results.clone();
+// ─────────────────────────────────────────────────────────────────────────────
+// ML Maps tab
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn ml_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
     let has_input = app.input_image.is_some();
-    let input_dims = app.input_image.as_ref().map(|i| i.image.dimensions());
-    let is_processing = matches!(app.processing, crate::processing::ProcessingState::Running(_));
-    
-    if let Some(results) = ml_results {
-        let mut rerun_clicked = false;
-        
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.heading("ML Analysis Results");
-            ui.separator();
+    let is_running = matches!(app.processing, crate::processing::ProcessingState::Running(_));
 
-            // Face Detection Section
-            ui.collapsing("👤 Face Detection", |ui| {
-                if results.landmarks.is_some() {
-                    ui.label(egui::RichText::new("✅ Face detected").color(egui::Color32::GREEN));
-                    
-                    if let Some(ref bounds) = results.face_bounds {
-                        ui.label(format!("Position: ({:.1}%, {:.1}%)", bounds.x * 100.0, bounds.y * 100.0));
-                        ui.label(format!("Size: {:.1}% × {:.1}%", bounds.width * 100.0, bounds.height * 100.0));
-                    }
-                    
-                    if let Some(ref lm) = results.landmarks {
-                        ui.label(format!("Landmarks: {} points", lm.points.len()));
-                    }
-                } else {
-                    ui.label(egui::RichText::new("⚠ No face detected").color(egui::Color32::YELLOW));
-                }
-            });
+    if !has_input {
+        centered_hint(ui, "Load an image first");
+        return;
+    }
 
-            // Depth Map Section
-            ui.collapsing("📐 Depth Estimation", |ui| {
-                if let Some(ref depth) = results.depth_map {
-                    ui.label(egui::RichText::new("✅ Depth map generated").color(egui::Color32::GREEN));
-                    
-                    if let Some((w, h)) = input_dims {
-                        ui.label(format!("Resolution: {}×{}", w, h));
-                        
-                        let min = depth.iter().cloned().fold(f32::INFINITY, f32::min);
-                        let max = depth.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                        let avg = depth.iter().sum::<f32>() / depth.len() as f32;
-                        
-                        ui.label(format!("Range: {:.3} - {:.3} | Avg: {:.3}", min, max, avg));
-                        
-                        ui.add_space(8.0);
-                        ui.label("Depth Map Visualization:");
-                        
-                        if let Some(depth_texture) = create_depth_texture(depth, w, h, ctx) {
-                            let available = ui.available_width();
-                            let display_scale = (available / w as f32).min(1.0);
-                            let display_w = w as f32 * display_scale;
-                            let display_h = h as f32 * display_scale;
-                            
-                            ui.image(egui::load::SizedTexture::new(depth_texture.id(), egui::Vec2::new(display_w, display_h)));
-                        }
-                    }
-                } else {
-                    ui.label("⚠ Depth estimation not run");
-                }
-            });
-
-            // Segmentation Section
-            ui.collapsing("🎨 Segmentation", |ui| {
-                if let Some(ref seg) = results.segmentation {
-                    ui.label(egui::RichText::new("✅ Segmentation complete").color(egui::Color32::GREEN));
-                    ui.label(format!("Pixels analyzed: {}", seg.regions.len()));
-                    
-                    use std::collections::HashMap;
-                    let mut region_counts: HashMap<crate::ml::SegmentationRegion, usize> = HashMap::new();
-                    for region in seg.regions.values() {
-                        *region_counts.entry(*region).or_insert(0) += 1;
-                    }
-                    
-                    ui.label("Region breakdown:");
-                    for (region, count) in region_counts {
-                        let pct = count as f32 / seg.regions.len() as f32 * 100.0;
-                        ui.label(format!("  {:?}: {} pixels ({:.1}%)", region, count, pct));
-                    }
-                    
-                    ui.add_space(8.0);
-                    ui.label("Segmentation Map Visualization:");
-                    
-                    if let Some((w, h)) = input_dims {
-                        if let Some(seg_texture) = create_segmentation_texture(&seg.regions, w, h, ctx) {
-                            let available = ui.available_width();
-                            let display_scale = (available / w as f32).min(1.0);
-                            let display_w = w as f32 * display_scale;
-                            let display_h = h as f32 * display_scale;
-                            
-                            ui.image(egui::load::SizedTexture::new(seg_texture.id(), egui::Vec2::new(display_w, display_h)));
-                        }
-                    }
-                } else {
-                    ui.label("⚠ Segmentation not run");
-                }
-            });
-            
-            ui.add_space(10.0);
-            
-            let enabled = !is_processing;
-            if ui.add_enabled(enabled, egui::Button::new("🔄 Re-run Analysis")).clicked() {
-                rerun_clicked = true;
-            }
-        });
-        
-        // Call outside closure to avoid borrow conflict
-        if rerun_clicked {
-            super::processing::run_ml_analysis(app, ctx);
-        }
-    } else if has_input {
+    if app.ml_results.is_none() {
         ui.vertical_centered(|ui| {
-            ui.add_space(100.0);
-            ui.label("ML analysis not yet run");
-            ui.add_space(20.0);
-            let enabled = !is_processing;
-            if ui.add_enabled(enabled, egui::Button::new("▶ Run ML Analysis")).clicked() {
+            ui.add_space(80.0);
+            ui.label("ML analysis has not been run yet.");
+            ui.add_space(12.0);
+            if ui.add_enabled(!is_running, egui::Button::new("▶ Run Analysis")).clicked() {
                 super::processing::run_ml_analysis(app, ctx);
             }
         });
-    } else {
-        ui.vertical_centered(|ui| {
-            ui.add_space(100.0);
-            ui.label("Load an image first");
+        return;
+    }
+
+    let (img_w, img_h) = app.input_image.as_ref().unwrap().image.dimensions();
+
+    // Snapshot the lightweight parts before entering the collapsing closures
+    // so we don't hold a borrow on app.ml_results through the whole scroll area.
+    let has_face  = app.ml_results.as_ref().unwrap().face_bounds.is_some();
+    let has_depth = app.ml_results.as_ref().unwrap().depth_map.is_some();
+    let has_seg   = app.ml_results.as_ref().unwrap().segmentation.is_some();
+    let has_edge  = app.ml_results.as_ref().unwrap().edge_map.is_some();
+
+    let face_conf_str = app.ml_results.as_ref()
+        .and_then(|r| r.face.as_ref())
+        .map(|f| format!("{:.1}%", f.confidence * 100.0));
+
+    let face_bounds_str = app.ml_results.as_ref()
+        .and_then(|r| r.face_bounds)
+        .map(|b| format!("{:.1}%×{:.1}% at ({:.1}%, {:.1}%)",
+            b.width*100.0, b.height*100.0, b.x*100.0, b.y*100.0));
+
+    let depth_stats = app.ml_results.as_ref()
+        .and_then(|r| r.depth_map.as_deref())
+        .map(|d| {
+            let mn = d.iter().cloned().fold(f32::INFINITY,     f32::min);
+            let mx = d.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let av = d.iter().sum::<f32>() / d.len().max(1) as f32;
+            (mn, mx, av)
         });
+
+    // Build textures now (before the scroll area closure captures app)
+    let depth_tex = app.ml_results.as_ref()
+        .and_then(|r| r.depth_map.as_deref())
+        .and_then(|d| depth_texture(d, img_w, img_h, ctx));
+
+    let seg_tex = app.ml_results.as_ref()
+        .and_then(|r| r.segmentation.as_ref())
+        .and_then(|s| seg_texture(&s.regions, img_w, img_h, ctx));
+
+    let edge_tex = app.ml_results.as_ref()
+        .and_then(|r| r.edge_map.as_deref())
+        .and_then(|e| edge_texture(e, img_w, img_h, ctx));
+
+    // Region breakdown is the only thing that needs cloning (it's a HashMap)
+    let region_summary: Vec<(SegmentationRegion, f32)> = app.ml_results.as_ref()
+        .and_then(|r| r.segmentation.as_ref())
+        .map(|s| {
+            let total = s.regions.len().max(1);
+            let mut counts: HashMap<SegmentationRegion, usize> = HashMap::new();
+            for &r in s.regions.values() { *counts.entry(r).or_insert(0) += 1; }
+            let mut pairs: Vec<_> = counts.into_iter()
+                .map(|(r, n)| (r, n as f32 / total as f32 * 100.0))
+                .collect();
+            pairs.sort_by_key(|(_, pct)| Reverse((*pct * 1000.0) as u32));
+            pairs.truncate(8);
+            pairs
+        })
+        .unwrap_or_default();
+
+    let mut rerun = false;
+
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+
+        // ── Face detection ──────────────────────────────────────────────────
+        ui.collapsing("👤 Face Detection", |ui| {
+            if has_face {
+                ui.colored_label(egui::Color32::GREEN, "✅ Detected");
+                if let Some(ref s) = face_conf_str   { ui.label(format!("Confidence: {}", s)); }
+                if let Some(ref s) = face_bounds_str  { ui.label(s); }
+                if let Some(ref r) = app.ml_results {
+                    if let Some(ref lm) = r.landmarks {
+                        ui.label(format!("{} landmark points", lm.points.len()));
+                    }
+                }
+            } else {
+                ui.colored_label(egui::Color32::YELLOW, "⚠ No face detected");
+                ui.label(egui::RichText::new("Lower the confidence threshold and re-run.").small().weak());
+            }
+        });
+
+        // ── Depth map ───────────────────────────────────────────────────────
+        ui.collapsing("📐 Depth Map", |ui| {
+            if has_depth {
+                ui.colored_label(egui::Color32::GREEN, "✅ Generated");
+                if let Some((mn, mx, av)) = depth_stats {
+                    ui.label(format!("Range {:.3}–{:.3}  avg {:.3}", mn, mx, av));
+                }
+                if let Some(ref tex) = depth_tex {
+                    map_image(ui, tex.id(), img_w, img_h);
+                }
+            } else {
+                ui.label("Not run");
+            }
+        });
+
+        // ── Segmentation ────────────────────────────────────────────────────
+        ui.collapsing("🎨 Face Parsing", |ui| {
+            if has_seg {
+                ui.colored_label(egui::Color32::GREEN, "✅ Complete");
+                for (region, pct) in &region_summary {
+                    let (r, g, b, _) = region.rgba();
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("■").color(egui::Color32::from_rgb(r, g, b)));
+                        ui.label(format!("{}: {:.1}%", region.display_name(), pct));
+                    });
+                }
+                if let Some(ref tex) = seg_tex {
+                    map_image(ui, tex.id(), img_w, img_h);
+                }
+            } else {
+                ui.label("Not run");
+            }
+        });
+
+        // ── Edges ───────────────────────────────────────────────────────────
+        ui.collapsing("✏ Edge Map (TEED)", |ui| {
+            if has_edge {
+                ui.colored_label(egui::Color32::GREEN, "✅ Generated");
+                if let Some(ref tex) = edge_tex {
+                    map_image(ui, tex.id(), img_w, img_h);
+                }
+            } else {
+                ui.label("Not run");
+                ui.label(egui::RichText::new("Enable TEED in ML Analysis and re-run.").small().weak());
+            }
+        });
+
+        ui.add_space(8.0);
+        if ui.add_enabled(!is_running, egui::Button::new("🔄 Re-run Analysis")).clicked() {
+            rerun = true;
+        }
+    });
+
+    if rerun {
+        super::processing::run_ml_analysis(app, ctx);
     }
 }
 
-fn output_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
-    let mut reprocess_clicked = false;
-    let has_input = app.input_image.is_some();
-    
-    let output_data = app.output_image.as_ref().map(|output| {
-        let (img_w, img_h) = output.image.dimensions();
-        let texture_id = output.texture.id();
-        let palette_len = output.palette.len();
-        (img_w, img_h, texture_id, palette_len)
-    });
-    
-    if let Some((img_w, img_h, texture_id, palette_len)) = output_data {
-        let available = ui.available_size();
-        
-        let base_scale = calculate_fit_scale(img_w, img_h, available);
-        let scale = base_scale * app.preview_zoom;
-        let display_w = (img_w as f32 * scale).max(8.0);
-        let display_h = (img_h as f32 * scale).max(8.0);
+// ─────────────────────────────────────────────────────────────────────────────
+// Output tab
+// ─────────────────────────────────────────────────────────────────────────────
 
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                ui.label(format!("{}×{} pixels", img_w, img_h));
-                ui.separator();
-                ui.label(format!("{} colors", palette_len));
-                ui.separator();
-                ui.label(format!("Display: {:.1}×", scale));
-            });
-            
-            ui.separator();
-            
-            let remaining = ui.available_size();
-            let spacer_x = (remaining.x - display_w).max(0.0) / 2.0;
-            ui.add_space(spacer_x);
-            
-            ui.image(egui::load::SizedTexture::new(texture_id, egui::Vec2::new(display_w, display_h)));
-            
-            ui.separator();
-            
-            if ui.button("🔄 Re-process").clicked() {
-                reprocess_clicked = true;
+fn output_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
+    let has_input  = app.input_image.is_some();
+    let is_running = matches!(app.processing, crate::processing::ProcessingState::Running(_));
+
+    let output_info = app.output_image.as_ref().map(|o| {
+        let (w, h) = o.image.dimensions();
+        (w, h, o.texture.id(), o.palette.len())
+    });
+
+    let mut reprocess = false;
+
+    if let Some((img_w, img_h, tex_id, pal_len)) = output_info {
+        let available = ui.available_size();
+        let scale = fit_scale(img_w, img_h, available) * app.preview_zoom;
+        let dw = img_w as f32 * scale;
+        let dh = img_h as f32 * scale;
+
+        ui.horizontal(|ui| {
+            ui.label(format!("{}×{}  ·  {} colors  ·  {:.1}×", img_w, img_h, pal_len, scale));
+            for (label, zoom) in [("Fit", 1.0f32), ("2×", 2.0), ("4×", 4.0)] {
+                if ui.small_button(label).clicked() { app.preview_zoom = zoom; }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_enabled(!is_running, egui::Button::new("🔄 Re-process")).clicked() {
+                    reprocess = true;
+                }
+            });
+        });
+
+        ui.separator();
+
+        egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+            let avail = ui.available_size();
+            if dw < avail.x { ui.add_space((avail.x - dw) * 0.5); }
+            ui.image(egui::load::SizedTexture::new(tex_id, egui::Vec2::new(dw, dh)));
         });
     } else {
         ui.vertical_centered(|ui| {
-            ui.add_space(100.0);
-            ui.label("Output will appear here after processing");
-            
+            ui.add_space(80.0);
+            ui.label("Output will appear here after processing.");
             if has_input {
-                ui.add_space(20.0);
-                if ui.button("▶ Process Now").clicked() {
-                    reprocess_clicked = true;
+                ui.add_space(12.0);
+                if ui.add_enabled(!is_running, egui::Button::new("▶ Process Now")).clicked() {
+                    reprocess = true;
                 }
             }
         });
     }
-    
-    // Call outside closure
-    if reprocess_clicked {
+
+    if reprocess {
         super::processing::process_image(app, ctx);
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Drop zone
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn drop_zone(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
-    let available = ui.available_size();
-    
-    ui.allocate_ui_with_layout(
-        [available.x, available.y].into(),
-        egui::Layout::top_down(egui::Align::Center),
-        |ui| {
-            ui.add_space(60.0);
-            ui.label(egui::RichText::new("📷").size(64.0));
-            ui.add_space(20.0);
-            ui.label(egui::RichText::new("Drop image here").size(20.0));
-            ui.label(egui::RichText::new("or").size(14.0).weak());
-            ui.add_space(10.0);
-            if ui.button(egui::RichText::new("Browse...").size(16.0)).clicked() {
-                super::processing::open_file_dialog(app);
-            }
-            ui.add_space(20.0);
-            ui.label(egui::RichText::new("Supported: PNG, JPG, JPEG, WebP, BMP").small().weak());
-        }
-    );
-}
+    let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
 
-/// Calculate scale to fit image in available space
-pub fn calculate_fit_scale(image_width: u32, image_height: u32, available: egui::Vec2) -> f32 {
-    let img_aspect = image_width as f32 / image_height as f32;
-    let avail_aspect = if available.y > 0.0 { available.x / available.y } else { 1.0 };
-    
-    let scale = if img_aspect > avail_aspect {
-        available.x / image_width as f32
-    } else {
-        available.y / image_height as f32
-    };
-    
-    scale * 0.95
-}
-
-/// Create a texture from depth map for visualization
-fn create_depth_texture(depth: &[f32], width: u32, height: u32, ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    let mut pixels = Vec::with_capacity(depth.len());
-    
-    for &d in depth {
-        let val = (d.clamp(0.0, 1.0) * 255.0) as u8;
-        pixels.push(egui::Color32::from_rgb(val, val, val));
+    // Draw a highlight rect when something is being dragged over
+    let rect = ui.available_rect_before_wrap();
+    if hovering {
+        ui.painter().rect_filled(
+            rect,
+            8.0,
+            egui::Color32::from_rgba_unmultiplied(100, 160, 255, 25),
+        );
+        ui.painter().rect_stroke(
+            rect,
+            8.0,
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 160, 255)),
+        );
     }
-    
-    let color_image = egui::ColorImage {
-        size: [width as usize, height as usize],
-        pixels,
-    };
-    
-    Some(ctx.load_texture("depth_map", color_image, egui::TextureOptions::default()))
+
+    ui.vertical_centered(|ui| {
+        ui.add_space(60.0);
+        ui.label(egui::RichText::new("📷").size(64.0));
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new(if hovering { "Release to open" } else { "Drop an image here" }).size(20.0));
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("or").size(13.0).weak());
+        ui.add_space(8.0);
+        if ui.button(egui::RichText::new("Browse…").size(15.0)).clicked() {
+            super::processing::open_file_dialog(app);
+        }
+        ui.add_space(16.0);
+        ui.label(egui::RichText::new("PNG · JPG · WebP · BMP").small().weak());
+    });
 }
 
-/// Create a texture from segmentation map for visualization
-fn create_segmentation_texture(
-    regions: &std::collections::HashMap<u32, crate::ml::SegmentationRegion>,
-    width: u32,
-    height: u32,
-    ctx: &egui::Context,
-) -> Option<egui::TextureHandle> {
-    use crate::ml::SegmentationRegion;
-    
-    let region_colors = |region: SegmentationRegion| -> egui::Color32 {
-        match region {
-            SegmentationRegion::Background => egui::Color32::from_rgb(30, 30, 30),
-            SegmentationRegion::Face => egui::Color32::from_rgb(255, 200, 150),
-            SegmentationRegion::Eyes => egui::Color32::from_rgb(100, 150, 255),
-            SegmentationRegion::Nose => egui::Color32::from_rgb(200, 150, 100),
-            SegmentationRegion::Lips => egui::Color32::from_rgb(255, 100, 100),
-            SegmentationRegion::Hair => egui::Color32::from_rgb(139, 90, 43),
-            SegmentationRegion::Ears => egui::Color32::from_rgb(230, 180, 140),
-            SegmentationRegion::Neck => egui::Color32::from_rgb(245, 195, 155),
-            SegmentationRegion::Clothing => egui::Color32::from_rgb(100, 150, 100),
-        }
-    };
-    
-    let mut pixels = Vec::with_capacity((width * height) as usize);
-    
-    for y in 0..height {
-        for x in 0..width {
-            let idx = (y * width + x) as u32;
-            let color = regions.get(&idx)
-                .map(|&r| region_colors(r))
-                .unwrap_or(egui::Color32::from_rgb(30, 30, 30));
-            pixels.push(color);
+// ─────────────────────────────────────────────────────────────────────────────
+// Texture builders — called once per frame while the maps tab is open.
+// egui caches textures by name and pixel data, so repeated calls with the
+// same data are a no-op after the first upload.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn depth_texture(depth: &[f32], w: u32, h: u32, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    if depth.len() != (w * h) as usize { return None; }
+    let pixels: Vec<egui::Color32> = depth.iter()
+        .map(|&d| { let (r,g,b) = turbo(d.clamp(0.0,1.0)); egui::Color32::from_rgb(r,g,b) })
+        .collect();
+    Some(ctx.load_texture("ml_depth", egui::ColorImage { size: [w as usize, h as usize], pixels }, egui::TextureOptions::default()))
+}
+
+fn seg_texture(regions: &HashMap<u32, SegmentationRegion>, w: u32, h: u32, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let total = (w * h) as usize;
+    if total == 0 { return None; }
+    let mut pixels = vec![egui::Color32::from_rgb(30, 30, 30); total];
+    for (&idx, &region) in regions {
+        if (idx as usize) < total {
+            let (r,g,b,_) = region.rgba();
+            pixels[idx as usize] = egui::Color32::from_rgb(r,g,b);
         }
     }
-    
-    let color_image = egui::ColorImage {
-        size: [width as usize, height as usize],
-        pixels,
-    };
-    
-    Some(ctx.load_texture("segmentation_map", color_image, egui::TextureOptions::default()))
+    Some(ctx.load_texture("ml_seg", egui::ColorImage { size: [w as usize, h as usize], pixels }, egui::TextureOptions::default()))
+}
+
+fn edge_texture(edges: &[f32], w: u32, h: u32, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    if edges.len() != (w * h) as usize { return None; }
+    let pixels: Vec<egui::Color32> = edges.iter()
+        .map(|&e| { let v = (e.clamp(0.0,1.0)*255.0) as u8; egui::Color32::from_rgb(v,v,v) })
+        .collect();
+    Some(ctx.load_texture("ml_edges", egui::ColorImage { size: [w as usize, h as usize], pixels }, egui::TextureOptions::default()))
+}
+
+/// Display a map scaled to fit the available panel width (never upscale)
+fn map_image(ui: &mut egui::Ui, id: egui::TextureId, map_w: u32, map_h: u32) {
+    let avail = ui.available_width();
+    let scale = (avail / map_w as f32).min(1.0);
+    let dw = map_w as f32 * scale;
+    let dh = map_h as f32 * scale;
+    ui.image(egui::load::SizedTexture::new(id, egui::Vec2::new(dw, dh)));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Colormap & utilities
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Turbo colormap (Mikhailov 2019) — better perceptual range than grayscale for depth.
+/// t=0 → dark, t=0.5 → bright green, t=1 → deep red.
+fn turbo(t: f32) -> (u8, u8, u8) {
+    let r = (0.13572138 + t*(4.61539260 + t*(-42.66032258 + t*(132.13108234 + t*(-152.94239396 + t*59.28637943))))) * 255.0;
+    let g = (0.09140261 + t*(2.19418839 + t*(4.84296658  + t*(-14.18503333 + t*(  4.27729857  + t* 2.82956604))))) * 255.0;
+    let b = (0.10667330 + t*(12.64194608 + t*(-60.58204836 + t*(110.36276771 + t*(-89.90310912 + t*27.34824973))))) * 255.0;
+    (r.clamp(0.0, 255.0) as u8, g.clamp(0.0, 255.0) as u8, b.clamp(0.0, 255.0) as u8)
+}
+
+/// Scale factor to fit an image inside an egui available_size rect (with 1% margin).
+pub fn fit_scale(img_w: u32, img_h: u32, available: egui::Vec2) -> f32 {
+    let sx = available.x / img_w as f32;
+    let sy = if available.y > 0.0 { available.y / img_h as f32 } else { sx };
+    sx.min(sy) * 0.99
+}
+
+fn centered_hint(ui: &mut egui::Ui, text: &str) {
+    ui.vertical_centered(|ui| { ui.add_space(80.0); ui.label(text); });
 }

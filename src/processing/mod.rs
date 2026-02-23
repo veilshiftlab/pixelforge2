@@ -1,7 +1,7 @@
 //! Processing pipeline and configuration
 
 mod config;
-mod pipeline;
+pub mod pipeline;
 mod depth_to_flat;
 mod downsampling;
 mod feature_preserve;

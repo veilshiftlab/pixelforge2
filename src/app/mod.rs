@@ -1,11 +1,11 @@
 //! Application module
 
-mod state;
+mod dialogs;
 mod menu;
 mod panels;
 mod preview;
-mod dialogs;
 mod processing;
+mod state;
 mod theme;
 
 pub use state::*;

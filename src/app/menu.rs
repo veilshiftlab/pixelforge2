@@ -1,7 +1,6 @@
-//! Menu bar implementation
+//! Menu bar
 
-use super::state::PixelForgeApp;
-use crate::config::ModelQuality;
+use super::state::{PixelForgeApp, PreviewTab};
 use eframe::egui;
 
 pub fn draw(app: &mut PixelForgeApp, ctx: &egui::Context) {
@@ -19,19 +18,21 @@ pub fn draw(app: &mut PixelForgeApp, ctx: &egui::Context) {
 
 fn file_menu(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.menu_button("File", |ui| {
-        if ui.button("📂 Open Image...").clicked() {
+        if ui.button("📂 Open…").clicked() {
             super::processing::open_file_dialog(app);
             ui.close_menu();
         }
 
-        if ui.add_enabled(app.input_image.is_some(), egui::Button::new("✖ Close Image")).clicked() {
+        let has_image = app.input_image.is_some();
+
+        if ui.add_enabled(has_image, egui::Button::new("✖ Close Image")).clicked() {
             super::processing::clear_image(app);
             ui.close_menu();
         }
 
         ui.separator();
 
-        if ui.add_enabled(app.output_image.is_some(), egui::Button::new("💾 Export Image...")).clicked() {
+        if ui.add_enabled(app.output_image.is_some(), egui::Button::new("💾 Export…")).clicked() {
             super::processing::export_image(app);
             ui.close_menu();
         }
@@ -47,13 +48,14 @@ fn file_menu(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
 fn edit_menu(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     ui.menu_button("Edit", |ui| {
         if ui.button("Reset to Defaults").clicked() {
-            app.transform_config = Default::default();
+            app.transform_config     = Default::default();
             app.depth_to_flat_config = Default::default();
-            app.feature_config = Default::default();
-            app.edge_config = Default::default();
-            app.palette_config = Default::default();
-            app.aspect_mode = Default::default();
-            app.current_preset = None;
+            app.feature_config       = Default::default();
+            app.edge_config          = Default::default();
+            app.palette_config       = Default::default();
+            app.ml_config            = Default::default();
+            app.aspect_mode          = Default::default();
+            app.current_preset       = None;
             ui.close_menu();
         }
     });
@@ -61,67 +63,84 @@ fn edit_menu(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
 
 fn view_menu(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     ui.menu_button("View", |ui| {
-        ui.checkbox(&mut app.show_landmarks, "Show Landmarks");
-        ui.checkbox(&mut app.show_depth_heatmap, "Show Depth Map");
-        ui.checkbox(&mut app.show_segmentation, "Show Segmentation");
+        for (tab, label) in [
+            (PreviewTab::Original, "📷 Original"),
+            (PreviewTab::MLMaps,   "🤖 ML Maps"),
+            (PreviewTab::Output,   "🎨 Output"),
+        ] {
+            if ui.selectable_label(app.preview_tab == tab, label).clicked() {
+                app.preview_tab = tab;
+                ui.close_menu();
+            }
+        }
+
         ui.separator();
-        ui.add(egui::Slider::new(&mut app.preview_zoom, 0.5..=8.0).text("Zoom"));
+
+        ui.checkbox(&mut app.show_landmarks, "Show Landmarks");
+        ui.checkbox(&mut app.show_segmentation_overlay, "Segmentation Overlay");
+
+        ui.separator();
+
+        ui.add(egui::Slider::new(&mut app.preview_zoom, 0.25..=8.0).text("Zoom"));
+
+        for (label, zoom) in [("Fit", 1.0f32), ("2×", 2.0), ("4×", 4.0)] {
+            if ui.small_button(label).clicked() {
+                app.preview_zoom = zoom;
+            }
+        }
     });
 }
 
 fn presets_menu(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     ui.menu_button("Presets", |ui| {
-        if ui.button("Save Preset...").clicked() {
+        if ui.button("Save Preset…").clicked() {
             super::processing::save_preset(app);
             ui.close_menu();
         }
-
-        if ui.button("Load Preset...").clicked() {
+        if ui.button("Load Preset…").clicked() {
             super::processing::load_preset(app);
             ui.close_menu();
         }
 
         ui.separator();
+        ui.label(egui::RichText::new("Built-in").small().weak());
 
-        if ui.button("Portrait - Minimal (32x32)").clicked() {
-            apply_preset(app, "minimal");
-            ui.close_menu();
-        }
-        if ui.button("Portrait - Detailed (64x64)").clicked() {
-            apply_preset(app, "detailed");
-            ui.close_menu();
-        }
-        if ui.button("Portrait - HD (128x128)").clicked() {
-            apply_preset(app, "hd");
-            ui.close_menu();
-        }
-        if ui.button("Game Boy Style (48x48)").clicked() {
-            apply_preset(app, "gameboy");
-            ui.close_menu();
+        for (label, id) in [
+            ("Portrait 32×32 — Minimal",  "minimal"),
+            ("Portrait 64×64 — Detailed", "detailed"),
+            ("Portrait 128 — HD",         "hd"),
+            ("Game Boy 48×48",            "gameboy"),
+        ] {
+            if ui.button(label).clicked() {
+                apply_builtin_preset(app, id);
+                ui.close_menu();
+            }
         }
     });
 }
 
 fn models_menu(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     ui.menu_button("Models", |ui| {
-        if ui.button("Manage Models...").clicked() {
+        if ui.button("Manage Models…").clicked() {
             app.show_model_dialog = true;
             ui.close_menu();
         }
 
         ui.separator();
 
-        for quality in [ModelQuality::Minimal, ModelQuality::Standard, ModelQuality::High] {
-            if ui.radio(app.config.model_quality == quality, quality.display_name()).clicked() {
-                app.config.model_quality = quality;
-                super::processing::update_model_settings(app);
+        // Execution mode — controls whether models run on CPU, GPU-sequential, or GPU-parallel.
+        // Wired to ml_config.execution.mode (not the removed AppConfig::ModelQuality).
+        ui.label(egui::RichText::new("Execution").small().weak());
+
+        use crate::ml::ExecutionMode;
+        for (mode, label) in [
+            (ExecutionMode::GpuSequential, "GPU — Sequential (default)"),
+            (ExecutionMode::GpuParallel,   "GPU — Parallel"),
+            (ExecutionMode::CpuOnly,       "CPU Only"),
+        ] {
+            if ui.radio(app.ml_config.execution.mode == mode, label).clicked() {
+                app.ml_config.execution.mode = mode;
             }
-        }
-
-        ui.separator();
-
-        if ui.checkbox(&mut app.config.sequential_processing, "Sequential Mode (Low VRAM)").changed() {
-            super::processing::update_model_settings(app);
         }
     });
 }
@@ -135,90 +154,69 @@ fn help_menu(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     });
 }
 
-fn apply_preset(app: &mut PixelForgeApp, preset_name: &str) {
-    use crate::processing::{EyeSize, DetailLevel, PaletteMode, PresetPalette};
-    
-    match preset_name {
+// ─────────────────────────────────────────────────────────────────────────────
+// Built-in preset application
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn apply_builtin_preset(app: &mut PixelForgeApp, id: &str) {
+    use crate::processing::{DetailLevel, EyeSize, PaletteMode, PresetPalette};
+
+    match id {
         "minimal" => {
-            app.transform_config = crate::processing::TransformConfig { 
-                output_size: 32, ..Default::default() 
-            };
+            app.transform_config.output_size = 32;
             app.aspect_mode = super::state::AspectRatioMode::Square;
-            app.depth_to_flat_config = crate::processing::DepthToFlatConfig { 
-                skin_tone_bands: 3, hair_bands: 2, clothing_bands: 2, background_bands: 1, 
-                ..Default::default() 
-            };
-            app.feature_config = crate::processing::FeaturePreserveConfig {
-                eye_size: EyeSize::Small,
-                eye_detail: DetailLevel::Minimal,
-                ..Default::default()
-            };
-            app.palette_config = crate::processing::PaletteConfig { 
-                max_colors: 12, ..Default::default() 
-            };
-            app.current_preset = Some("Portrait - Minimal".to_string());
+            app.depth_to_flat_config.skin_tone_bands  = 3;
+            app.depth_to_flat_config.hair_bands        = 2;
+            app.depth_to_flat_config.clothing_bands    = 2;
+            app.depth_to_flat_config.background_bands  = 1;
+            app.feature_config.eye_size   = EyeSize::Small;
+            app.feature_config.eye_detail = DetailLevel::Minimal;
+            app.palette_config.max_colors = 12;
+            app.current_preset = Some("Portrait — Minimal".into());
         }
         "detailed" => {
-            app.transform_config = crate::processing::TransformConfig { 
-                output_size: 64, ..Default::default() 
-            };
+            app.transform_config.output_size = 64;
             app.aspect_mode = super::state::AspectRatioMode::Square;
-            app.depth_to_flat_config = crate::processing::DepthToFlatConfig { 
-                skin_tone_bands: 5, hair_bands: 4, clothing_bands: 3, background_bands: 2, 
-                ..Default::default() 
-            };
-            app.feature_config = crate::processing::FeaturePreserveConfig {
-                eye_size: EyeSize::Medium,
-                eye_detail: DetailLevel::Standard,
-                lip_detail: DetailLevel::Standard,
-                nose_detail: DetailLevel::Standard,
-                distinct_nostrils: true,
-                ..Default::default()
-            };
-            app.palette_config = crate::processing::PaletteConfig { 
-                max_colors: 32, ..Default::default() 
-            };
-            app.current_preset = Some("Portrait - Detailed".to_string());
+            app.depth_to_flat_config.skin_tone_bands  = 5;
+            app.depth_to_flat_config.hair_bands        = 4;
+            app.depth_to_flat_config.clothing_bands    = 3;
+            app.depth_to_flat_config.background_bands  = 2;
+            app.feature_config.eye_size    = EyeSize::Medium;
+            app.feature_config.eye_detail  = DetailLevel::Standard;
+            app.feature_config.lip_detail  = DetailLevel::Standard;
+            app.feature_config.nose_detail = DetailLevel::Standard;
+            app.feature_config.distinct_nostrils = true;
+            app.palette_config.max_colors  = 32;
+            app.current_preset = Some("Portrait — Detailed".into());
         }
         "hd" => {
-            app.transform_config = crate::processing::TransformConfig { 
-                output_size: 128, ..Default::default() 
-            };
+            app.transform_config.output_size = 128;
             app.aspect_mode = super::state::AspectRatioMode::Preserve;
-            app.depth_to_flat_config = crate::processing::DepthToFlatConfig { 
-                skin_tone_bands: 6, hair_bands: 5, clothing_bands: 4, background_bands: 3, 
-                ..Default::default() 
-            };
-            app.feature_config = crate::processing::FeaturePreserveConfig {
-                eye_size: EyeSize::Large,
-                eye_detail: DetailLevel::Full,
-                lip_detail: DetailLevel::Full,
-                nose_detail: DetailLevel::Standard,
-                distinct_nostrils: true,
-                force_eye_highlights: true,
-                ..Default::default()
-            };
-            app.palette_config = crate::processing::PaletteConfig { 
-                max_colors: 64, ..Default::default() 
-            };
-            app.current_preset = Some("Portrait - HD".to_string());
+            app.depth_to_flat_config.skin_tone_bands  = 6;
+            app.depth_to_flat_config.hair_bands        = 5;
+            app.depth_to_flat_config.clothing_bands    = 4;
+            app.depth_to_flat_config.background_bands  = 3;
+            app.feature_config.eye_size             = EyeSize::Large;
+            app.feature_config.eye_detail           = DetailLevel::Full;
+            app.feature_config.lip_detail           = DetailLevel::Full;
+            app.feature_config.nose_detail          = DetailLevel::Standard;
+            app.feature_config.distinct_nostrils    = true;
+            app.feature_config.force_eye_highlights = true;
+            app.palette_config.max_colors = 64;
+            app.current_preset = Some("Portrait — HD".into());
         }
         "gameboy" => {
-            app.transform_config = crate::processing::TransformConfig { 
-                output_size: 48, export_scale: 2, ..Default::default() 
-            };
+            app.transform_config.output_size  = 48;
+            app.transform_config.export_scale = 2;
             app.aspect_mode = super::state::AspectRatioMode::Square;
-            app.depth_to_flat_config = crate::processing::DepthToFlatConfig { 
-                skin_tone_bands: 2, hair_bands: 2, clothing_bands: 2, background_bands: 1, 
-                ..Default::default() 
-            };
-            app.palette_config = crate::processing::PaletteConfig {
-                mode: PaletteMode::Preset,
-                preset: PresetPalette::GameBoy,
-                max_colors: 4,
-                ..Default::default()
-            };
-            app.current_preset = Some("Game Boy Style".to_string());
+            app.depth_to_flat_config.skin_tone_bands = 2;
+            app.depth_to_flat_config.hair_bands       = 2;
+            app.depth_to_flat_config.clothing_bands   = 2;
+            app.depth_to_flat_config.background_bands = 1;
+            app.palette_config.mode       = PaletteMode::Preset;
+            app.palette_config.preset     = PresetPalette::GameBoy;
+            app.palette_config.max_colors = 4;
+            app.current_preset = Some("Game Boy Style".into());
         }
         _ => {}
     }
