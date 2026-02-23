@@ -132,3 +132,125 @@ impl ImageTransform {
         image.flipv()
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Image Processor: stateful transformation manager
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Tracks transformation state for an image (flip directions, rotation, max dimension).
+/// Provides methods to apply transforms and retrieve the current processed image.
+#[derive(Clone)]
+pub struct ImageProcessor {
+    /// Original/base image
+    original: DynamicImage,
+    /// Path to original file (if loaded from file)
+    path: Option<std::path::PathBuf>,
+    /// Whether image is flipped horizontally
+    flip_h: bool,
+    /// Whether image is flipped vertically
+    flip_v: bool,
+    /// Rotation in degrees
+    rotation: f32,
+    /// Max dimension for auto-resize (0 = no limit)
+    max_dimension: u32,
+}
+
+impl ImageProcessor {
+    /// Create a new processor from a loaded image
+    pub fn new(original: DynamicImage, path: Option<std::path::PathBuf>, max_dimension: u32) -> Self {
+        Self {
+            original,
+            path,
+            flip_h: false,
+            flip_v: false,
+            rotation: 0.0,
+            max_dimension,
+        }
+    }
+
+    /// Toggle horizontal flip
+    pub fn flip_horizontal(&mut self) {
+        self.flip_h = !self.flip_h;
+    }
+
+    /// Toggle vertical flip
+    pub fn flip_vertical(&mut self) {
+        self.flip_v = !self.flip_v;
+    }
+
+    /// Set rotation in degrees (absolute, not incremental)
+    pub fn set_rotation(&mut self, degrees: f32) {
+        self.rotation = degrees;
+    }
+
+    /// Rotate by adding degrees (incremental)
+    pub fn rotate(&mut self, degrees: f32) {
+        self.rotation += degrees;
+        // Normalize to [0, 360)
+        self.rotation = self.rotation.rem_euclid(360.0);
+    }
+
+    /// Set the maximum dimension (0 = no resize)
+    pub fn set_max_dimension(&mut self, max_dim: u32) {
+        self.max_dimension = max_dim;
+    }
+
+    /// Get original image dimensions
+    pub fn original_dimensions(&self) -> (u32, u32) {
+        self.original.dimensions()
+    }
+
+    /// Get original image (unmodified)
+    pub fn get_original_image(&self) -> &DynamicImage {
+        &self.original
+    }
+
+    /// Get current transformation state
+    pub fn get_state(&self) -> (bool, bool, f32, u32) {
+        (self.flip_h, self.flip_v, self.rotation, self.max_dimension)
+    }
+
+    /// Reset all transformations to original state
+    pub fn reset(&mut self) {
+        self.flip_h = false;
+        self.flip_v = false;
+        self.rotation = 0.0;
+    }
+
+    /// Compute and return the processed image based on current transformation state
+    pub fn get_processed_image(&self) -> Result<DynamicImage> {
+        let mut img = self.original.clone();
+
+        // Apply flips
+        if self.flip_h {
+            img = ImageTransform::flip_horizontal(&img);
+        }
+        if self.flip_v {
+            img = ImageTransform::flip_vertical(&img);
+        }
+
+        // Apply rotation if non-zero
+        if self.rotation.abs() > f32::EPSILON {
+            img = ImageTransform::rotate(&img, self.rotation)?;
+        }
+
+        // Apply resize if needed
+        if self.max_dimension > 0 {
+            let (w, h) = img.dimensions();
+            let max_side = w.max(h);
+            if max_side > self.max_dimension {
+                let factor = (self.max_dimension as f32) / (max_side as f32);
+                let new_w = ((w as f32) * factor).round().max(1.0) as u32;
+                let new_h = ((h as f32) * factor).round().max(1.0) as u32;
+                img = ImageTransform::resize(&img, new_w, new_h)?;
+            }
+        }
+
+        Ok(img)
+    }
+
+    /// Get the path to the original image file (if loaded from file)
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+}

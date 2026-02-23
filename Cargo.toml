@@ -21,7 +21,12 @@ egui_extras = { version = "0.29", features = ["image"] }
 image = { version = "0.25", features = ["png", "jpeg", "webp"] }
 
 # ML Inference (ONNX Runtime)
-ort = { version = "2.0.0-rc.11", features = ["load-dynamic", "download-binaries"] }
+# GPU providers (CUDA, DirectML, CoreML) are included in the downloaded binaries
+# and automatically detected at runtime based on installed libraries
+ort = { version = "2.0.0-rc.11", features = [
+    "load-dynamic",
+    "download-binaries",
+] }
 ndarray = "0.15"
 
 # Parallel Processing

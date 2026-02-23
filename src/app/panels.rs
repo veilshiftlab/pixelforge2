@@ -311,7 +311,7 @@ pub fn draw_right(app: &mut PixelForgeApp, ctx: &egui::Context) {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 output_size_section(app, ui);
                 ui.separator();
-                transform_section(app, ui);
+                transform_section(app, ui, ctx);
                 ui.separator();
                 palette_section(app, ui);
                 ui.separator();
@@ -385,7 +385,51 @@ fn output_size_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     ui.label(egui::RichText::new(format!("→ {}×{} px", ow, oh)).small().weak());
 }
 
-fn transform_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
+fn transform_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
+    // ── Input image transforms (using ImageProcessor from image crate) ────────────
+    if app.image_processor.is_some() {
+        ui.label(egui::RichText::new("Input Transforms").small().weak());
+        
+        ui.horizontal(|ui| {
+            if ui.button("🔄 Flip H").on_hover_text("Flip horizontally").clicked() {
+                if let Some(ref mut proc) = app.image_processor {
+                    proc.flip_horizontal();
+                }
+                super::processing::refresh_input_preview(app, ctx);
+            }
+            if ui.button("🔃 Flip V").on_hover_text("Flip vertically").clicked() {
+                if let Some(ref mut proc) = app.image_processor {
+                    proc.flip_vertical();
+                }
+                super::processing::refresh_input_preview(app, ctx);
+            }
+            if ui.button("↺ Reset").on_hover_text("Reset all transformations").clicked() {
+                if let Some(ref mut proc) = app.image_processor {
+                    proc.reset();
+                }
+                super::processing::refresh_input_preview(app, ctx);
+            }
+        });
+
+        let mut rotation = 0.0;
+        if let Some(ref proc) = app.image_processor {
+            rotation = proc.get_state().2;
+        }
+        if ui.add(egui::Slider::new(&mut rotation, -180.0..=180.0).text("Rotate °")).changed() {
+            if let Some(ref mut proc) = app.image_processor {
+                proc.set_rotation(rotation);
+            }
+            super::processing::refresh_input_preview(app, ctx);
+        }
+
+        ui.separator();
+    } else {
+        ui.label(egui::RichText::new("(Load an image to transform)").small().italics());
+        ui.separator();
+    }
+
+    // ── Pipeline output transforms ────────────────────────────────────────────────
+    ui.label(egui::RichText::new("Output").small().weak());
     ui.label("Downsampling:");
     egui::ComboBox::from_id_salt("ds_method")
         .selected_text(format!("{:?}", app.transform_config.downsampling_method))
@@ -400,14 +444,9 @@ fn transform_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
         });
 
     ui.add(egui::Slider::new(&mut app.transform_config.scale,     0.1..=4.0  ).text("Scale"));
-    ui.add(egui::Slider::new(&mut app.transform_config.rotation, -180.0..=180.0).text("Rotate °"));
     ui.horizontal(|ui| {
         ui.add(egui::Slider::new(&mut app.transform_config.offset_x, -1.0..=1.0).text("X"));
         ui.add(egui::Slider::new(&mut app.transform_config.offset_y, -1.0..=1.0).text("Y"));
-    });
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut app.transform_config.flip_horizontal, "Flip H");
-        ui.checkbox(&mut app.transform_config.flip_vertical,   "Flip V");
     });
 
     ui.separator();

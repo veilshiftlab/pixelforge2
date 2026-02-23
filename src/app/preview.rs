@@ -53,30 +53,51 @@ fn original_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     let scale = fit_scale(img_w, img_h, available) * app.preview_zoom;
     let dw = img_w as f32 * scale;
     let dh = img_h as f32 * scale;
+    let tex_id = input.texture.id();
+    
+    // Extract path info before closure to avoid borrow conflict
+    let path_name = input.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string());
+    
+    // Drop the borrow on input before the horizontal closure
+    let _ = input;
 
     // Info row
     ui.horizontal(|ui| {
         ui.label(format!("{}×{}", img_w, img_h));
-        if let Some(path) = &input.path {
-            if let Some(name) = path.file_name() {
-                ui.separator();
-                ui.label(egui::RichText::new(name.to_string_lossy()).weak());
-            }
+        if let Some(name) = path_name {
+            ui.separator();
+            ui.label(egui::RichText::new(name).weak());
         }
         ui.separator();
         for (label, zoom) in [("Fit", 1.0f32), ("2×", 2.0), ("4×", 4.0)] {
             if ui.small_button(label).clicked() { app.preview_zoom = zoom; }
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("🔄 Load").on_hover_text("Load another image").clicked() {
+                super::processing::open_file_dialog(app);
+            }
+            if ui.small_button("✕ Clear").on_hover_text("Clear current image").clicked() {
+                super::processing::clear_image(app);
+            }
+        });
     });
 
     ui.separator();
 
-    let tex_id = input.texture.id();
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-        // Centre the image when smaller than the scroll area
+        // Center the image when smaller than the scroll area
         let avail = ui.available_size();
-        if dw < avail.x { ui.add_space((avail.x - dw) * 0.5); }
-        ui.image(egui::load::SizedTexture::new(tex_id, egui::Vec2::new(dw, dh)));
+        ui.vertical(|ui| {
+            if dh < avail.y {
+                ui.add_space((avail.y - dh) * 0.5);
+            }
+            ui.horizontal(|ui| {
+                if dw < avail.x {
+                    ui.add_space((avail.x - dw) * 0.5);
+                }
+                ui.image(egui::load::SizedTexture::new(tex_id, egui::Vec2::new(dw, dh)));
+            });
+        });
     });
 }
 
@@ -277,8 +298,17 @@ fn output_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context)
 
         egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
             let avail = ui.available_size();
-            if dw < avail.x { ui.add_space((avail.x - dw) * 0.5); }
-            ui.image(egui::load::SizedTexture::new(tex_id, egui::Vec2::new(dw, dh)));
+            ui.vertical(|ui| {
+                if dh < avail.y {
+                    ui.add_space((avail.y - dh) * 0.5);
+                }
+                ui.horizontal(|ui| {
+                    if dw < avail.x {
+                        ui.add_space((avail.x - dw) * 0.5);
+                    }
+                    ui.image(egui::load::SizedTexture::new(tex_id, egui::Vec2::new(dw, dh)));
+                });
+            });
         });
     } else {
         ui.vertical_centered(|ui| {
@@ -393,11 +423,13 @@ fn turbo(t: f32) -> (u8, u8, u8) {
     (r.clamp(0.0, 255.0) as u8, g.clamp(0.0, 255.0) as u8, b.clamp(0.0, 255.0) as u8)
 }
 
-/// Scale factor to fit an image inside an egui available_size rect (with 1% margin).
+/// Scale factor to fit an image inside an egui available_size rect.
+/// Uses conservative calculation with 4px margin to prevent scrollbars.
 pub fn fit_scale(img_w: u32, img_h: u32, available: egui::Vec2) -> f32 {
-    let sx = available.x / img_w as f32;
-    let sy = if available.y > 0.0 { available.y / img_h as f32 } else { sx };
-    sx.min(sy) * 0.99
+    let margin = 4.0; // Conservative pixel margin
+    let sx = (available.x - margin) / img_w as f32;
+    let sy = if available.y > margin { (available.y - margin) / img_h as f32 } else { sx };
+    sx.min(sy).max(0.1) // Ensure minimum scale of 0.1
 }
 
 fn centered_hint(ui: &mut egui::Ui, text: &str) {

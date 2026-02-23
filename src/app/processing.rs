@@ -20,8 +20,10 @@ use image::GenericImageView;
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn load_image(app: &mut PixelForgeApp, path: &std::path::Path, ctx: &egui::Context) {
-    match image::open(path) {
-        Ok(img) => {
+    match crate::image::ImageLoader::load_with_processor(path, 1024) {
+        Ok(processor) => {
+            let img = processor.get_processed_image()
+                .unwrap_or_else(|_| processor.get_original_image().clone());
             let texture = upload_texture(ctx, "input_image", &img);
 
             app.custom_output_width  = img.width().min(512);
@@ -32,6 +34,7 @@ pub fn load_image(app: &mut PixelForgeApp, path: &std::path::Path, ctx: &egui::C
                 texture,
                 path: Some(path.to_path_buf()),
             });
+            app.image_processor = Some(processor);
 
             app.preprocessed_image = None;
             app.flat_color_image   = None;
@@ -47,11 +50,30 @@ pub fn load_image(app: &mut PixelForgeApp, path: &std::path::Path, ctx: &egui::C
 
 pub fn clear_image(app: &mut PixelForgeApp) {
     app.input_image        = None;
+    app.image_processor    = None;
     app.preprocessed_image = None;
     app.flat_color_image   = None;
     app.ml_results         = None;
     app.output_image       = None;
     app.processing         = ProcessingState::Idle;
+}
+
+/// Refresh the input image texture to reflect current processor transformations
+/// Call this after any flip/rotate operation to update the preview
+pub fn refresh_input_preview(app: &mut PixelForgeApp, ctx: &egui::Context) {
+    if let Some(ref mut input) = app.input_image {
+        if let Some(ref processor) = app.image_processor {
+            match processor.get_processed_image() {
+                Ok(processed_img) => {
+                    let texture = upload_texture(ctx, "input_image", &processed_img);
+                    input.image = processed_img;
+                    input.texture = texture;
+                    ctx.request_repaint();
+                }
+                Err(e) => log::error!("Failed to refresh preview: {}", e),
+            }
+        }
+    }
 }
 
 pub fn open_file_dialog(app: &mut PixelForgeApp) {
@@ -160,8 +182,20 @@ pub fn get_output_dimensions(app: &PixelForgeApp) -> (u32, u32) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn run_ml_analysis(app: &mut PixelForgeApp, ctx: &egui::Context) {
-    let Some(input) = &app.input_image else { return };
-    let image     = input.image.clone();
+    let Some(_input) = &app.input_image else { return };
+    let Some(ref processor) = app.image_processor else { return };
+    
+    // Use the processed image (with flips/rotations applied) from the ImageProcessor
+    let image = match processor.get_processed_image() {
+        Ok(img) => img,
+        Err(e) => {
+            log::error!("Failed to get processed image for ML: {}", e);
+            app.processing = ProcessingState::Error(e.to_string());
+            ctx.request_repaint();
+            return;
+        }
+    };
+    
     let ml_config = app.ml_config.clone();
     let mgr       = app.model_manager.clone();
 
@@ -196,7 +230,7 @@ pub fn run_ml_analysis(app: &mut PixelForgeApp, ctx: &egui::Context) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn process_image(app: &mut PixelForgeApp, ctx: &egui::Context) {
-    if app.input_image.is_none() { return; }
+    if app.input_image.is_none() || app.image_processor.is_none() { return; }
 
     app.processing = ProcessingState::Running(ProcessingStatus {
         progress: 0.05,
@@ -205,7 +239,21 @@ pub fn process_image(app: &mut PixelForgeApp, ctx: &egui::Context) {
     ctx.request_repaint();
 
     let (ow, oh) = get_output_dimensions(app);
-    let input    = app.input_image.as_ref().unwrap().image.clone();
+    
+    // Use the processed image (with flips/rotations applied) from the ImageProcessor
+    let input = if let Some(ref processor) = app.image_processor {
+        match processor.get_processed_image() {
+            Ok(img) => img,
+            Err(e) => {
+                log::error!("Failed to get processed image: {}", e);
+                app.processing = ProcessingState::Error(e.to_string());
+                ctx.request_repaint();
+                return;
+            }
+        }
+    } else {
+        app.input_image.as_ref().unwrap().image.clone()
+    };
 
     let pipeline_input = PipelineInput {
         image:         &input,

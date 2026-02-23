@@ -45,10 +45,11 @@
 use crate::ml::preprocess::{
     normalize_min_max, upsample_map_to_original, PreprocessConfig, preprocess,
 };
+use crate::ml::session::{SessionManager, ModelType};
 use anyhow::{anyhow, Result};
 use image::{DynamicImage, GenericImageView};
-use ort::session::builder::GraphOptimizationLevel;
-use std::cell::RefCell;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Detector
@@ -59,7 +60,8 @@ use std::cell::RefCell;
 /// On a dynamic-axes export (recommended) the model runs at the exact input resolution.
 /// On a fixed export it falls back to the export size and bilinearly upsamples the result.
 pub struct TeedEdgeDetector {
-    session: RefCell<ort::session::Session>,
+    session_manager: Arc<SessionManager>,
+    model_path: PathBuf,
     input_name: String,
     output_name: String,
     /// `None` → model accepts dynamic input (preferred).
@@ -68,15 +70,15 @@ pub struct TeedEdgeDetector {
 }
 
 impl TeedEdgeDetector {
-    /// Load the ONNX model.
+    /// Load the ONNX model using SessionManager for GPU support.
     pub fn new(model_path: &std::path::Path) -> Result<Self> {
-        let session = ort::session::builder::SessionBuilder::new()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(4)?
-            .commit_from_file(model_path)?;
-
+        let session_manager = crate::ml::session::global_session_manager();
+        let model_session = session_manager.get_or_load(&model_path.to_path_buf(), ModelType::DepthEstimation)?; // TEED doesn't have a dedicated ModelType yet,  using DepthEstimation as proxy
+        
+        let session = model_session.session.lock().unwrap();
         let input_name  = session.inputs()[0].name().to_string();
         let output_name = session.outputs()[0].name().to_string();
+        drop(session);
 
         // We can't introspect dims from ORT 2.x before the first run, so we
         // assume dynamic. If the model is actually fixed-size, the first
@@ -84,9 +86,9 @@ impl TeedEdgeDetector {
         // with a clear shape mismatch that surfaces immediately.
         let fixed_dims: Option<(u32, u32)> = None;
 
-        log::info!("TEED loaded (dynamic input assumed): input_name='{}'", input_name);
+        log::info!("TEED loaded (dynamic input assumed): input_name='{}' (backend: {:?})", input_name, session_manager.backend());
 
-        Ok(Self { session: RefCell::new(session), input_name, output_name, fixed_dims })
+        Ok(Self { session_manager, model_path: model_path.to_path_buf(), input_name, output_name, fixed_dims })
     }
 
     /// Detect edges in `image`.
@@ -105,7 +107,8 @@ impl TeedEdgeDetector {
             tensor,
         ))?;
 
-        let mut session = self.session.borrow_mut();
+        let model_session = self.session_manager.get_or_load(&self.model_path, ModelType::DepthEstimation)?;
+        let mut session = model_session.session.lock().unwrap();
         let outputs = session.run(ort::inputs![&self.input_name => input_tensor])?;
 
         let output = outputs

@@ -53,8 +53,8 @@ pub struct PixelForgeApp {
     pub model_manager: Arc<RwLock<ModelManager>>,
 
     // ── Images ───────────────────────────────────────────────────────────────
-    pub input_image: Option<InputImage>,
-    /// Post-transform, pre-downsample (for debugging)
+    pub input_image: Option<InputImage>,    /// Image processor for tracking transforms (flip/rotate/resize)
+    pub image_processor: Option<crate::image::ImageProcessor>,    /// Post-transform, pre-downsample (for debugging)
     pub preprocessed_image: Option<image::DynamicImage>,
     /// Post depth-to-flat intermediate
     pub flat_color_image: Option<image::DynamicImage>,
@@ -117,6 +117,7 @@ impl PixelForgeApp {
             config,
             model_manager,
             input_image: None,
+            image_processor: None,
             preprocessed_image: None,
             flat_color_image: None,
             output_image: None,

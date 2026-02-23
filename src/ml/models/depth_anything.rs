@@ -21,10 +21,11 @@
 use crate::ml::preprocess::{
     normalize_min_max, upsample_map_to_original, PreprocessConfig, preprocess,
 };
+use crate::ml::session::{SessionManager, ModelType};
 use anyhow::{anyhow, Result};
 use image::DynamicImage;
-use ort::session::builder::GraphOptimizationLevel;
-use std::cell::RefCell;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -39,7 +40,8 @@ const DEFAULT_INPUT_SIZE: u32 = 518;
 
 /// Depth estimator using Depth-Anything V2 ONNX model.
 pub struct DepthAnythingEstimator {
-    session: RefCell<ort::session::Session>,
+    session_manager: Arc<SessionManager>,
+    model_path: PathBuf,
     input_name: String,
     output_name: String,
     /// Model input width (static from export, or DEFAULT_INPUT_SIZE for dynamic models)
@@ -49,20 +51,21 @@ pub struct DepthAnythingEstimator {
 }
 
 impl DepthAnythingEstimator {
-    /// Load the ONNX model.
+    /// Load the ONNX model using SessionManager for GPU support.
     pub fn new(model_path: &std::path::Path) -> Result<Self> {
-        let session = ort::session::builder::SessionBuilder::new()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(4)?
-            .commit_from_file(model_path)?;
-
+        let session_manager = crate::ml::session::global_session_manager();
+        let model_session = session_manager.get_or_load(&model_path.to_path_buf(), ModelType::DepthEstimation)?;
+        
+        let session = model_session.session.lock().unwrap();
         let input_name  = session.inputs()[0].name().to_string();
         let output_name = session.outputs()[0].name().to_string();
+        drop(session);
 
-        log::info!("Depth-Anything V2 loaded: input_name='{}'", input_name);
+        log::info!("Depth-Anything V2 loaded: input_name='{}' (backend: {:?})", input_name, session_manager.backend());
 
         Ok(Self {
-            session: RefCell::new(session),
+            session_manager,
+            model_path: model_path.to_path_buf(),
             input_name,
             output_name,
             model_w: DEFAULT_INPUT_SIZE,
@@ -83,7 +86,8 @@ impl DepthAnythingEstimator {
             tensor,
         ))?;
 
-        let mut session = self.session.borrow_mut();
+        let model_session = self.session_manager.get_or_load(&self.model_path, ModelType::DepthEstimation)?;
+        let mut session = model_session.session.lock().unwrap();
         let outputs = session.run(ort::inputs![&self.input_name => input_tensor])?;
 
         let output = outputs

@@ -35,10 +35,11 @@
 
 use crate::ml::{FaceBounds, FaceDetectionResult, FaceLandmarks, LandmarkRegion};
 use crate::ml::preprocess::{PreprocessConfig, ResizeScale, preprocess};
+use crate::ml::session::{SessionManager, ModelType};
 use anyhow::{anyhow, Result};
 use image::DynamicImage;
-use ort::session::builder::GraphOptimizationLevel;
-use std::cell::RefCell;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -59,7 +60,8 @@ const DET_CHANNELS: usize = 15;
 
 /// Face detector using YOLOv8n-Face ONNX model.
 pub struct YoloV8FaceDetector {
-    session: RefCell<ort::session::Session>,
+    session_manager: Arc<SessionManager>,
+    model_path: PathBuf,
     input_name: String,
     output_name: String,
     /// Model input dimensions resolved at load time (falls back to 640×640)
@@ -68,27 +70,29 @@ pub struct YoloV8FaceDetector {
 }
 
 impl YoloV8FaceDetector {
-    /// Load the ONNX model and resolve its input dimensions.
+    /// Load the ONNX model and resolve its input dimensions using SessionManager for GPU support.
     pub fn new(model_path: &std::path::Path) -> Result<Self> {
-        let session = ort::session::builder::SessionBuilder::new()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(4)?
-            .commit_from_file(model_path)?;
-
+        let session_manager = crate::ml::session::global_session_manager();
+        let model_session = session_manager.get_or_load(&model_path.to_path_buf(), ModelType::FaceDetection)?;
+        
+        let session = model_session.session.lock().unwrap();
         let input_name  = session.inputs()[0].name().to_string();
         let output_name = session.outputs()[0].name().to_string();
 
         // Try to read static input dims from the model metadata.
         // Dynamic axes appear as -1; we keep the default for those.
         let (model_w, model_h) = resolve_input_dims(&session, DEFAULT_INPUT_SIZE);
+        drop(session);
 
         log::info!(
-            "YOLOv8n-Face loaded: input={}x{}, input_name='{}'",
-            model_w, model_h, input_name
+            "YOLOv8n-Face loaded: input={}x{}, input_name='{}' (backend: {:?})",
+            model_w, model_h, input_name, session_manager.backend()
         );
 
+
         Ok(Self {
-            session: RefCell::new(session),
+            session_manager,
+            model_path: model_path.to_path_buf(),
             input_name,
             output_name,
             model_w,
@@ -108,7 +112,8 @@ impl YoloV8FaceDetector {
             tensor,
         ))?;
 
-        let mut session = self.session.borrow_mut();
+        let model_session = self.session_manager.get_or_load(&self.model_path, ModelType::FaceDetection)?;
+        let mut session = model_session.session.lock().unwrap();
         let outputs = session.run(ort::inputs![&self.input_name => input_tensor])?;
 
         let output = outputs

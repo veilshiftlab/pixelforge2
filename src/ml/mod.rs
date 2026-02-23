@@ -29,6 +29,7 @@ mod config;
 mod types;
 pub mod models;
 pub mod preprocess;
+pub mod session;
 
 pub use analysis::MLAnalysis;
 pub use config::*;
