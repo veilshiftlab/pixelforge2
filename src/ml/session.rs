@@ -1,194 +1,241 @@
 //! Unified ONNX Session Management
 //!
-//! Provides centralized model loading, caching, and GPU execution provider configuration.
+//! Provides centralized model loading, caching, and execution provider configuration.
+//! Backend priority (highest to lowest): CUDA → DirectML → CoreML → CPU
+//! The best available backend is selected automatically at runtime.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ort::session::builder::GraphOptimizationLevel;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Execution backend for ONNX Runtime
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+// ── Execution Backend ────────────────────────────────────────────────────────
+
+/// Hardware execution backend for ONNX Runtime.
+/// Ordered by general performance capability (best first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionBackend {
-    /// CPU execution (default)
-    #[default]
-    Cpu,
-    /// CUDA (NVIDIA GPU)
+    /// NVIDIA GPU via CUDA — best performance, requires CUDA + cuDNN
     Cuda,
-    /// DirectML (Windows - AMD/Intel GPU)
+    /// AMD/Intel GPU on Windows via DirectML — good, no extra deps on Windows 10+
     DirectML,
-    /// CoreML (macOS)
+    /// Apple Neural Engine / GPU on macOS/iOS via CoreML
     CoreML,
+    /// CPU fallback — always available
+    Cpu,
 }
 
 impl ExecutionBackend {
-    /// Get available backends on this system
-    pub fn available_backends() -> Vec<ExecutionBackend> {
+    /// Detect and return all available backends on the current system,
+    /// sorted from best to worst. CPU is always last.
+    pub fn detect() -> Vec<Self> {
         let mut backends = Vec::new();
-        
-        log::info!("=== GPU Backend Detection (Platform: {:?}) ===", std::env::consts::OS);
 
-        if cfg!(target_os = "windows") {
-            log::info!("→ Windows detected: Using DirectML (native Windows GPU support)");
-            log::info!("[DirectML] ✓ Available on Windows - No external dependencies needed");
-            backends.push(ExecutionBackend::DirectML);
-            
-            log::info!("[CUDA] Also checking if CUDA is available (fallback)...");
-            if ExecutionBackend::check_cuda_available() {
-                log::info!("[CUDA] ✓ CUDA toolkit found - Available as fallback");
-                backends.push(ExecutionBackend::Cuda);
-            } else {
-                log::info!("[CUDA] ✗ CUDA not found");
-            }
-        } else if cfg!(target_os = "linux") {
-            log::info!("→ Linux detected: Prioritizing CUDA > CPU");
-            log::info!("[CUDA] Checking if CUDA toolkit is installed...");
-            if ExecutionBackend::check_cuda_available() {
-                log::info!("[CUDA] ✓ CUDA toolkit found");
-                backends.push(ExecutionBackend::Cuda);
-            } else {
-                log::warn!("[CUDA] ✗ CUDA toolkit not found");
-            }
-        } else if cfg!(target_os = "macos") {
-            log::info!("→ macOS detected: Using CoreML");
-            log::info!("[CoreML] ✓ Available on macOS");
-            backends.push(ExecutionBackend::CoreML);
+        // CUDA: best on any platform that has an NVIDIA GPU + toolkit
+        if Self::cuda_available() {
+            backends.push(Self::Cuda);
+            log::info!("[Backend] CUDA available — NVIDIA GPU will be used");
         }
 
-        // CPU is always available as fallback
-        log::info!("[CPU] Always available as fallback");
-        backends.push(ExecutionBackend::Cpu);
-        
-        log::info!("=== Available backends (in priority order): {:?} ===\n", backends);
+        // DirectML: Windows-only, covers AMD/Intel/NVIDIA dGPUs
+        #[cfg(target_os = "windows")]
+        if !backends.contains(&Self::Cuda) {
+            // Only fall back to DirectML if CUDA isn't available;
+            // CUDA is strictly better for NVIDIA hardware.
+            backends.push(Self::DirectML);
+            log::info!("[Backend] DirectML available — Windows GPU acceleration enabled");
+        }
+
+        // CoreML: macOS / iOS only
+        #[cfg(target_os = "macos")]
+        {
+            backends.push(Self::CoreML);
+            log::info!("[Backend] CoreML available — Apple Silicon / ANE will be used");
+        }
+
+        // CPU is always the final fallback
+        backends.push(Self::Cpu);
+
+        log::info!(
+            "[Backend] Priority order: {:?}",
+            backends
+                .iter()
+                .map(|b| format!("{b:?}"))
+                .collect::<Vec<_>>()
+                .join(" → ")
+        );
+
         backends
     }
 
-    /// Check if CUDA is available and retrieve cuDNN path
-    fn check_cuda_available() -> bool {
-        log::info!("  → Checking for CUDA toolkit and cuDNN...");
-        
-        // First check CUDNN_PATH env var (if set, we already have cuDNN configured)
-        if let Ok(cudnn_path) = std::env::var("CUDNN_PATH") {
-            log::warn!("    ✓ CUDNN_PATH env var found: {}", cudnn_path);
-            let cudnn_bin = std::path::PathBuf::from(&cudnn_path).join("bin");
-            if cudnn_bin.exists() {
-                log::warn!("    ✓ cuDNN bin directory found: {}", cudnn_bin.display());
-                // Add cuDNN to PATH for ORT runtime
-                if let Ok(current_path) = std::env::var("PATH") {
-                    let new_path = format!("{};{}", cudnn_bin.display(), current_path);
-                    std::env::set_var("PATH", new_path);
-                    log::info!("    ✓ Added cuDNN bin to PATH for ORT runtime");
-                }
-                return true;
-            }
-        }
-        
-        // Try to find CUDA toolkit in common locations
-        let cuda_paths = if cfg!(target_os = "windows") {
-            vec![
-                "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA",
-                "C:\\Program Files (x86)\\NVIDIA GPU Computing Toolkit\\CUDA",
-            ]
-        } else if cfg!(target_os = "linux") {
-            vec!["/usr/local/cuda", "/opt/cuda"]
-        } else {
-            vec![]
-        };
-
-        for path in cuda_paths {
-            if std::path::Path::new(path).exists() {
-                log::info!("    ✓ CUDA toolkit found at: {}", path);
-                
-                // Check for cuDNN (critical for GPU inference)
-                // Try standard NVIDIA cuDNN install location
-                let cudnn_paths = if cfg!(target_os = "windows") {
-                    vec![
-                        "C:\\Program Files\\NVIDIA\\CUDNN\\v13.1\\bin",
-                        "C:\\Program Files\\NVIDIA\\CUDNN\\v13.0\\bin",
-                        "C:\\Program Files\\NVIDIA\\CUDNN\\v12.9\\bin",
-                        "C:\\Program Files\\NVIDIA\\CUDNN\\v9.19\\bin",
-                        "C:\\Program Files\\cuDNN\\bin",
-                    ]
-                } else if cfg!(target_os = "linux") {
-                    vec![
-                        "/usr/local/cuda/lib64",
-                        "/opt/cuda/lib64",
-                    ]
-                } else {
-                    vec![]
-                };
-                
-                let mut cudnn_found = false;
-                for cudnn_path in &cudnn_paths {
-                    let cudnn_dir = std::path::Path::new(cudnn_path);
-                    if cudnn_dir.exists() {
-                        log::warn!("    ✓ cuDNN found at: {}", cudnn_path);
-                        // Add to PATH for ORT runtime
-                        if let Ok(current_path) = std::env::var("PATH") {
-                            let new_path = format!("{};{}", cudnn_path, current_path);
-                            std::env::set_var("PATH", new_path);
-                            log::info!("    ✓ Added cuDNN bin to PATH for ORT runtime");
-                        }
-                        cudnn_found = true;
-                        break;
-                    }
-                }
-                
-                if !cudnn_found {
-                    log::error!("    ⚠ ⚠ WARNING: cuDNN NOT FOUND ⚠ ⚠");
-                    log::error!("      CUDA toolkit found but cuDNN is missing!");
-                    log::error!("      GPU acceleration will NOT work without cuDNN");
-                    log::error!("      Set CUDNN_PATH env var or install from: https://developer.nvidia.com/cudnn");
-                }
-                
-                return true;
-            }
-        }
-
-        // Also check via environment variable
-        if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
-            log::info!("    ✓ CUDA_PATH env var found: {}", cuda_path);
-            return true;
-        }
-        if let Ok(cuda_home) = std::env::var("CUDA_HOME") {
-            log::info!("    ✓ CUDA_HOME env var found: {}", cuda_home);
-            return true;
-        }
-
-        log::warn!("  ✗ CUDA toolkit NOT found in common locations or env vars");
-        false
+    /// Returns the single best backend available on this system.
+    pub fn best() -> Self {
+        Self::detect().into_iter().next().unwrap_or(Self::Cpu)
     }
 
-    /// Check if this backend is available
-    pub fn is_available(&self) -> bool {
-        let available = match self {
-            ExecutionBackend::Cpu => {
-                log::debug!("[CPU] Checking availability - always true");
-                true
-            }
-            ExecutionBackend::Cuda => {
-                let ok = Self::check_cuda_available();
-                log::debug!("[CUDA] Checking availability - {}", if ok { "OK" } else { "FAIL" });
-                ok
-            }
-            ExecutionBackend::DirectML => {
-                let ok = cfg!(target_os = "windows");
-                log::debug!("[DirectML] Checking availability on {} - {}", std::env::consts::OS, if ok { "OK" } else { "FAIL" });
-                ok
-            }
-            ExecutionBackend::CoreML => {
-                let ok = cfg!(target_os = "macos");
-                log::debug!("[CoreML] Checking availability on {} - {}", std::env::consts::OS, if ok { "OK" } else { "FAIL" });
-                ok
-            }
+    /// Probe CUDA + cuDNN availability using environment variables and known
+    /// install paths. Also ensures cuDNN bin is on PATH so ORT can load it.
+    fn cuda_available() -> bool {
+        // ── 1. Find CUDA toolkit ──────────────────────────────────────────
+        let cuda_root = std::env::var("CUDA_PATH").ok().or_else(|| {
+            let fallbacks: &[&str] = &[
+                "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.5",
+                "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4",
+                "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.3",
+                "/usr/local/cuda",
+                "/usr/cuda",
+            ];
+            fallbacks
+                .iter()
+                .find(|p| std::path::Path::new(p).exists())
+                .map(|p| p.to_string())
+        });
+
+        let Some(cuda_root) = cuda_root else {
+            log::debug!("[Backend] CUDA_PATH not set and no CUDA install found — skipping CUDA");
+            return false;
         };
-        available
+        log::debug!("[Backend] CUDA toolkit found at: {}", cuda_root);
+
+        // ── 2. Find cuDNN bin directory ───────────────────────────────────
+        // cuDNN may live separately (CUDNN_PATH) or bundled inside CUDA toolkit.
+        let cudnn_bin: Option<std::path::PathBuf> = if cfg!(target_os = "windows") {
+            // The CUDA-aware cuDNN installer nests DLLs under:
+            //   CUDNN_PATH\bin\<cuda_ver>\x64\cudnn*.dll  (e.g. bin\12.9\x64)
+            // Older / manual installs put them directly under:
+            //   CUDNN_PATH\bin\cudnn*.dll
+            // Also check inside the CUDA toolkit bin as a last resort.
+            let search_roots: Vec<std::path::PathBuf> = {
+                let mut v = Vec::new();
+                if let Ok(p) = std::env::var("CUDNN_PATH") {
+                    v.push(std::path::PathBuf::from(p));
+                }
+                v.push(std::path::PathBuf::from(&cuda_root));
+                v
+            };
+
+            // Walk up to 3 levels deep under each root looking for any cudnn*.dll
+            fn find_cudnn_dir(root: &std::path::Path) -> Option<std::path::PathBuf> {
+                // BFS over subdirectory levels: root, root/*, root/*/*, root/*/*/*
+                let mut queue: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
+                for _ in 0..3 {
+                    let mut next = Vec::new();
+                    for dir in &queue {
+                        if let Ok(entries) = std::fs::read_dir(dir) {
+                            let has_dll = entries
+                                .filter_map(|e| e.ok())
+                                .any(|e| {
+                                    let name = e.file_name().to_string_lossy().to_lowercase();
+                                    let is_dll = name.starts_with("cudnn") && name.ends_with(".dll");
+                                    if is_dll {
+                                        log::debug!("[Backend] Found cuDNN DLL: {}", e.path().display());
+                                    }
+                                    is_dll
+                                });
+                            if has_dll {
+                                return Some(dir.clone());
+                            }
+                            // Queue subdirs for next level
+                            if let Ok(subdirs) = std::fs::read_dir(dir) {
+                                for sub in subdirs.filter_map(|e| e.ok()) {
+                                    if sub.path().is_dir() {
+                                        next.push(sub.path());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    queue = next;
+                }
+                None
+            }
+
+            search_roots.iter().find_map(|root| find_cudnn_dir(root))
+        } else {
+            let from_env = std::env::var("CUDNN_PATH")
+                .ok()
+                .map(|p| std::path::PathBuf::from(p).join("lib64"));
+            let bundled = std::path::PathBuf::from(&cuda_root).join("lib64");
+            [from_env, Some(bundled)].into_iter().flatten().find(|d| d.exists())
+        };
+
+        let Some(cudnn_bin) = cudnn_bin else {
+            log::warn!(
+                "[Backend] CUDA found at {} but cuDNN not located — \
+                 set CUDNN_PATH or install cuDNN into the CUDA directory",
+                cuda_root
+            );
+            return false;
+        };
+        log::info!("[Backend] cuDNN found at: {}", cudnn_bin.display());
+
+        // ── 3. Ensure cuDNN bin is on PATH so ORT can dlopen it ───────────
+        if cfg!(target_os = "windows") {
+            let cudnn_str = cudnn_bin.to_string_lossy().to_string();
+            let current = std::env::var("PATH").unwrap_or_default();
+            if !current.to_lowercase().contains(&cudnn_str.to_lowercase()) {
+                std::env::set_var("PATH", format!("{};{}", cudnn_str, current));
+                log::info!("[Backend] Added cuDNN bin to PATH: {}", cudnn_str);
+            }
+        }
+
+        true
+    }
+
+    /// Register this backend as an execution provider on the given session builder.
+    fn apply(
+        &self,
+        builder: ort::session::builder::SessionBuilder,
+    ) -> Result<ort::session::builder::SessionBuilder> {
+        use ort::ep;
+
+        let builder = match self {
+            Self::Cuda => builder.with_execution_providers([
+                ep::CUDA::default().build(),
+            ])?,
+
+            Self::DirectML => {
+                // Device 0 is often the iGPU on hybrid systems.
+                // Default to adapter 1 (discrete GPU) on hybrid systems.
+                let device_id = best_directml_device_id();
+                log::info!("[DirectML] Selected adapter index: {}", device_id);
+                builder.with_execution_providers([
+                    ep::DirectML::default().with_device_id(device_id).build(),
+                ])?
+            }
+
+            Self::CoreML => builder.with_execution_providers([
+                ep::CoreML::default().build(),
+            ])?,
+
+            Self::Cpu => builder, // ORT defaults to CPU; nothing to register
+        };
+
+        Ok(builder)
     }
 }
 
-/// Types of ML models supported
+/// Heuristic: pick the DirectML adapter that isn't the primary display adapter
+/// when a discrete GPU is present. Falls back to 0 if none found.
+fn best_directml_device_id() -> i32 {
+    // On most hybrid systems: 0 = iGPU (display), 1 = dGPU (compute)
+    // Without a full DXGI enumeration we use env var override or default to 1
+    // so that the discrete GPU is preferred over the integrated one.
+    if let Ok(val) = std::env::var("PIXELFORGE_DIRECTML_DEVICE") {
+        if let Ok(id) = val.parse::<i32>() {
+            return id;
+        }
+    }
+    // Default to adapter 1 (discrete GPU) — safe because DirectML silently
+    // falls back to adapter 0 if adapter 1 doesn't exist.
+    1
+}
+
+// ── Model Types ──────────────────────────────────────────────────────────────
+
+/// Types of ML models supported by PixelForge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelType {
     FaceDetection,
@@ -196,232 +243,171 @@ pub enum ModelType {
     Segmentation,
 }
 
-/// Cached ONNX session with metadata
-pub struct ModelSession {
-    /// The ONNX session (wrapped in Mutex since run() needs &mut self)
-    pub session: std::sync::Mutex<ort::session::Session>,
-    /// Input name for the model
-    pub input_name: String,
-    /// Output name for the model
-    pub output_name: String,
-    /// Input shape (NCHW format)
-    pub input_shape: Vec<i64>,
-    /// Model type identifier
-    pub model_type: ModelType,
+impl ModelType {
+    /// Expected input shape in NCHW format.
+    pub fn input_shape(self) -> [i64; 4] {
+        match self {
+            Self::FaceDetection => [1, 3, 160, 160],
+            Self::DepthEstimation => [1, 3, 384, 384],
+            Self::Segmentation => [1, 3, 512, 512],
+        }
+    }
 }
 
-/// Model cache key
+// ── Model Session ─────────────────────────────────────────────────────────────
+
+/// A loaded ONNX model with its metadata.
+pub struct ModelSession {
+    /// Inner ORT session. Mutex because `run()` requires `&mut self`.
+    pub session: std::sync::Mutex<ort::session::Session>,
+    /// Name of the primary input tensor.
+    pub input_name: String,
+    /// Name of the primary output tensor.
+    pub output_name: String,
+    /// Input shape in NCHW format.
+    pub input_shape: [i64; 4],
+    /// Which model this session represents.
+    pub model_type: ModelType,
+    /// Which backend is actually running inference.
+    pub backend: ExecutionBackend,
+}
+
+// ── Session Manager ───────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
-struct ModelKey {
+struct CacheKey {
     path: PathBuf,
     model_type: ModelType,
 }
 
-/// Centralized session manager for ONNX models
+/// Centralized ONNX session manager with automatic backend selection and caching.
 pub struct SessionManager {
-    /// Cached sessions
-    cache: RwLock<HashMap<ModelKey, Arc<ModelSession>>>,
-    /// Execution backend
+    cache: RwLock<HashMap<CacheKey, Arc<ModelSession>>>,
     backend: ExecutionBackend,
-    /// Number of intra-op threads
     num_threads: usize,
-    /// Graph optimization level
     optimization_level: GraphOptimizationLevel,
 }
 
 impl SessionManager {
-    /// Create a new session manager, automatically selecting the best available backend
+    /// Create a manager that auto-detects and uses the best available backend.
     pub fn new() -> Result<Self> {
-        log::info!("\n┌────────────────────────────────────────┐");
-        log::info!("│  SessionManager Initialization         │");
-        log::info!("└────────────────────────────────────────┘");
-        
-        // Try to use GPU if available, otherwise fall back to CPU
-        let backends = ExecutionBackend::available_backends();
-
-        log::info!("\n>>> Attempting backends in priority order:");
-        for (idx, backend) in backends.iter().enumerate() {
-            log::info!("  [{}] {:?}", idx + 1, backend);
-        }
-        
-        for backend in backends {
-            if backend.is_available() && backend != ExecutionBackend::Cpu {
-                log::info!("\n>>> Attempting to initialize: {:?}", backend);
-                log::info!("    Status: Backend is available");
-                match Self::with_backend(backend) {
-                    Ok(manager) => {
-                        log::warn!("\n✓✓✓ SUCCESS - Using {:?} backend ✓✓✓\n", backend);
-                        return Ok(manager);
-                    }
-                    Err(e) => {
-                        log::warn!("✗ Failed to initialize {:?}: {}", backend, e);
-                        log::info!("    Trying next backend...");
-                    }
-                }
-            } else {
-                log::info!(">>> Skipping {:?} (backend not available or is CPU)", backend);
-            }
-        }
-
-        // Fall back to CPU
-        log::warn!("\n>>> All GPU backends unavailable or failed - Falling back to CPU\n");
-        Self::with_backend(ExecutionBackend::Cpu)
+        Self::with_backend(ExecutionBackend::best())
     }
 
-    /// Create a new session manager with specified backend
+    /// Create a manager pinned to a specific backend.
     pub fn with_backend(backend: ExecutionBackend) -> Result<Self> {
+        log::info!("[SessionManager] Initialized with backend: {:?}", backend);
         Ok(Self {
             cache: RwLock::new(HashMap::new()),
             backend,
-            num_threads: 4,
+            num_threads: num_cpus(),
             optimization_level: GraphOptimizationLevel::Level3,
         })
     }
 
-    /// Set number of threads for intra-op parallelism
-    pub fn with_threads(mut self, num_threads: usize) -> Self {
-        self.num_threads = num_threads;
+    /// Override the intra-op thread count (defaults to logical CPU count).
+    pub fn with_threads(mut self, n: usize) -> Self {
+        self.num_threads = n;
         self
     }
 
-    /// Get the current execution backend
+    /// The backend this manager is using.
     pub fn backend(&self) -> ExecutionBackend {
         self.backend
     }
 
-    /// Get or create a session for the given model
+    /// Retrieve a cached session or load the model from disk.
     pub fn get_or_load(
         &self,
         model_path: &PathBuf,
         model_type: ModelType,
     ) -> Result<Arc<ModelSession>> {
-        let key = ModelKey {
+        let key = CacheKey {
             path: model_path.clone(),
             model_type,
         };
 
-        // Check cache first (read lock)
-        {
-            let cache = self.cache.read();
-            if let Some(session) = cache.get(&key) {
-                log::debug!("[CACHE HIT] Model already loaded: {:?}", model_type);
-                return Ok(Arc::clone(session));
-            }
+        // Fast path: read lock
+        if let Some(session) = self.cache.read().get(&key) {
+            log::debug!("[Cache] HIT {:?}", model_type);
+            return Ok(Arc::clone(session));
         }
 
-        log::info!("[LOADING] Model: {:?} from cache MISS", model_type);
-        
-        // Not in cache, create new session
-        let session = self.create_session(model_path, model_type)?;
+        // Slow path: load and insert
+        log::info!("[Cache] MISS {:?} — loading from disk", model_type);
+        let session = self.load_session(model_path, model_type)?;
 
-        // Store in cache (write lock)
-        {
-            let mut cache = self.cache.write();
-            cache.insert(key, Arc::clone(&session));
-            log::debug!("[CACHE] Stored {:?} in session cache", model_type);
-        }
+        self.cache.write().insert(key, Arc::clone(&session));
+        log::debug!("[Cache] Stored {:?}", model_type);
 
         Ok(session)
     }
 
-    /// Create a new ONNX session
-    fn create_session(
+    /// Load a new ONNX session, trying backends in priority order and falling
+    /// back gracefully if the preferred one fails at runtime.
+    fn load_session(
         &self,
         model_path: &PathBuf,
         model_type: ModelType,
     ) -> Result<Arc<ModelSession>> {
         log::info!(
-            "\n╔═══════════════════════════════════════╗"
-        );
-        log::info!(
-            "║ Creating ORT Session                  ║"
-        );
-        log::info!(
-            "╠═══════════════════════════════════════╣"
-        );
-        log::info!(
-            "║ Model Type:   {:?}",
-            model_type
-        );
-        log::info!(
-            "║ Path:         {:?}\n║",
-            model_path
-        );
-        log::info!(
-            "║ Backend:      {:?}",
-            self.backend
-        );
-        log::info!(
-            "║ Threads:      {}",
-            self.num_threads
-        );
-        log::info!(
-            "╚═══════════════════════════════════════╝\n"
+            "[Load] {:?} from \"{}\"",
+            model_type,
+            model_path.display()
         );
 
-        let builder = ort::session::builder::SessionBuilder::new()?
+        // Try preferred backend first, then fall back down the priority list
+        let backends = {
+            let mut list = ExecutionBackend::detect();
+            // Ensure the manager's chosen backend is always tried first
+            list.retain(|b| b != &self.backend);
+            list.insert(0, self.backend);
+            list
+        };
+
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for backend in &backends {
+            log::info!("[Load] Trying backend: {:?}", backend);
+
+            match self.try_load_with_backend(model_path, model_type, *backend) {
+                Ok(session) => {
+                    log::info!("[Load] ✓ {:?} loaded on {:?}", model_type, backend);
+                    return Ok(session);
+                }
+                Err(e) => {
+                    log::warn!("[Load] {:?} failed: {:#}", backend, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No backends available")))
+            .context(format!("Failed to load {:?} on any backend", model_type))
+    }
+
+    fn try_load_with_backend(
+        &self,
+        model_path: &PathBuf,
+        model_type: ModelType,
+        backend: ExecutionBackend,
+    ) -> Result<Arc<ModelSession>> {
+        let base_builder = ort::session::builder::SessionBuilder::new()?
             .with_optimization_level(self.optimization_level)?
             .with_intra_threads(self.num_threads)?;
 
-        log::info!("→ Backend selected: {:?}", self.backend);
-        
-        // Build execution providers list based on selected backend
-        let providers: Vec<ort::ep::ExecutionProviderDispatch> = match self.backend {
-            ExecutionBackend::Cuda => {
-                log::info!("  → Registering CUDA execution provider");
-                log::info!("    Requirements: NVIDIA CUDA toolkit + cuDNN");
-                vec![ort::ep::CUDA::default().build()]
-            }
-            ExecutionBackend::DirectML => {
-                log::info!("  → Registering DirectML execution provider");
-                log::info!("    Requirements: Windows 10/11 + GPU drivers");
-                vec![ort::ep::DirectML::default().build()]
-            }
-            ExecutionBackend::CoreML => {
-                log::info!("  → Registering CoreML execution provider");
-                vec![ort::ep::CoreML::default().build()]
-            }
-            ExecutionBackend::Cpu => {
-                log::warn!("  ⚠ CPU-only execution (no GPU provider)");
-                vec![] // Empty = CPU only
-            }
-        };
+        let builder = backend.apply(base_builder)?;
+        let session = builder
+            .commit_from_file(model_path)
+            .with_context(|| format!("ORT commit_from_file failed for {:?}", backend))?;
 
-        log::info!("\n→ Creating ONNX Runtime session from: {:?}", model_path);
-        
-        let builder = builder.with_execution_providers(providers)?;
-        log::info!("✓ Execution providers registered successfully");
-        
-        let session = match builder.commit_from_file(model_path) {
-            Ok(sess) => {
-                log::warn!("✓ Session created successfully on registered provider");
-                sess
-            }
-            Err(e) => {
-                log::error!("✗ SESSION CREATION FAILED!");
-                log::error!("  Error: {}", e);
-                return Err(anyhow::anyhow!("Session creation error: {}", e));
-            }
-        };
-
-        log::info!("\n→ Reading model metadata...");
-        // Get input/output names
         let input_name = session.inputs()[0].name().to_string();
         let output_name = session.outputs()[0].name().to_string();
+        let input_shape = model_type.input_shape();
 
-        // Get input shape - use defaults based on model type
-        let input_shape: Vec<i64> = match model_type {
-            ModelType::FaceDetection => vec![1, 3, 160, 160],
-            ModelType::DepthEstimation => vec![1, 3, 384, 384],
-            ModelType::Segmentation => vec![1, 3, 512, 512],
-        };
-
-        log::warn!(
-            "✓✓✓ Session Ready ✓✓✓\n  Backend:  {:?}\n  Input:    {} {:?}\n  Output:   {}\n",
-            self.backend,
-            input_name,
-            input_shape,
-            output_name
+        log::info!(
+            "[Load] input={} output={} shape={:?} backend={:?}",
+            input_name, output_name, input_shape, backend
         );
 
         Ok(Arc::new(ModelSession {
@@ -430,43 +416,39 @@ impl SessionManager {
             output_name,
             input_shape,
             model_type,
+            backend,
         }))
     }
 
-    /// Clear the model cache (unload all models)
+    /// Remove all cached sessions.
     pub fn clear_cache(&self) {
-        let mut cache = self.cache.write();
-        cache.clear();
-        log::info!("Model cache cleared");
+        self.cache.write().clear();
+        log::info!("[Cache] Cleared");
     }
 
-    /// Remove a specific model from cache
+    /// Remove one model from the cache.
     pub fn unload(&self, model_path: &PathBuf, model_type: ModelType) {
-        let key = ModelKey {
+        let key = CacheKey {
             path: model_path.clone(),
             model_type,
         };
-        let mut cache = self.cache.write();
-        cache.remove(&key);
+        self.cache.write().remove(&key);
+        log::debug!("[Cache] Unloaded {:?}", model_type);
     }
 
-    /// Get cache statistics
+    /// Returns `(cached_model_count, estimated_vram_mb)`.
     pub fn cache_stats(&self) -> (usize, usize) {
-        let cache = self.cache.read();
-        let count = cache.len();
-        // Estimate memory usage (rough approximation)
-        let estimated_mb = count * 50; // Assume ~50MB per model
-        (count, estimated_mb)
+        let count = self.cache.read().len();
+        (count, count * 50) // rough 50 MB/model estimate
     }
 
-    /// Check if a model is loaded in cache
+    /// Check whether a model is currently cached.
     pub fn is_loaded(&self, model_path: &PathBuf, model_type: ModelType) -> bool {
-        let key = ModelKey {
+        let key = CacheKey {
             path: model_path.clone(),
             model_type,
         };
-        let cache = self.cache.read();
-        cache.contains_key(&key)
+        self.cache.read().contains_key(&key)
     }
 }
 
@@ -476,20 +458,33 @@ impl Default for SessionManager {
     }
 }
 
-/// Global session manager instance (lazy initialized)
+// ── Global Instance ───────────────────────────────────────────────────────────
+
 static SESSION_MANAGER: std::sync::OnceLock<Arc<SessionManager>> = std::sync::OnceLock::new();
 
-/// Get or create the global session manager
+/// Returns the process-wide session manager, creating it on first call.
 pub fn global_session_manager() -> Arc<SessionManager> {
     SESSION_MANAGER
-        .get_or_init(|| Arc::new(SessionManager::new().expect("Failed to create global SessionManager")))
+        .get_or_init(|| {
+            Arc::new(SessionManager::new().expect("Failed to create global SessionManager"))
+        })
         .clone()
 }
 
-/// Initialize the global session manager with a specific backend
+/// Initialize the global session manager with an explicit backend.
+/// Must be called before any `global_session_manager()` call to take effect.
 pub fn init_global_session_manager(backend: ExecutionBackend) -> Result<Arc<SessionManager>> {
     let manager = Arc::new(SessionManager::with_backend(backend)?);
-    // Note: OnceLock doesn't allow overwriting, so this only works on first call
+    // OnceLock: only the first call wins; subsequent calls are no-ops.
     let _ = SESSION_MANAGER.set(manager.clone());
     Ok(manager)
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Best-effort logical CPU count; defaults to 4 if unavailable.
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
