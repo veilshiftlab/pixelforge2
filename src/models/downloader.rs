@@ -67,7 +67,7 @@ impl Default for DownloadSettings {
 
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
-    pub id: &'static str,
+    pub id: String,
     pub name: String,
     pub filename: String,
     pub url: String,
@@ -142,7 +142,7 @@ impl ModelDownloader {
         let def = config.models.get(model_id)?;
 
         Some(ModelInfo {
-            id: Box::leak(model_id.to_string().into_boxed_str()),
+            id: model_id.to_string(),
             name: def.name.clone(),
             filename: def.filename.clone(),
             url: def.url.clone(),
@@ -157,19 +157,24 @@ impl ModelDownloader {
             Err(_) => return Vec::new(),
         };
 
-        config
+        let mut models: Vec<ModelInfo> = config
             .models
             .iter()
             .filter(|(_, def)| def.enabled)
             .map(|(id, def)| ModelInfo {
-                id: Box::leak(id.clone().into_boxed_str()),
+                id: id.clone(),
                 name: def.name.clone(),
                 filename: def.filename.clone(),
                 url: def.url.clone(),
                 size_mb: def.size_mb,
                 description: def.description.clone(),
             })
-            .collect()
+            .collect();
+
+        // Sort by ID for stable UI ordering — HashMap iteration is random per
+        // call, which caused the Models panel to reorganize every frame.
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models
     }
 
     pub fn is_model_downloaded(&self, model_id: &str) -> bool {
@@ -282,17 +287,20 @@ impl ModelDownloader {
         config.models.values().filter(|def| def.enabled).map(|def| def.size_mb).sum()
     }
 
-    pub fn list_models_status(&self) -> Vec<(&'static str, bool)> {
-        self.config
+    pub fn list_models_status(&self) -> Vec<(String, bool)> {
+        let mut models: Vec<(String, bool)> = self.config
             .models
             .iter()
             .filter(|(_, def)| def.enabled)
             .map(|(id, def)| {
                 let downloaded = self.models_dir.join(&def.filename).exists();
-                // Use Box::leak to get 'static lifetime
-                (Box::leak(id.clone().into_boxed_str()) as &str, downloaded)
+                (id.clone(), downloaded)
             })
-            .collect()
+            .collect();
+
+        // Sort by ID for stable ordering (HashMap iteration is random).
+        models.sort_by(|a, b| a.0.cmp(&b.0));
+        models
     }
 }
 
@@ -350,7 +358,7 @@ impl AsyncDownloader {
         }
     }
 
-    pub fn list_models_status(&self) -> Vec<(&'static str, bool)> {
+    pub fn list_models_status(&self) -> Vec<(String, bool)> {
         if let Ok(d) = self.downloader.lock() {
             d.list_models_status()
         } else {

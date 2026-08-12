@@ -239,10 +239,8 @@ pub fn about_dialog(app: &mut PixelForgeApp, ctx: &egui::Context) {
             ui.add_space(6.0);
 
             for (icon, text) in [
-                ("👤", "YOLOv8n-Face — bounding box + 5 real landmarks"),
                 ("📐", "Depth-Anything V2 — per-pixel relative depth for shading"),
-                ("🎨", "BiSeNet — 19-class face parsing for region-aware palette"),
-                ("✏",  "TEED — perceptual edge detection for crisp outlines"),
+                ("✏",  "DexiNed — perceptual edge detection for crisp outlines"),
             ] {
                 ui.horizontal(|ui| {
                     ui.label(icon);

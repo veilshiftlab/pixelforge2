@@ -1,11 +1,8 @@
 //! Central preview panel
 
 use super::state::{PixelForgeApp, PreviewTab};
-use crate::ml::SegmentationRegion;
 use eframe::egui;
 use image::GenericImageView;
-use std::cmp::Reverse;
-use std::collections::HashMap;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Entry point
@@ -54,10 +51,10 @@ fn original_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     let dw = img_w as f32 * scale;
     let dh = img_h as f32 * scale;
     let tex_id = input.texture.id();
-    
+
     // Extract path info before closure to avoid borrow conflict
     let path_name = input.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string());
-    
+
     // Drop the borrow on input before the horizontal closure
     let _ = input;
 
@@ -130,19 +127,8 @@ fn ml_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
 
     // Snapshot the lightweight parts before entering the collapsing closures
     // so we don't hold a borrow on app.ml_results through the whole scroll area.
-    let has_face  = app.ml_results.as_ref().unwrap().face_bounds.is_some();
     let has_depth = app.ml_results.as_ref().unwrap().depth_map.is_some();
-    let has_seg   = app.ml_results.as_ref().unwrap().segmentation.is_some();
     let has_edge  = app.ml_results.as_ref().unwrap().edge_map.is_some();
-
-    let face_conf_str = app.ml_results.as_ref()
-        .and_then(|r| r.face.as_ref())
-        .map(|f| format!("{:.1}%", f.confidence * 100.0));
-
-    let face_bounds_str = app.ml_results.as_ref()
-        .and_then(|r| r.face_bounds)
-        .map(|b| format!("{:.1}%×{:.1}% at ({:.1}%, {:.1}%)",
-            b.width*100.0, b.height*100.0, b.x*100.0, b.y*100.0));
 
     let depth_stats = app.ml_results.as_ref()
         .and_then(|r| r.depth_map.as_deref())
@@ -158,50 +144,28 @@ fn ml_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
         .and_then(|r| r.depth_map.as_deref())
         .and_then(|d| depth_texture(d, img_w, img_h, ctx));
 
-    let seg_tex = app.ml_results.as_ref()
-        .and_then(|r| r.segmentation.as_ref())
-        .and_then(|s| seg_texture(&s.regions, img_w, img_h, ctx));
-
     let edge_tex = app.ml_results.as_ref()
         .and_then(|r| r.edge_map.as_deref())
         .and_then(|e| edge_texture(e, img_w, img_h, ctx));
 
-    // Region breakdown is the only thing that needs cloning (it's a HashMap)
-    let region_summary: Vec<(SegmentationRegion, f32)> = app.ml_results.as_ref()
-        .and_then(|r| r.segmentation.as_ref())
-        .map(|s| {
-            let total = s.regions.len().max(1);
-            let mut counts: HashMap<SegmentationRegion, usize> = HashMap::new();
-            for &r in s.regions.values() { *counts.entry(r).or_insert(0) += 1; }
-            let mut pairs: Vec<_> = counts.into_iter()
-                .map(|(r, n)| (r, n as f32 / total as f32 * 100.0))
-                .collect();
-            pairs.sort_by_key(|(_, pct)| Reverse((*pct * 1000.0) as u32));
-            pairs.truncate(8);
-            pairs
-        })
-        .unwrap_or_default();
+    // SLIC label map visualization — shows the superpixel regions so the user
+    // can see how the image is being segmented and tune K / spatial_weight.
+    let slic_tex = app.ml_results.as_ref()
+        .and_then(|r| r.slic_labels.as_ref())
+        .and_then(|labels| slic_label_texture(labels, img_w, img_h, ctx));
+
+    let slic_info = app.ml_results.as_ref()
+        .and_then(|r| r.slic_labels.as_ref())
+        .map(|labels| {
+            let mut s: Vec<u32> = labels.iter().copied().collect();
+            s.sort_unstable();
+            s.dedup();
+            (labels.len(), s.len())
+        });
 
     let mut rerun = false;
 
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-
-        // ── Face detection ──────────────────────────────────────────────────
-        ui.collapsing("👤 Face Detection", |ui| {
-            if has_face {
-                ui.colored_label(egui::Color32::GREEN, "✅ Detected");
-                if let Some(ref s) = face_conf_str   { ui.label(format!("Confidence: {}", s)); }
-                if let Some(ref s) = face_bounds_str  { ui.label(s); }
-                if let Some(ref r) = app.ml_results {
-                    if let Some(ref lm) = r.landmarks {
-                        ui.label(format!("{} landmark points", lm.points.len()));
-                    }
-                }
-            } else {
-                ui.colored_label(egui::Color32::YELLOW, "⚠ No face detected");
-                ui.label(egui::RichText::new("Lower the confidence threshold and re-run.").small().weak());
-            }
-        });
 
         // ── Depth map ───────────────────────────────────────────────────────
         ui.collapsing("📐 Depth Map", |ui| {
@@ -218,27 +182,8 @@ fn ml_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
             }
         });
 
-        // ── Segmentation ────────────────────────────────────────────────────
-        ui.collapsing("🎨 Face Parsing", |ui| {
-            if has_seg {
-                ui.colored_label(egui::Color32::GREEN, "✅ Complete");
-                for (region, pct) in &region_summary {
-                    let (r, g, b, _) = region.rgba();
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("■").color(egui::Color32::from_rgb(r, g, b)));
-                        ui.label(format!("{}: {:.1}%", region.display_name(), pct));
-                    });
-                }
-                if let Some(ref tex) = seg_tex {
-                    map_image(ui, tex.id(), img_w, img_h);
-                }
-            } else {
-                ui.label("Not run");
-            }
-        });
-
         // ── Edges ───────────────────────────────────────────────────────────
-        ui.collapsing("✏ Edge Map (TEED)", |ui| {
+        ui.collapsing("✏ Edge Map (DexiNed)", |ui| {
             if has_edge {
                 ui.colored_label(egui::Color32::GREEN, "✅ Generated");
                 if let Some(ref tex) = edge_tex {
@@ -246,7 +191,22 @@ fn ml_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
                 }
             } else {
                 ui.label("Not run");
-                ui.label(egui::RichText::new("Enable TEED in ML Analysis and re-run.").small().weak());
+                ui.label(egui::RichText::new("Enable DexiNed in ML Analysis and re-run.").small().weak());
+            }
+        });
+
+        // ── SLIC regions ───────────────────────────────────────────────────
+        ui.collapsing("🧩 SLIC Regions", |ui| {
+            if let Some(ref tex) = slic_tex {
+                if let Some((n_pixels, n_clusters)) = slic_info {
+                    ui.label(format!("{} pixels, {} active clusters", n_pixels, n_clusters));
+                }
+                ui.label(egui::RichText::new(
+                    "Each color = one superpixel. Adjust K and Spatial weight in the left panel, then Re-process."
+                ).small().weak());
+                map_image(ui, tex.id(), img_w, img_h);
+            } else {
+                ui.label("Not computed — run Process once first.");
             }
         });
 
@@ -380,25 +340,44 @@ fn depth_texture(depth: &[f32], w: u32, h: u32, ctx: &egui::Context) -> Option<e
     Some(ctx.load_texture("ml_depth", egui::ColorImage { size: [w as usize, h as usize], pixels }, egui::TextureOptions::default()))
 }
 
-fn seg_texture(regions: &HashMap<u32, SegmentationRegion>, w: u32, h: u32, ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    let total = (w * h) as usize;
-    if total == 0 { return None; }
-    let mut pixels = vec![egui::Color32::from_rgb(30, 30, 30); total];
-    for (&idx, &region) in regions {
-        if (idx as usize) < total {
-            let (r,g,b,_) = region.rgba();
-            pixels[idx as usize] = egui::Color32::from_rgb(r,g,b);
-        }
-    }
-    Some(ctx.load_texture("ml_seg", egui::ColorImage { size: [w as usize, h as usize], pixels }, egui::TextureOptions::default()))
-}
-
 fn edge_texture(edges: &[f32], w: u32, h: u32, ctx: &egui::Context) -> Option<egui::TextureHandle> {
     if edges.len() != (w * h) as usize { return None; }
     let pixels: Vec<egui::Color32> = edges.iter()
         .map(|&e| { let v = (e.clamp(0.0,1.0)*255.0) as u8; egui::Color32::from_rgb(v,v,v) })
         .collect();
     Some(ctx.load_texture("ml_edges", egui::ColorImage { size: [w as usize, h as usize], pixels }, egui::TextureOptions::default()))
+}
+
+/// SLIC label map → colored texture. Each cluster ID gets a distinct color
+/// so the user can see how the image is being segmented.
+fn slic_label_texture(labels: &[u32], w: u32, h: u32, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    if labels.len() != (w * h) as usize { return None; }
+
+    // Distinct colors for up to 16 cluster IDs (cycled if more)
+    let palette: [egui::Color32; 16] = [
+        egui::Color32::from_rgb(230,  25,  75),  // red
+        egui::Color32::from_rgb( 60, 180,  75),  // green
+        egui::Color32::from_rgb(255, 225,  25),  // yellow
+        egui::Color32::from_rgb(  0, 130, 200),  // blue
+        egui::Color32::from_rgb(245, 130,  48),  // orange
+        egui::Color32::from_rgb(145,  30, 180),  // purple
+        egui::Color32::from_rgb( 70, 240, 240),  // cyan
+        egui::Color32::from_rgb(240,  50, 230),  // magenta
+        egui::Color32::from_rgb(210, 245,  60),  // lime
+        egui::Color32::from_rgb(250, 190, 190),  // pink
+        egui::Color32::from_rgb(  0, 128, 128),  // teal
+        egui::Color32::from_rgb(230, 190, 255),  // lavender
+        egui::Color32::from_rgb(170, 110,  40),  // brown
+        egui::Color32::from_rgb(255, 250, 200),  // beige
+        egui::Color32::from_rgb(128, 128, 128),  // gray
+        egui::Color32::from_rgb(  0,   0,   0),  // black
+    ];
+
+    let pixels: Vec<egui::Color32> = labels.iter()
+        .map(|&label| palette[(label as usize) % palette.len()])
+        .collect();
+
+    Some(ctx.load_texture("ml_slic", egui::ColorImage { size: [w as usize, h as usize], pixels }, egui::TextureOptions::default()))
 }
 
 /// Display a map scaled to fit the available panel width (never upscale)

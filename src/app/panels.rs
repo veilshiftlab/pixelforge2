@@ -2,7 +2,7 @@
 
 use super::state::{AspectRatioMode, PixelForgeApp};
 use crate::processing::{
-    DetailLevel, DownsamplingMethod, EdgeMode, EyeSize, PaletteMode, PresetPalette,
+    DownsamplingMethod, EdgeMode, OutlineStyle, PaletteMode, PresetPalette,
 };
 use eframe::egui;
 use image::GenericImageView;
@@ -26,7 +26,7 @@ pub fn draw_left(app: &mut PixelForgeApp, ctx: &egui::Context) {
                 ui.add_space(6.0);
                 depth_to_flat_section(app, ui);
                 ui.add_space(6.0);
-                feature_section(app, ui);
+                slic_section(app, ui);
                 ui.add_space(6.0);
                 edge_section(app, ui);
             });
@@ -116,37 +116,19 @@ fn models_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
 
 fn ml_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.collapsing("🤖 ML Analysis", |ui| {
-        // Enable toggles — one per model
-        ui.checkbox(&mut app.ml_config.face_detection_enabled,  "Face Detection (YOLOv8)");
+        // Enable toggles — one per remaining model
         ui.checkbox(&mut app.ml_config.depth_estimation_enabled, "Depth Estimation (Depth-Anything V2)");
-        ui.checkbox(&mut app.ml_config.segmentation_enabled,    "Face Parsing (BiSeNet)");
-        ui.checkbox(&mut app.ml_config.edge_detection_enabled,  "Edge Detection (TEED)");
+        ui.checkbox(&mut app.ml_config.edge_detection_enabled,  "Edge Detection (DexiNed)");
 
-        ui.separator();
-        ui.label("Thresholds:");
-
-        // Sliders wire directly to the nested sub-configs — no shim sync needed
-        ui.add(
-            egui::Slider::new(&mut app.ml_config.face_detection.confidence_threshold, 0.1..=0.95)
-                .text("Face"),
-        );
-        ui.add(
-            egui::Slider::new(&mut app.ml_config.segmentation.confidence_threshold, 0.1..=0.9)
-                .text("Segmentation"),
-        );
-        ui.add(
-            egui::Slider::new(&mut app.ml_config.edge.threshold, 0.05..=0.95)
-                .text("Edge"),
-        );
+        // Note: edge threshold is in the Edges panel (edge_config.teed_threshold).
+        // It controls which pixels become outlines during the pixel-art pass.
 
         ui.separator();
 
-        // ML-result status badges
+        // ML-result status badges (depth + edges only)
         if let Some(ref r) = app.ml_results {
             ui.horizontal_wrapped(|ui| {
-                badge(ui, "👤", r.face_bounds.is_some());
                 badge(ui, "📐", r.depth_map.is_some());
-                badge(ui, "🎨", r.segmentation.is_some());
                 badge(ui, "✏",  r.edge_map.is_some());
             });
         }
@@ -172,50 +154,47 @@ fn depth_to_flat_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     ui.collapsing("🎨 Depth → Flat", |ui| {
         let dtf = &mut app.depth_to_flat_config;
 
-        // ── Depth influence ───────────────────────────────────────────────────
+        // ── Per-region shading ──────────────────────────────────────────────────
+        ui.label(egui::RichText::new("Per-region shading (SLIC + MAD)").small().weak());
+
         ui.add(
-            egui::Slider::new(&mut dtf.depth_influence, 0.0..=1.0)
-                .text("Depth influence")
+            egui::Slider::new(&mut dtf.strength, 0.0..=1.0)
+                .text("Strength")
                 .fixed_decimals(2),
         ).on_hover_text(
-            "How strongly depth shading overrides the photo's existing lighting.\n             0 = photo only  ·  0.4 = balanced blend  ·  1 = depth only"
+            "How strongly depth-derived shading biases Lab L*.\n0 = no shading · 0.4 = balanced · 1.0 = max contrast"
+        );
+
+        ui.add(
+            egui::Slider::new(&mut dtf.gamma, 0.5..=2.0)
+                .text("Gamma")
+                .fixed_decimals(2),
+        ).on_hover_text(
+            "Contrast curve exponent: s' = sign(s) × |s|^gamma.\n1.0 = linear · <1.0 = more midtone contrast · >1.0 = compressed"
+        );
+
+        ui.add(
+            egui::Slider::new(&mut dtf.mad_threshold, 0.01..=0.2)
+                .text("MAD threshold")
+                .fixed_decimals(3),
+        ).on_hover_text(
+            "Regions with MAD below this get no shading (avoids noise in flat areas).\nLower = shade more regions · Higher = skip noisier regions"
+        );
+
+        ui.add(
+            egui::Slider::new(&mut dtf.global_depth_weight, 0.0..=1.0)
+                .text("Global depth")
+                .fixed_decimals(2),
+        ).on_hover_text(
+            "Blend between local (per-region MAD) and global (whole-image min-max) depth shading.\n\
+             0.0 = pure local (fine detail, loses global relationships)\n\
+             0.5 = balanced (default)\n\
+             1.0 = pure global (preserves relative depth, flattens local detail)"
         );
 
         ui.separator();
 
-        // ── Tonal bands ───────────────────────────────────────────────────────
-        ui.label(egui::RichText::new("Tonal bands").small().weak());
-        for (label, val) in [
-            ("Skin",     &mut dtf.skin_tone_bands),
-            ("Hair",     &mut dtf.hair_bands),
-            ("Clothing", &mut dtf.clothing_bands),
-        ] {
-            ui.horizontal(|ui| {
-                ui.label(label);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add(egui::DragValue::new(val).range(1..=16).suffix(" bands"));
-                });
-            });
-        }
-
-        ui.add_space(4.0);
-        ui.add(egui::Slider::new(&mut dtf.shadow_threshold,    0.0..=0.5).text("Shadow"));
-        ui.add(egui::Slider::new(&mut dtf.highlight_threshold, 0.5..=1.0).text("Highlight"));
-
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut dtf.preserve_gradients, "Soft bands");
-            if dtf.preserve_gradients {
-                ui.add(
-                    egui::Slider::new(&mut dtf.gradient_preservation, 0.0..=1.0)
-                        .fixed_decimals(2)
-                        .text("Softness"),
-                );
-            }
-        });
-
-        ui.separator();
-
-        // ── Background separation ─────────────────────────────────────────────
+        // ── Background separation ────────────────────────────────────────────────
         ui.label(egui::RichText::new("Background separation").small().weak());
 
         ui.horizontal(|ui| {
@@ -245,35 +224,42 @@ fn depth_to_flat_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     });
 }
 
-// ─── Feature preservation ─────────────────────────────────────────────────────
+// ─── SLIC superpixels ───────────────────────────────────────────────────────
 
-fn feature_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
-    ui.collapsing("👁 Features", |ui| {
-        // Eye size
-        ui.label("Eye size:");
-        ui.horizontal_wrapped(|ui| {
-            for size in [EyeSize::Auto, EyeSize::Small, EyeSize::Medium, EyeSize::Large] {
-                if ui.selectable_label(app.feature_config.eye_size == size, format!("{:?}", size)).clicked() {
-                    app.feature_config.eye_size = size;
-                }
+fn slic_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
+    ui.collapsing("🧩 Regions (SLIC)", |ui| {
+        ui.add(
+            egui::Slider::new(&mut app.slic_config.k, 3..=8)
+                .text("Clusters (K)")
+                .fixed_decimals(0),
+        ).on_hover_text(
+            "Number of superpixel regions. Higher = more, smaller regions = finer detail control.\nRe-clusters on next Process."
+        );
+
+        ui.add(
+            egui::Slider::new(&mut app.slic_config.spatial_weight, 0.0..=1.0)
+                .text("Spatial weight")
+                .fixed_decimals(2),
+        ).on_hover_text(
+            "Controls blobbiness vs. detail fidelity.\nHigher = blobbier regions (boundaries follow the spatial grid).\nLower = regions follow color/depth boundaries more faithfully."
+        );
+
+        // Show cluster info if labels are cached
+        if let Some(ref ml) = app.ml_results {
+            if let Some(ref labels) = ml.slic_labels {
+                let unique = {
+                    let mut s: Vec<u32> = labels.iter().copied().collect();
+                    s.sort_unstable();
+                    s.dedup();
+                    s.len()
+                };
+                ui.label(egui::RichText::new(format!(
+                    "Cached: {} pixels, {} active clusters",
+                    labels.len(),
+                    unique
+                )).small().weak());
             }
-        });
-
-        ui.label("Detail:");
-        ui.horizontal_wrapped(|ui| {
-            for level in [DetailLevel::Minimal, DetailLevel::Standard, DetailLevel::Full] {
-                if ui.selectable_label(app.feature_config.eye_detail == level, format!("{:?}", level)).clicked() {
-                    // Apply to all facial features at once
-                    app.feature_config.eye_detail  = level;
-                    app.feature_config.lip_detail  = level;
-                    app.feature_config.nose_detail = level;
-                }
-            }
-        });
-
-        ui.add_space(4.0);
-        ui.checkbox(&mut app.feature_config.force_eye_highlights, "Force eye highlights");
-        ui.checkbox(&mut app.feature_config.distinct_nostrils,    "Distinct nostrils");
+        }
     });
 }
 
@@ -294,6 +280,29 @@ fn edge_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
         ui.add(egui::Slider::new(&mut app.edge_config.thickness,              1..=4).text("Thickness"));
         ui.add(egui::Slider::new(&mut app.edge_config.edge_darkener_strength, 0.0..=1.0).text("Darkener"));
         ui.checkbox(&mut app.edge_config.anti_alias_edges, "Anti-alias");
+
+        ui.separator();
+        ui.label(egui::RichText::new("DexiNed outline pass").small().weak());
+
+        // Outline style — determines how outline colors are chosen from the palette
+        ui.label("Outline style:");
+        ui.horizontal_wrapped(|ui| {
+            for style in [OutlineStyle::AutoContrast, OutlineStyle::Black] {
+                if ui.selectable_label(app.edge_config.outline_style == style, format!("{:?}", style)).clicked() {
+                    app.edge_config.outline_style = style;
+                }
+            }
+        });
+
+        ui.add(egui::Slider::new(&mut app.edge_config.teed_threshold, 0.05..=0.8)
+            .text("Edge threshold")
+            .fixed_decimals(2))
+            .on_hover_text(
+                "Edge probability threshold (average-pooled to pixel-art resolution).\n\
+                 Lower = more edges (thicker, denser); higher = fewer edges (thinner, cleaner).\n\
+                 0.3 = balanced default. If edges are too thick, raise this to 0.4–0.5.\n\
+                 Falls back to Sobel when the model is unavailable."
+            );
     });
 }
 
@@ -389,7 +398,7 @@ fn transform_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Con
     // ── Input image transforms (using ImageProcessor from image crate) ────────────
     if app.image_processor.is_some() {
         ui.label(egui::RichText::new("Input Transforms").small().weak());
-        
+
         ui.horizontal(|ui| {
             if ui.button("🔄 Flip H").on_hover_text("Flip horizontally").clicked() {
                 if let Some(ref mut proc) = app.image_processor {
@@ -435,29 +444,39 @@ fn transform_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Con
         .selected_text(format!("{:?}", app.transform_config.downsampling_method))
         .show_ui(ui, |ui| {
             for m in [
-                DownsamplingMethod::Weighted,
+                DownsamplingMethod::PaletteMode,
                 DownsamplingMethod::NearestNeighbor,
+                DownsamplingMethod::Weighted,
                 DownsamplingMethod::Bilinear,
             ] {
                 ui.selectable_value(&mut app.transform_config.downsampling_method, m, format!("{:?}", m));
             }
         });
 
+    match app.transform_config.downsampling_method {
+        DownsamplingMethod::PaletteMode => ui.label(
+            egui::RichText::new("Palette-mode: quantize at full res, pick most common color per block. Crisp, no smudge.")
+            .small().color(egui::Color32::from_rgb(100, 200, 100))
+        ),
+        DownsamplingMethod::NearestNeighbor => ui.label(
+            egui::RichText::new("Nearest: picks center pixel. Fast but may miss detail.")
+            .small().weak()
+        ),
+        DownsamplingMethod::Weighted => ui.label(
+            egui::RichText::new("Weighted: averages all pixels in block. May smudge.")
+            .small().weak()
+        ),
+        DownsamplingMethod::Bilinear => ui.label(
+            egui::RichText::new("Bilinear: smooth interpolation. May blur.")
+            .small().weak()
+        ),
+    };
+
     ui.add(egui::Slider::new(&mut app.transform_config.scale,     0.1..=4.0  ).text("Scale"));
     ui.horizontal(|ui| {
         ui.add(egui::Slider::new(&mut app.transform_config.offset_x, -1.0..=1.0).text("X"));
         ui.add(egui::Slider::new(&mut app.transform_config.offset_y, -1.0..=1.0).text("Y"));
     });
-
-    ui.separator();
-    ui.checkbox(&mut app.transform_config.clip_to_face, "Clip to face")
-        .on_hover_text("Crop to the detected face region before downsampling");
-    if app.transform_config.clip_to_face {
-        if app.ml_results.as_ref().and_then(|r| r.face_bounds.as_ref()).is_none() {
-            ui.label(egui::RichText::new("⚠ No face detected — run ML first").color(egui::Color32::YELLOW).small());
-        }
-        ui.add(egui::Slider::new(&mut app.transform_config.clip_padding, 0.0..=1.0).text("Padding"));
-    }
 }
 
 fn palette_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
@@ -474,8 +493,6 @@ fn palette_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     match app.palette_config.mode {
         PaletteMode::Auto => {
             ui.add(egui::Slider::new(&mut app.palette_config.max_colors, 2..=256).text("Max colors"));
-            ui.checkbox(&mut app.palette_config.per_region_limit, "Per-region palette")
-                .on_hover_text("Each segmented region gets its own sub-palette — useful for portraits");
         }
         PaletteMode::Preset => {
             egui::ComboBox::from_id_salt("palette_preset")
@@ -497,8 +514,6 @@ fn palette_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
             ui.label(egui::RichText::new("Custom palette editing coming soon").small().weak());
         }
         PaletteMode::Hybrid => {
-            // Hybrid combines auto-extracted colors with preset/override colors.
-            // The palette section for Hybrid shows the same auto controls.
             ui.add(egui::Slider::new(&mut app.palette_config.max_colors, 2..=256).text("Auto colors"));
             ui.label(egui::RichText::new("Region overrides configured in color settings.").small().weak());
         }
@@ -518,7 +533,6 @@ fn preset_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
                 ).clicked() {
                     app.transform_config     = preset.transform;
                     app.depth_to_flat_config = preset.depth_to_flat;
-                    app.feature_config       = preset.features;
                     app.edge_config          = preset.edges;
                     app.palette_config       = preset.palette;
                     app.current_preset       = Some(preset.name);
@@ -646,13 +660,11 @@ pub fn draw_status(app: &mut PixelForgeApp, ctx: &egui::Context) {
                 let (ow, oh) = super::processing::get_output_dimensions(app);
                 ui.label(egui::RichText::new(format!("→ {}×{}", ow, oh)).small().weak());
 
-                // ML result badges
+                // ML result badges (depth + edges only)
                 if let Some(ref ml) = app.ml_results {
                     ui.separator();
                     for (icon, active) in [
-                        ("👤", ml.face_bounds.is_some()),
                         ("📐", ml.depth_map.is_some()),
-                        ("🎨", ml.segmentation.is_some()),
                         ("✏",  ml.edge_map.is_some()),
                     ] {
                         if active {

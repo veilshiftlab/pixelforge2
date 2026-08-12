@@ -50,7 +50,6 @@ fn edit_menu(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
         if ui.button("Reset to Defaults").clicked() {
             app.transform_config     = Default::default();
             app.depth_to_flat_config = Default::default();
-            app.feature_config       = Default::default();
             app.edge_config          = Default::default();
             app.palette_config       = Default::default();
             app.ml_config            = Default::default();
@@ -73,11 +72,6 @@ fn view_menu(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
                 ui.close_menu();
             }
         }
-
-        ui.separator();
-
-        ui.checkbox(&mut app.show_landmarks, "Show Landmarks");
-        ui.checkbox(&mut app.show_segmentation_overlay, "Segmentation Overlay");
 
         ui.separator();
 
@@ -129,7 +123,6 @@ fn models_menu(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
         ui.separator();
 
         // Execution mode — controls whether models run on CPU, GPU-sequential, or GPU-parallel.
-        // Wired to ml_config.execution.mode (not the removed AppConfig::ModelQuality).
         ui.label(egui::RichText::new("Execution").small().weak());
 
         use crate::ml::ExecutionMode;
@@ -159,49 +152,30 @@ fn help_menu(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn apply_builtin_preset(app: &mut PixelForgeApp, id: &str) {
-    use crate::processing::{DetailLevel, EyeSize, PaletteMode, PresetPalette};
+    use crate::processing::{PaletteMode, PresetPalette};
 
     match id {
         "minimal" => {
             app.transform_config.output_size = 32;
             app.aspect_mode = super::state::AspectRatioMode::Square;
-            app.depth_to_flat_config.skin_tone_bands  = 3;
-            app.depth_to_flat_config.hair_bands        = 2;
-            app.depth_to_flat_config.clothing_bands    = 2;
-            app.depth_to_flat_config.background_bands  = 1;
-            app.feature_config.eye_size   = EyeSize::Small;
-            app.feature_config.eye_detail = DetailLevel::Minimal;
+            app.depth_to_flat_config = Default::default();
+            app.palette_config.mode = PaletteMode::Auto;
             app.palette_config.max_colors = 12;
             app.current_preset = Some("Portrait — Minimal".into());
         }
         "detailed" => {
             app.transform_config.output_size = 64;
             app.aspect_mode = super::state::AspectRatioMode::Square;
-            app.depth_to_flat_config.skin_tone_bands  = 5;
-            app.depth_to_flat_config.hair_bands        = 4;
-            app.depth_to_flat_config.clothing_bands    = 3;
-            app.depth_to_flat_config.background_bands  = 2;
-            app.feature_config.eye_size    = EyeSize::Medium;
-            app.feature_config.eye_detail  = DetailLevel::Standard;
-            app.feature_config.lip_detail  = DetailLevel::Standard;
-            app.feature_config.nose_detail = DetailLevel::Standard;
-            app.feature_config.distinct_nostrils = true;
-            app.palette_config.max_colors  = 32;
+            app.depth_to_flat_config = Default::default();
+            app.palette_config.mode = PaletteMode::Auto;
+            app.palette_config.max_colors = 32;
             app.current_preset = Some("Portrait — Detailed".into());
         }
         "hd" => {
             app.transform_config.output_size = 128;
             app.aspect_mode = super::state::AspectRatioMode::Preserve;
-            app.depth_to_flat_config.skin_tone_bands  = 6;
-            app.depth_to_flat_config.hair_bands        = 5;
-            app.depth_to_flat_config.clothing_bands    = 4;
-            app.depth_to_flat_config.background_bands  = 3;
-            app.feature_config.eye_size             = EyeSize::Large;
-            app.feature_config.eye_detail           = DetailLevel::Full;
-            app.feature_config.lip_detail           = DetailLevel::Full;
-            app.feature_config.nose_detail          = DetailLevel::Standard;
-            app.feature_config.distinct_nostrils    = true;
-            app.feature_config.force_eye_highlights = true;
+            app.depth_to_flat_config = Default::default();
+            app.palette_config.mode = PaletteMode::Auto;
             app.palette_config.max_colors = 64;
             app.current_preset = Some("Portrait — HD".into());
         }
@@ -209,10 +183,7 @@ fn apply_builtin_preset(app: &mut PixelForgeApp, id: &str) {
             app.transform_config.output_size  = 48;
             app.transform_config.export_scale = 2;
             app.aspect_mode = super::state::AspectRatioMode::Square;
-            app.depth_to_flat_config.skin_tone_bands = 2;
-            app.depth_to_flat_config.hair_bands       = 2;
-            app.depth_to_flat_config.clothing_bands   = 2;
-            app.depth_to_flat_config.background_bands = 1;
+            app.depth_to_flat_config = Default::default();
             app.palette_config.mode       = PaletteMode::Preset;
             app.palette_config.preset     = PresetPalette::GameBoy;
             app.palette_config.max_colors = 4;

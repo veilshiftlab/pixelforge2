@@ -4,8 +4,8 @@ use crate::config::AppConfig;
 use crate::ml::{MLConfig, MLResults};
 use crate::models::ModelManager;
 use crate::processing::{
-    DepthToFlatConfig, EdgeConfig, FeaturePreserveConfig, PaletteConfig,
-    ProcessingState, TransformConfig,
+    DepthToFlatConfig, EdgeConfig, PaletteConfig,
+    ProcessingState, SlicConfig, TransformConfig,
 };
 use eframe::egui::{self, TextureHandle};
 use parking_lot::RwLock;
@@ -53,8 +53,10 @@ pub struct PixelForgeApp {
     pub model_manager: Arc<RwLock<ModelManager>>,
 
     // ── Images ───────────────────────────────────────────────────────────────
-    pub input_image: Option<InputImage>,    /// Image processor for tracking transforms (flip/rotate/resize)
-    pub image_processor: Option<crate::image::ImageProcessor>,    /// Post-transform, pre-downsample (for debugging)
+    pub input_image: Option<InputImage>,
+    /// Image processor for tracking transforms (flip/rotate/resize)
+    pub image_processor: Option<crate::image::ImageProcessor>,
+    /// Post-transform, pre-downsample (for debugging)
     pub preprocessed_image: Option<image::DynamicImage>,
     /// Post depth-to-flat intermediate
     pub flat_color_image: Option<image::DynamicImage>,
@@ -70,9 +72,9 @@ pub struct PixelForgeApp {
     pub ml_config: MLConfig,
     pub transform_config: TransformConfig,
     pub depth_to_flat_config: DepthToFlatConfig,
-    pub feature_config: FeaturePreserveConfig,
     pub edge_config: EdgeConfig,
     pub palette_config: PaletteConfig,
+    pub slic_config: SlicConfig,
 
     // ── Output sizing ─────────────────────────────────────────────────────────
     pub aspect_mode: AspectRatioMode,
@@ -82,8 +84,6 @@ pub struct PixelForgeApp {
     // ── Preview ──────────────────────────────────────────────────────────────
     pub preview_tab: PreviewTab,
     pub preview_zoom: f32,
-    pub show_landmarks: bool,
-    pub show_segmentation_overlay: bool,
 
     // ── Presets ──────────────────────────────────────────────────────────────
     pub current_preset: Option<String>,
@@ -103,6 +103,10 @@ pub struct PixelForgeApp {
 
     // ── Async helpers ────────────────────────────────────────────────────────
     pub pending_file_load: Option<std::path::PathBuf>,
+
+    /// Receiver for background ML analysis results. `Some` while a background
+    /// ML thread is running; polled each frame in `update()`.
+    pub ml_analysis_receiver: Option<std::sync::mpsc::Receiver<anyhow::Result<crate::ml::MLResults>>>,
 }
 
 impl PixelForgeApp {
@@ -126,16 +130,14 @@ impl PixelForgeApp {
             ml_config: MLConfig::default(),
             transform_config: TransformConfig::default(),
             depth_to_flat_config: DepthToFlatConfig::default(),
-            feature_config: FeaturePreserveConfig::default(),
             edge_config: EdgeConfig::default(),
             palette_config: PaletteConfig::default(),
+            slic_config: SlicConfig::default(),
             aspect_mode: AspectRatioMode::Square,
             custom_output_width: 64,
             custom_output_height: 64,
             preview_tab: PreviewTab::Original,
             preview_zoom: 1.0,
-            show_landmarks: true,
-            show_segmentation_overlay: false,
             current_preset: None,
             show_model_dialog: false,
             show_about_dialog: false,
@@ -145,6 +147,7 @@ impl PixelForgeApp {
             vram_usage: 0,
             total_vram: 4096,
             pending_file_load: None,
+            ml_analysis_receiver: None,
         }
     }
 }
@@ -165,6 +168,30 @@ impl eframe::App for PixelForgeApp {
 
         if matches!(self.processing, ProcessingState::Running(_)) {
             ctx.request_repaint();
+        }
+
+        // ── Poll background ML analysis ───────────────────────────────────────
+        if let Some(rx) = self.ml_analysis_receiver.take() {
+            match rx.try_recv() {
+                Ok(Ok(results)) => {
+                    self.vram_usage = self.model_manager.read().estimated_vram_usage() / (1024 * 1024);
+                    self.ml_results = Some(results);
+                    self.processing = ProcessingState::Complete;
+                }
+                Ok(Err(e)) => {
+                    log::error!("ML analysis failed: {}", e);
+                    self.processing = ProcessingState::Error(e.to_string());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still running — put the receiver back and request a repaint
+                    self.ml_analysis_receiver = Some(rx);
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    log::error!("ML analysis thread disconnected (panicked?)");
+                    self.processing = ProcessingState::Error("ML analysis thread crashed".into());
+                }
+            }
         }
 
         super::menu::draw(self, ctx);

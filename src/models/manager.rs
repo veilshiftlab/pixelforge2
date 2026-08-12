@@ -164,7 +164,7 @@ impl ModelManager {
     }
 
     /// Check which model files exist and return their status
-    pub fn check_model_files(&self) -> Vec<(&'static str, bool)> {
+    pub fn check_model_files(&self) -> Vec<(String, bool)> {
         self.list_models()
             .into_iter()
             .map(|m| (m.id, m.downloaded))
@@ -174,7 +174,7 @@ impl ModelManager {
 
 #[derive(Debug, Clone)]
 pub struct ModelStatus {
-    pub id: &'static str,
+    pub id: String,
     pub name: String,
     pub filename: String,
     pub downloaded: bool,

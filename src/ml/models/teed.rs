@@ -1,46 +1,37 @@
-//! TEED: Tiny and Efficient Edge Detector
+//! Edge Detection — DexiNed (and TEED-compatible)
 //!
 //! # Model Details
 //!
-//! - **Source**: `xavysp/teed` on HuggingFace — export to ONNX with dynamic axes
-//! - **Size**: <1 MB (≈58 K parameters)
-//! - **Architecture**: Lightweight fully-convolutional CNN — natively handles any H×W
-//! - **Input**: RGB float32 NCHW, ImageNet-normalized
-//! - **Output**: `[1, 1, H, W]` — edge probability map, values in [0, 1]
+//! - **Current model**: DexiNed (Dense Extreme Inception Network for Edge Detection)
+//!   - Source: `SStahan/ONNX-exports-dpt-seg-edge-face` on HuggingFace
+//!   - Size: ~134 MB
+//!   - Input: RGB float32 NCHW, ImageNet-normalized, fixed 512×512
+//!   - Output: `[1, 1, H, W]` — edge probability map, values in [0, 1]
 //!
-//! # Why TEED instead of depth-derived edges
+//! - **Also compatible**: TEED (Tiny and Efficient Edge Detector)
+//!   - Size: <1 MB, dynamic input shape
+//!   - The module auto-detects whether the loaded model has fixed or dynamic
+//!     input dimensions and handles both cases.
 //!
-//! Depth discontinuities only capture silhouette edges. TEED is trained on perceptual
-//! edge ground truth and detects within-object boundaries: eyebrow lines, eyelids,
-//! fabric folds, hair strands. These are exactly the contours a pixel artist would
-//! hand-draw and the ones most damaged by downsampling.
+//! # Why a perceptual edge detector instead of depth-derived edges
 //!
-//! # Dynamic input
+//! Depth discontinuities only capture silhouette edges. A perceptual edge
+//! detector is trained on edge ground truth and detects within-object
+//! boundaries: eyebrow lines, eyelids, fabric folds, hair strands. These are
+//! exactly the contours a pixel artist would hand-draw and the ones most
+//! damaged by downsampling.
 //!
-//! With a dynamic-axes ONNX export, TEED runs at the exact original resolution — no
-//! rescaling, no bilinear upsampling, no spatial distortion in the edge map.
+//! # Fixed vs. dynamic input
 //!
-//! # Export recipe (one-time Python, run locally or on Colab)
+//! DexiNed is exported with a fixed 512×512 input shape. When the input image
+//! is not 512×512, we resize to 512×512 for inference, then bilinearly
+//! upsample the edge map back to the original resolution.
 //!
-//! ```python
-//! import torch
-//! # pip install git+https://github.com/xavysp/TEED
-//! from teed import TED
+//! TEED (if used) supports dynamic input and runs at the exact original
+//! resolution — no rescaling needed.
 //!
-//! model = TED()
-//! model.load_state_dict(torch.load("ted.pth", map_location="cpu"))
-//! model.eval()
-//!
-//! dummy = torch.zeros(1, 3, 512, 512)
-//! torch.onnx.export(
-//!     model, dummy, "teed.onnx",
-//!     input_names=["input"],
-//!     output_names=["edges"],
-//!     dynamic_axes={"input":  {2: "height", 3: "width"},
-//!                   "edges":  {2: "height", 3: "width"}},
-//!     opset_version=17,
-//! )
-//! ```
+//! The module queries the ONNX model's input dimensions at load time to
+//! determine which mode to use. A dimension value of `-1` indicates dynamic.
 
 use crate::ml::preprocess::{
     normalize_min_max, upsample_map_to_original, PreprocessConfig, preprocess,
@@ -55,40 +46,86 @@ use std::sync::Arc;
 // Detector
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Edge detector using TEED ONNX model.
+/// Edge detector using an ONNX edge detection model (DexiNed or TEED).
 ///
-/// On a dynamic-axes export (recommended) the model runs at the exact input resolution.
-/// On a fixed export it falls back to the export size and bilinearly upsamples the result.
+/// On a dynamic-axes export (TEED) the model runs at the exact input resolution.
+/// On a fixed export (DexiNed, 512×512) it resizes to the fixed size and
+/// bilinearly upsamples the result.
+///
+/// The struct is named `TeedEdgeDetector` for historical reasons — it was
+/// originally written for TEED. It now supports any ONNX edge detector with
+/// a `[1, 3, H, W]` input and `[1, 1, H, W]` / `[1, H, W]` / `[H, W]` output.
 pub struct TeedEdgeDetector {
     session_manager: Arc<SessionManager>,
     model_path: PathBuf,
     input_name: String,
     output_name: String,
-    /// `None` → model accepts dynamic input (preferred).
-    /// `Some((w, h))` → model has fixed input; we'll resize and upsample.
+    /// `None` → model accepts dynamic input (TEED).
+    /// `Some((w, h))` → model has fixed input (DexiNed: 512×512); we resize and upsample.
     fixed_dims: Option<(u32, u32)>,
 }
 
 impl TeedEdgeDetector {
     /// Load the ONNX model using SessionManager for GPU support.
+    ///
+    /// Queries the model's input dimensions to determine whether it uses
+    /// fixed or dynamic input shapes.
     pub fn new(model_path: &std::path::Path) -> Result<Self> {
         let session_manager = crate::ml::session::global_session_manager();
-        let model_session = session_manager.get_or_load(&model_path.to_path_buf(), ModelType::DepthEstimation)?; // TEED doesn't have a dedicated ModelType yet,  using DepthEstimation as proxy
-        
+        let model_session = session_manager.get_or_load(&model_path.to_path_buf(), ModelType::EdgeDetection)?;
+
         let session = model_session.session.lock().unwrap();
         let input_name  = session.inputs()[0].name().to_string();
         let output_name = session.outputs()[0].name().to_string();
+
+        // ── Detect fixed vs. dynamic input dimensions ───────────────────────
+        // The input shape is [N, C, H, W]. If H and W are both >= 0, the model
+        // has fixed input. If either is -1, the model accepts dynamic input.
+        let fixed_dims = Self::detect_fixed_dims(&session);
+
         drop(session);
 
-        // We can't introspect dims from ORT 2.x before the first run, so we
-        // assume dynamic. If the model is actually fixed-size, the first
-        // inference will succeed (we send whatever the image size is) or fail
-        // with a clear shape mismatch that surfaces immediately.
-        let fixed_dims: Option<(u32, u32)> = None;
+        match fixed_dims {
+            Some((w, h)) => log::info!(
+                "Edge detector loaded (fixed input {}×{}, backend: {:?})",
+                w, h, session_manager.backend()
+            ),
+            None => log::info!(
+                "Edge detector loaded (dynamic input, backend: {:?})",
+                session_manager.backend()
+            ),
+        }
 
-        log::info!("TEED loaded (dynamic input assumed): input_name='{}' (backend: {:?})", input_name, session_manager.backend());
+        Ok(Self {
+            session_manager,
+            model_path: model_path.to_path_buf(),
+            input_name,
+            output_name,
+            fixed_dims,
+        })
+    }
 
-        Ok(Self { session_manager, model_path: model_path.to_path_buf(), input_name, output_name, fixed_dims })
+    /// Query the model's input dimensions from the ORT session.
+    ///
+    /// Returns `Some((width, height))` if both spatial dimensions are fixed,
+    /// or `None` if either is dynamic (-1).
+    fn detect_fixed_dims(session: &ort::session::Session) -> Option<(u32, u32)> {
+        use ort::value::ValueType;
+
+        let input = session.inputs().first()?;
+        let dtype = input.dtype();
+
+        if let ValueType::Tensor { shape, .. } = dtype {
+            // Shape is [N, C, H, W] — dims[2] = H, dims[3] = W
+            if shape.len() >= 4 {
+                let h = shape[2];
+                let w = shape[3];
+                if h > 0 && w > 0 {
+                    return Some((w as u32, h as u32));
+                }
+            }
+        }
+        None
     }
 
     /// Detect edges in `image`.
@@ -107,13 +144,13 @@ impl TeedEdgeDetector {
             tensor,
         ))?;
 
-        let model_session = self.session_manager.get_or_load(&self.model_path, ModelType::DepthEstimation)?;
+        let model_session = self.session_manager.get_or_load(&self.model_path, ModelType::EdgeDetection)?;
         let mut session = model_session.session.lock().unwrap();
         let outputs = session.run(ort::inputs![&self.input_name => input_tensor])?;
 
         let output = outputs
             .get(&self.output_name)
-            .ok_or_else(|| anyhow!("TEED produced no output"))?;
+            .ok_or_else(|| anyhow!("Edge detector produced no output"))?;
 
         let (shape, raw) = output.try_extract_tensor::<f32>()?;
 
@@ -121,12 +158,12 @@ impl TeedEdgeDetector {
             4 => (shape[2] as usize, shape[3] as usize),
             3 => (shape[1] as usize, shape[2] as usize),
             2 => (shape[0] as usize, shape[1] as usize),
-            _ => return Err(anyhow!("Unexpected TEED output shape: {:?}", shape)),
+            _ => return Err(anyhow!("Unexpected edge detector output shape: {:?}", shape)),
         };
 
         let map_size = map_h * map_w;
         if raw.len() < map_size {
-            return Err(anyhow!("TEED output too small: expected {}, got {}", map_size, raw.len()));
+            return Err(anyhow!("Edge detector output too small: expected {}, got {}", map_size, raw.len()));
         }
         let map_slice = &raw[raw.len() - map_size..];
 

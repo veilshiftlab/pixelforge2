@@ -117,6 +117,14 @@ impl DepthAnythingEstimator {
         let mut upsampled = upsample_map_to_original(map_slice, map_w, map_h, &scale);
         normalize_min_max(&mut upsampled);
 
+        // Depth-Anything V2 outputs disparity (higher value = closer to camera).
+        // Our pipeline convention is depth (0 = nearest, 1 = farthest), so we
+        // invert after normalization. Without this, background pixels (low
+        // disparity) are treated as "near" and get foreground treatment.
+        for d in &mut upsampled {
+            *d = 1.0 - *d;
+        }
+
         Ok(upsampled)
     }
 }

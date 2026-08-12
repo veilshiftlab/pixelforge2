@@ -236,20 +236,27 @@ fn best_directml_device_id() -> i32 {
 // ── Model Types ──────────────────────────────────────────────────────────────
 
 /// Types of ML models supported by PixelForge.
+///
+/// After the pipeline repurpose, only DepthEstimation and EdgeDetection
+/// remain. FaceDetection and Segmentation were removed along with YOLOv8n-Face
+/// and BiSeNet. The dedicated `EdgeDetection` variant prevents the cache-key
+/// collision risk that existed when TEED reused `DepthEstimation`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelType {
-    FaceDetection,
     DepthEstimation,
-    Segmentation,
+    EdgeDetection,
 }
 
 impl ModelType {
     /// Expected input shape in NCHW format.
+    ///
+    /// These are the nominal export sizes; both Depth-Anything V2 and TEED
+    /// are exported with dynamic spatial axes, so the actual inference shape
+    /// is set per-image from the input dimensions.
     pub fn input_shape(self) -> [i64; 4] {
         match self {
-            Self::FaceDetection => [1, 3, 160, 160],
             Self::DepthEstimation => [1, 3, 384, 384],
-            Self::Segmentation => [1, 3, 512, 512],
+            Self::EdgeDetection => [1, 3, 512, 512],
         }
     }
 }

@@ -113,7 +113,6 @@ pub fn save_preset(app: &PixelForgeApp) {
             name:          path.file_stem().and_then(|s| s.to_str()).unwrap_or("Custom").to_string(),
             transform:     app.transform_config.clone(),
             depth_to_flat: app.depth_to_flat_config.clone(),
-            features:      app.feature_config.clone(),
             edges:         app.edge_config.clone(),
             palette:       app.palette_config.clone(),
         };
@@ -133,7 +132,6 @@ pub fn load_preset(app: &mut PixelForgeApp) {
             Ok(preset) => {
                 app.transform_config     = preset.transform;
                 app.depth_to_flat_config = preset.depth_to_flat;
-                app.feature_config       = preset.features;
                 app.edge_config          = preset.edges;
                 app.palette_config       = preset.palette;
                 app.current_preset       = Some(preset.name);
@@ -184,7 +182,7 @@ pub fn get_output_dimensions(app: &PixelForgeApp) -> (u32, u32) {
 pub fn run_ml_analysis(app: &mut PixelForgeApp, ctx: &egui::Context) {
     let Some(_input) = &app.input_image else { return };
     let Some(ref processor) = app.image_processor else { return };
-    
+
     // Use the processed image (with flips/rotations applied) from the ImageProcessor
     let image = match processor.get_processed_image() {
         Ok(img) => img,
@@ -195,7 +193,7 @@ pub fn run_ml_analysis(app: &mut PixelForgeApp, ctx: &egui::Context) {
             return;
         }
     };
-    
+
     let ml_config = app.ml_config.clone();
     let mgr       = app.model_manager.clone();
 
@@ -205,25 +203,19 @@ pub fn run_ml_analysis(app: &mut PixelForgeApp, ctx: &egui::Context) {
     });
     ctx.request_repaint();
 
-    // Synchronous for now — see TODO below
-    match crate::ml::MLAnalysis::analyze(&image, &ml_config, &mgr) {
-        Ok(results) => {
-            app.vram_usage = mgr.read().estimated_vram_usage() / (1024 * 1024);
-            app.ml_results = Some(results);
-            app.processing = ProcessingState::Complete;
-        }
-        Err(e) => {
-            log::error!("ML analysis failed: {}", e);
-            app.processing = ProcessingState::Error(e.to_string());
-        }
-    }
-    ctx.request_repaint();
-}
+    // Spawn a background thread so the UI doesn't freeze during ML inference.
+    // Results are sent back via an mpsc channel, polled in `update()`.
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.ml_analysis_receiver = Some(rx);
 
-// TODO: offload to a background thread once ort::Session gains Send:
-//   let (tx, rx) = std::sync::mpsc::channel();
-//   std::thread::spawn(move || tx.send(MLAnalysis::analyze(...)));
-//   poll rx in update() each frame, updating ProcessingState accordingly.
+    let ctx_clone = ctx.clone();
+    std::thread::spawn(move || {
+        let result = crate::ml::MLAnalysis::analyze(&image, &ml_config, &mgr);
+        let _ = tx.send(result);
+        // Wake the UI so it picks up the result immediately
+        ctx_clone.request_repaint();
+    });
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Processing pipeline
@@ -255,12 +247,50 @@ pub fn process_image(app: &mut PixelForgeApp, ctx: &egui::Context) {
         app.input_image.as_ref().unwrap().image.clone()
     };
 
+    // ── Compute SLIC superpixels (cached in ml_results) ───────────────────────
+    // SLIC runs on the same processed image the ML analysis used. The label
+    // map is cached in ml_results.slic_labels so palette/edge tweaks don't
+    // trigger a re-cluster. Recompute when depth_map is available and either
+    // the labels are missing or the config changed.
+    if let Some(ref mut ml) = app.ml_results {
+        let need_recompute = ml.slic_labels.is_none()
+            || ml.slic_labels_k != Some(app.slic_config.k)
+            || ml.slic_labels_s != Some(app.slic_config.spatial_weight);
+        if need_recompute {
+            if let Some(ref depth) = ml.depth_map {
+                match crate::processing::slic::slic(&input, Some(depth), &app.slic_config) {
+                    Ok(labels) => {
+                        ml.slic_labels = Some(labels);
+                        ml.slic_labels_k = Some(app.slic_config.k);
+                        ml.slic_labels_s = Some(app.slic_config.spatial_weight);
+                    }
+                    Err(e) => {
+                        log::warn!("SLIC failed: {e}");
+                        ml.slic_labels = None;
+                    }
+                }
+            } else {
+                // No depth map — still run SLIC with depth=0.5 fallback
+                match crate::processing::slic::slic(&input, None, &app.slic_config) {
+                    Ok(labels) => {
+                        ml.slic_labels = Some(labels);
+                        ml.slic_labels_k = Some(app.slic_config.k);
+                        ml.slic_labels_s = Some(app.slic_config.spatial_weight);
+                    }
+                    Err(e) => {
+                        log::warn!("SLIC (no depth) failed: {e}");
+                        ml.slic_labels = None;
+                    }
+                }
+            }
+        }
+    }
+
     let pipeline_input = PipelineInput {
         image:         &input,
         ml_results:    app.ml_results.as_ref(),
         transform:     &app.transform_config,
         depth_to_flat: &app.depth_to_flat_config,
-        features:      &app.feature_config,
         edges:         &app.edge_config,
         palette:       &app.palette_config,
         output_width:  ow,
@@ -307,9 +337,12 @@ fn upload_texture(ctx: &egui::Context, name: &str, img: &image::DynamicImage) ->
     let pixels: Vec<egui::Color32> = rgba.pixels()
         .map(|p| egui::Color32::from_rgba_unmultiplied(p.0[0], p.0[1], p.0[2], p.0[3]))
         .collect();
+    // NEAREST filtering is critical for pixel art — linear filtering would
+    // interpolate between pixels, producing the "gradient" artifacts the user
+    // reported in the preview. This applies to output AND intermediate previews.
     ctx.load_texture(
         name,
         ColorImage { size: [rgba.width() as _, rgba.height() as _], pixels },
-        egui::TextureOptions::default(),
+        egui::TextureOptions::NEAREST,
     )
 }

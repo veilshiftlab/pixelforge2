@@ -1,7 +1,7 @@
 //! Preset save/load functionality
 
 use crate::processing::{
-    DepthToFlatConfig, EdgeConfig, FeaturePreserveConfig, PaletteConfig, TransformConfig,
+    DepthToFlatConfig, EdgeConfig, PaletteConfig, TransformConfig,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -19,9 +19,6 @@ pub struct Preset {
     /// Depth-to-flat settings
     pub depth_to_flat: DepthToFlatConfig,
 
-    /// Feature preservation settings
-    pub features: FeaturePreserveConfig,
-
     /// Edge settings
     pub edges: EdgeConfig,
 
@@ -35,7 +32,6 @@ impl Default for Preset {
             name: "Default".to_string(),
             transform: TransformConfig::default(),
             depth_to_flat: DepthToFlatConfig::default(),
-            features: FeaturePreserveConfig::default(),
             edges: EdgeConfig::default(),
             palette: PaletteConfig::default(),
         }
@@ -73,35 +69,10 @@ impl Preset {
                     offset_y: 0.0,
                     flip_horizontal: false,
                     flip_vertical: false,
-                    clip_to_face: false,
-                    clip_padding: 0.2,
                     export_scale: 1,
                     downsampling_method: crate::processing::DownsamplingMethod::Weighted,
                 },
-                depth_to_flat: DepthToFlatConfig {
-                    skin_tone_bands: 3,
-                    hair_bands: 2,
-                    clothing_bands: 2,
-                    background_bands: 1,
-                    shadow_threshold: 0.25,
-                    highlight_threshold: 0.75,
-                    preserve_gradients: false,
-                    gradient_preservation: 0.0,
-                    depth_influence: 0.4,
-                    use_otsu_threshold: true,
-                    bg_depth_threshold: 0.6,
-                    bg_desaturation: 0.65,
-                    bg_lightness_shift: 0.0,
-                },
-                features: FeaturePreserveConfig {
-                    eye_size: crate::processing::EyeSize::Small,
-                    eye_detail: crate::processing::DetailLevel::Minimal,
-                    lip_detail: crate::processing::DetailLevel::Minimal,
-                    nose_detail: crate::processing::DetailLevel::Minimal,
-                    force_eye_highlights: true,
-                    distinct_nostrils: false,
-                    feature_sharpening: 0.5,
-                },
+                depth_to_flat: DepthToFlatConfig::default(),
                 edges: EdgeConfig {
                     edge_mode: crate::processing::EdgeMode::Outlines,
                     thickness: 1,
@@ -109,11 +80,12 @@ impl Preset {
                     custom_edge_color: egui::Color32::BLACK,
                     edge_darkener_strength: 0.3,
                     anti_alias_edges: false,
+                    ..Default::default()
                 },
                 palette: PaletteConfig {
                     mode: crate::processing::PaletteMode::Auto,
                     max_colors: 12,
-                    per_region_limit: true,
+                    per_region_limit: false,
                     preset: crate::processing::PresetPalette::None,
                     custom_colors: Vec::new(),
                     skin_override: None,
@@ -135,35 +107,10 @@ impl Preset {
                     offset_y: 0.0,
                     flip_horizontal: false,
                     flip_vertical: false,
-                    clip_to_face: false,
-                    clip_padding: 0.2,
                     export_scale: 1,
                     downsampling_method: crate::processing::DownsamplingMethod::Weighted,
                 },
-                depth_to_flat: DepthToFlatConfig {
-                    skin_tone_bands: 5,
-                    hair_bands: 4,
-                    clothing_bands: 3,
-                    background_bands: 2,
-                    shadow_threshold: 0.2,
-                    highlight_threshold: 0.8,
-                    preserve_gradients: false,
-                    gradient_preservation: 0.0,
-                    depth_influence: 0.4,
-                    use_otsu_threshold: true,
-                    bg_depth_threshold: 0.6,
-                    bg_desaturation: 0.65,
-                    bg_lightness_shift: 0.0,
-                },
-                features: FeaturePreserveConfig {
-                    eye_size: crate::processing::EyeSize::Medium,
-                    eye_detail: crate::processing::DetailLevel::Standard,
-                    lip_detail: crate::processing::DetailLevel::Standard,
-                    nose_detail: crate::processing::DetailLevel::Standard,
-                    force_eye_highlights: true,
-                    distinct_nostrils: true,
-                    feature_sharpening: 0.7,
-                },
+                depth_to_flat: DepthToFlatConfig::default(),
                 edges: EdgeConfig {
                     edge_mode: crate::processing::EdgeMode::Both,
                     thickness: 1,
@@ -171,11 +118,12 @@ impl Preset {
                     custom_edge_color: egui::Color32::BLACK,
                     edge_darkener_strength: 0.4,
                     anti_alias_edges: false,
+                    ..Default::default()
                 },
                 palette: PaletteConfig {
                     mode: crate::processing::PaletteMode::Auto,
                     max_colors: 32,
-                    per_region_limit: true,
+                    per_region_limit: false,
                     preset: crate::processing::PresetPalette::None,
                     custom_colors: Vec::new(),
                     skin_override: None,
@@ -197,35 +145,10 @@ impl Preset {
                     offset_y: 0.0,
                     flip_horizontal: false,
                     flip_vertical: false,
-                    clip_to_face: false,
-                    clip_padding: 0.2,
                     export_scale: 2,
                     downsampling_method: crate::processing::DownsamplingMethod::NearestNeighbor,
                 },
-                depth_to_flat: DepthToFlatConfig {
-                    skin_tone_bands: 2,
-                    hair_bands: 2,
-                    clothing_bands: 2,
-                    background_bands: 1,
-                    shadow_threshold: 0.3,
-                    highlight_threshold: 0.7,
-                    preserve_gradients: false,
-                    gradient_preservation: 0.0,
-                    depth_influence: 0.4,
-                    use_otsu_threshold: true,
-                    bg_depth_threshold: 0.6,
-                    bg_desaturation: 0.65,
-                    bg_lightness_shift: 0.0,
-                },
-                features: FeaturePreserveConfig {
-                    eye_size: crate::processing::EyeSize::Small,
-                    eye_detail: crate::processing::DetailLevel::Minimal,
-                    lip_detail: crate::processing::DetailLevel::Minimal,
-                    nose_detail: crate::processing::DetailLevel::Minimal,
-                    force_eye_highlights: true,
-                    distinct_nostrils: false,
-                    feature_sharpening: 0.3,
-                },
+                depth_to_flat: DepthToFlatConfig::default(),
                 edges: EdgeConfig {
                     edge_mode: crate::processing::EdgeMode::Outlines,
                     thickness: 1,
@@ -233,6 +156,8 @@ impl Preset {
                     custom_edge_color: egui::Color32::BLACK,
                     edge_darkener_strength: 0.2,
                     anti_alias_edges: false,
+                    outline_style: crate::processing::OutlineStyle::Black,
+                    ..Default::default()
                 },
                 palette: PaletteConfig {
                     mode: crate::processing::PaletteMode::Preset,

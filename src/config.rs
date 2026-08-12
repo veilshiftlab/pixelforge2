@@ -95,18 +95,6 @@ pub struct ProcessingDefaults {
     /// Default output size
     pub default_output_size: u32,
 
-    /// Default skin tone bands
-    pub default_skin_bands: u32,
-
-    /// Default hair bands
-    pub default_hair_bands: u32,
-
-    /// Default shadow threshold
-    pub default_shadow_threshold: f32,
-
-    /// Default highlight threshold
-    pub default_highlight_threshold: f32,
-
     /// Default edge thickness
     pub default_edge_thickness: u32,
 }
@@ -115,10 +103,6 @@ impl Default for ProcessingDefaults {
     fn default() -> Self {
         Self {
             default_output_size: 32,
-            default_skin_bands: 4,
-            default_hair_bands: 3,
-            default_shadow_threshold: 0.25,
-            default_highlight_threshold: 0.75,
             default_edge_thickness: 1,
         }
     }

@@ -5,18 +5,19 @@
 //! **importance-weighted downsampling**, which uses ML analysis results
 //! to preserve important details during size reduction.
 //!
-//! NOTE: This file was synced from server - includes compute_combined_importance_map function.
-//!
 //! # Importance Map
 //!
 //! The importance map assigns a weight to each pixel, indicating how
 //! important it is to preserve that pixel's color during downsampling.
 //! Importance is derived from:
 //!
-//! 1. **Facial Landmarks**: Eyes, nose, and mouth areas are prioritized
-//! 2. **Depth Gradients**: Edges in the depth map indicate form boundaries
-//! 3. **Segmentation Boundaries**: Region boundaries should be crisp
-//! 4. **Image Edges**: Sobel-detected edges in the original image
+//! 1. **Depth Gradients**: Edges in the depth map indicate form boundaries
+//! 2. **Image Edges**: Sobel-detected edges in the original image
+//!
+//! Facial-landmark and segmentation-boundary importance were removed in the
+//! pipeline repurpose (those ML models are gone). TEED-driven importance is
+//! intentionally NOT used here — TEED is too aggressive for downsampling and
+//! preserves detail that doesn't read as pixel art at small sizes.
 //!
 //! # Downsampling Methods
 //!
@@ -46,17 +47,6 @@ use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 /// 1. Find the corresponding region in the input image
 /// 2. Weight each input pixel by its importance value
 /// 3. Compute weighted average color
-///
-/// # Arguments
-///
-/// * `input` - The input image (any size)
-/// * `importance_map` - Per-pixel importance weights (same size as input)
-/// * `output_width` - Target width in pixels
-/// * `output_height` - Target height in pixels
-///
-/// # Returns
-///
-/// Downsampled image at the specified dimensions.
 pub fn weighted_downsample(
     input: &DynamicImage,
     importance_map: &[f32],
@@ -152,6 +142,83 @@ pub fn nearest_neighbor_downsample(
     Ok(input.resize(output_width, output_height, image::imageops::FilterType::Nearest))
 }
 
+/// Palette-mode downsampling — the key fix for "smudge" artifacts.
+///
+/// For each output pixel, this finds the corresponding region in the input
+/// image, counts how many times each palette color appears in that region,
+/// and picks the **most common** (mode) palette color.
+///
+/// This produces crisp, discrete output — no averaging, no smudge. Every
+/// output pixel is a real palette color. This is how professional pixel-art
+/// tools handle downscaling: quantize first, then pick the dominant color.
+///
+/// # Arguments
+///
+/// * `input` - The input image (any size, should already be palette-quantized)
+/// * `palette` - The palette to use for per-pixel quantization before counting
+/// * `output_width` - Target width in pixels
+/// * `output_height` - Target height in pixels
+pub fn palette_mode_downsample(
+    input: &DynamicImage,
+    palette: &super::Palette,
+    output_width: u32,
+    output_height: u32,
+) -> Result<DynamicImage> {
+    if palette.colors.is_empty() {
+        // No palette — fall back to nearest neighbor
+        return nearest_neighbor_downsample(input, output_width, output_height);
+    }
+
+    let (input_width, input_height) = input.dimensions();
+    let rgba = input.to_rgba8();
+
+    // Pre-quantize every input pixel to its nearest palette color index.
+    // This is the crucial step: after this, every pixel is a discrete palette
+    // entry, so counting frequencies gives meaningful results (no smudge).
+    let palette_indices: Vec<usize> = rgba.pixels()
+        .map(|p| {
+            let target = Rgba([p[0], p[1], p[2], 255]);
+            palette.nearest_index(target)
+        })
+        .collect();
+
+    let mut output = RgbaImage::new(output_width, output_height);
+
+    let scale_x = input_width as f32 / output_width as f32;
+    let scale_y = input_height as f32 / output_height as f32;
+
+    for out_y in 0..output_height {
+        for out_x in 0..output_width {
+            let in_x_start = (out_x as f32 * scale_x).floor() as u32;
+            let in_y_start = (out_y as f32 * scale_y).floor() as u32;
+            let in_x_end = ((out_x + 1) as f32 * scale_x).ceil().min(input_width as f32) as u32;
+            let in_y_end = ((out_y + 1) as f32 * scale_y).ceil().min(input_height as f32) as u32;
+
+            // Count palette color frequencies in this block
+            let mut counts: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+            for in_y in in_y_start..in_y_end {
+                for in_x in in_x_start..in_x_end {
+                    let idx = (in_y * input_width + in_x) as usize;
+                    if idx < palette_indices.len() {
+                        *counts.entry(palette_indices[idx]).or_insert(0) += 1;
+                    }
+                }
+            }
+
+            // Pick the most common palette color (mode)
+            let best_idx = counts.into_iter()
+                .max_by_key(|&(_, count)| count)
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+
+            let color = palette.colors.get(best_idx).copied().unwrap_or(Rgba([0, 0, 0, 255]));
+            output.put_pixel(out_x, out_y, color);
+        }
+    }
+
+    Ok(DynamicImage::ImageRgba8(output))
+}
+
 // =============================================================================
 // Importance Map Computation
 // =============================================================================
@@ -164,19 +231,12 @@ pub fn nearest_neighbor_downsample(
 ///
 /// # Sources of Importance
 ///
-/// 1. **Landmarks**: Gaussian boost around facial feature points
-/// 2. **Depth Gradients**: Areas where depth changes rapidly (edges)
-/// 3. **Segmentation Boundaries**: Pixels at region boundaries
+/// 1. **Depth Gradients**: Areas where depth changes rapidly (edges of 3D forms)
 ///
-/// # Arguments
-///
-/// * `width` - Image width
-/// * `height` - Image height
-/// * `ml_results` - Optional ML analysis results
-///
-/// # Returns
-///
-/// Vec<f32> with length width * height, normalized to 0.0-1.0 range.
+/// Note: `depth_map` is at the **original image resolution**. When the input
+/// image passed in is at a different resolution (post-transform), depth-gradient
+/// lookups silently miss and fall back to the base weight of 1.0. This is
+/// acceptable for Phase 1; Phase 2.4 resamples ML maps to post-transform dims.
 pub fn compute_importance_map(
     width: u32,
     height: u32,
@@ -186,98 +246,25 @@ pub fn compute_importance_map(
     let mut importance = vec![1.0f32; size];
 
     if let Some(ml) = ml_results {
-        // =====================================================================
-        // Landmark Importance
-        // =====================================================================
-        // Boost importance around facial landmarks (eyes, nose, mouth)
-        
-        if let Some(landmarks) = &ml.landmarks {
-            let radius = (width as f32 * 0.05).max(5.0);
-            let radius_sq = radius * radius;
-
-            for &(lx, ly) in &landmarks.points {
-                let px = (lx * width as f32) as i32;
-                let py = (ly * height as f32) as i32;
-                let radius_i = radius.ceil() as i32;
-
-                // Apply Gaussian-like boost in a circular region
-                for dy in -radius_i..=radius_i {
-                    for dx in -radius_i..=radius_i {
-                        let target_x = px + dx;
-                        let target_y = py + dy;
-
-                        if target_x >= 0 && target_y >= 0 
-                           && target_x < width as i32 
-                           && target_y < height as i32 
-                        {
-                            let dist_sq = (dx * dx + dy * dy) as f32;
-                            if dist_sq < radius_sq {
-                                // Gaussian falloff: higher boost near center
-                                let boost = (1.0 - dist_sq / radius_sq) * 4.0;
-                                let idx = (target_y as u32 * width + target_x as u32) as usize;
-                                if idx < importance.len() {
-                                    importance[idx] += boost;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // =====================================================================
-        // Depth Gradient Importance
-        // =====================================================================
-        // Boost areas where depth changes rapidly (edges of 3D forms)
-        
+        // Depth Gradient Importance — boost areas where depth changes rapidly
+        // (edges of 3D forms). Guarded against dimension mismatch.
         if let Some(depth_map) = &ml.depth_map {
+            let w = width as usize;
             for y in 1..height - 1 {
                 for x in 1..width - 1 {
-                    let idx = (y * width + x) as usize;
-                    let idx_left = idx - 1;
+                    let idx = y as usize * w + x as usize;
+                    let idx_left = idx.saturating_sub(1);
                     let idx_right = idx + 1;
-                    let idx_up = idx - width as usize;
-                    let idx_down = idx + width as usize;
+                    let idx_up = idx.saturating_sub(w);
+                    let idx_down = idx + w;
 
                     if idx_right < depth_map.len() && idx_down < depth_map.len() {
-                        // Sobel-like gradient calculation
                         let grad_x = (depth_map[idx_right] - depth_map[idx_left]).abs();
                         let grad_y = (depth_map[idx_down] - depth_map[idx_up]).abs();
                         let gradient = (grad_x + grad_y) * 0.5;
 
                         // Scale gradient for visible effect
                         importance[idx] += gradient * 5.0;
-                    }
-                }
-            }
-        }
-
-        // =====================================================================
-        // Segmentation Boundary Importance
-        // =====================================================================
-        // Boost pixels at boundaries between regions (face/hair, skin/clothes)
-        
-        if let Some(segmentation) = &ml.segmentation {
-            for y in 1..height - 1 {
-                for x in 1..width - 1 {
-                    let idx = (y * width + x) as u32;
-                    let current_region = segmentation.regions.get(&idx);
-                    
-                    // Check if any neighbor has a different region
-                    let is_boundary = [
-                        (y > 0).then(|| segmentation.regions.get(&(idx - width))),
-                        (y < height - 1).then(|| segmentation.regions.get(&(idx + width))),
-                        (x > 0).then(|| segmentation.regions.get(&(idx - 1))),
-                        (x < width - 1).then(|| segmentation.regions.get(&(idx + 1))),
-                    ].iter().any(|neighbor| {
-                        *neighbor != Some(current_region)
-                    });
-                    
-                    if is_boundary {
-                        let idx_usize = idx as usize;
-                        if idx_usize < importance.len() {
-                            importance[idx_usize] += 3.0; // Strong boost for boundaries
-                        }
                     }
                 }
             }
@@ -298,45 +285,35 @@ pub fn compute_importance_map(
 /// Compute combined importance map including edge detection.
 ///
 /// This is the main entry point for importance map computation.
-/// It combines ML-derived importance with image edge detection
-/// for the most accurate importance weighting.
+/// It combines ML-derived importance (depth gradients) with image edge
+/// detection (Sobel) for the most accurate importance weighting.
 ///
 /// # Algorithm
 ///
-/// 1. Compute base importance from ML results (landmarks, depth, segmentation)
+/// 1. Compute base importance from ML results (depth gradients)
 /// 2. Compute edge importance from image using Sobel operator
 /// 3. Combine: final = base * 0.7 + edge * 0.3 + edge * 2.0 (boost)
 /// 4. Normalize to 0.0-1.0
-///
-/// # Arguments
-///
-/// * `input` - The input image
-/// * `ml_results` - Optional ML analysis results
-///
-/// # Returns
-///
-/// Vec<f32> with length = width * height of input image.
 pub fn compute_combined_importance_map(
     input: &DynamicImage,
     ml_results: Option<&MLResults>,
 ) -> Vec<f32> {
     let (width, height) = input.dimensions();
-    
+
     // Get base importance from ML results
     let mut importance = compute_importance_map(width, height, ml_results);
-    
+
     // Add edge-based importance from the image itself
     let edge_importance = compute_edge_importance(input);
-    
+
     // Combine with edge importance
     // Edges are critical for pixel art, so we boost them significantly
     for (i, base) in importance.iter_mut().enumerate() {
         if let Some(&edge) = edge_importance.get(i) {
-            // Weight edge importance higher - it's critical for pixel art
-            *base = *base * 0.7 + edge * 0.3 + edge * 2.0; // Boost edges significantly
+            *base = *base * 0.7 + edge * 0.3 + edge * 2.0;
         }
     }
-    
+
     // Normalize again after combination
     let max = importance.iter().cloned().fold(1.0f32, f32::max);
     if max > 0.0 {
@@ -352,13 +329,6 @@ pub fn compute_combined_importance_map(
 ///
 /// Detects edges in the image using the Sobel operator, which
 /// computes horizontal and vertical gradients.
-///
-/// # Algorithm
-///
-/// For each pixel (except borders):
-/// 1. Apply Sobel kernel to compute Gx (horizontal gradient)
-/// 2. Apply Sobel kernel to compute Gy (vertical gradient)
-/// 3. Magnitude = sqrt(Gx² + Gy²)
 ///
 /// # Sobel Kernels
 ///

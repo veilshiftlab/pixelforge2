@@ -1,74 +1,50 @@
 //! Depth-to-flat color conversion
 //!
-//! # What depth is used for (and not used for)
+//! # Phase 2.3 — SLIC-driven per-region shading
 //!
-//! **Background separation** (most reliable):
-//! Depth-Anything V2 reliably distinguishes foreground subjects from background
-//! in portrait images. Background pixels are desaturated and optionally darkened.
+//! Replaces the BiSeNet-dependent per-region shading with a model-free
+//! approach using SLIC superpixel labels:
 //!
-//! **Classification hierarchy:**
-//! When BiSeNet segmentation is available it is authoritative — a pixel labeled
-//! `Skin` by BiSeNet is foreground regardless of its depth value. Depth is only
-//! used to classify pixels that BiSeNet labeled `Background` (confirming they are
-//! truly background) or when no segmentation was run at all (pure depth fallback).
+//! 1. **Median filter** (5×5) on the depth map to remove speckle around hair,
+//!    glasses, and fine detail boundaries.
+//! 2. **Per-region MAD normalization**: for each SLIC cluster, compute the
+//!    median and MAD (median absolute deviation) of the depth values. Normalize
+//!    each pixel's depth to `s = (depth - median) / (1.4826 * MAD)`, clamped to
+//!    [-1, 1]. Regions with MAD < `mad_threshold` get `s = 0` (no shading —
+//!    avoids amplifying noise in flat regions).
+//! 3. **Contrast curve**: `s' = sign(s) * |s|^gamma`. Lower gamma = more
+//!    contrast in midtones.
+//! 4. **Lab L bias**: `L' = clamp(L + s' * strength * 100, 0, 100)`. Near
+//!    features (nose tip) become highlights, far features become shadows.
 //!
-//! This prevents the OR-logic mistake of desaturating cheeks and neck just
-//! because they are slightly farther from the camera than the nose tip.
-//!
-//! **Lightness reinforcement** (moderate reliability):
-//! Within BiSeNet-defined regions, depth nudges the existing photo shading
-//! toward discrete tonal bands.  The photo's own illumination is preserved as
-//! the primary signal; depth adds at most `depth_influence` weight (default 0.4).
-//! Depth is NOT used to drive shading on high-detail facial regions (eyes, lips,
-//! nose) — BiSeNet boundaries are far more reliable there.
+//! Background separation (Otsu/manual threshold + Lab desaturation) is also
+//! applied — background pixels bypass the shading step.
 //!
 //! # Depth convention
 //!
-//! Depth-Anything V2 outputs **0 = nearest, 1 = farthest** after our normalization.
-//! For shading we invert this: near pixels should be highlights (high L), far pixels
-//! should be shadows (low L).  So `depth_for_shading = 1.0 - depth`.
+//! Depth-Anything V2 outputs **0 = nearest, 1 = farthest**. For shading, near
+//! features should be highlights (high L), so we invert: depth values below
+//! the region median produce positive `s` (lighten), above produce negative
+//! `s` (darken).
 
 use super::DepthToFlatConfig;
-use crate::ml::{MLResults, SegmentationRegion};
+use crate::ml::MLResults;
 use anyhow::Result;
 use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
-use palette::{FromColor, IntoColor, Lab, Srgb};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Per-image depth statistics (computed once, shared across all pixels)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Statistics extracted from the depth map for a single image.
-struct DepthStats {
-    /// Depth value above which an unlabeled pixel is classified as background.
-    /// Only consulted when BiSeNet segmentation is absent (pure depth fallback).
-    bg_threshold: f32,
-}
-
-impl DepthStats {
-    fn compute(depth_map: &[f32], config: &DepthToFlatConfig) -> Self {
-        let bg_threshold = if config.use_otsu_threshold {
-            // Clamp to [0.3, 0.85]: Otsu on a portrait with a dominant near subject
-            // can place the threshold very low (e.g. 0.15), classifying most of the
-            // image as background.  The clamp prevents that.
-            let raw = otsu_threshold(depth_map);
-            let clamped = raw.clamp(0.3, 0.85);
-            log::debug!("Otsu depth threshold: raw={:.3} clamped={:.3}", raw, clamped);
-            clamped
-        } else {
-            let t = config.bg_depth_threshold.clamp(0.01, 0.99);
-            log::debug!("Manual depth threshold: {:.3}", t);
-            t
-        };
-        Self { bg_threshold }
-    }
-}
+use palette::{IntoColor, Lab, Srgb};
+use std::collections::HashMap;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Convert depth map to flat color bands, with background separation.
+/// Convert depth map to flat color bands with per-region shading.
+///
+/// Pipeline:
+/// 1. Median-filter the depth map (5×5) to remove speckle.
+/// 2. Compute per-region shading signal (MAD normalization per SLIC cluster).
+/// 3. Separate background (Otsu/manual threshold).
+/// 4. Apply contrast curve + Lab L bias to foreground; desaturate background.
 pub fn depth_to_flat(
     input: &DynamicImage,
     ml_results: &MLResults,
@@ -77,47 +53,45 @@ pub fn depth_to_flat(
     let (width, height) = input.dimensions();
     let mut output = RgbaImage::new(width, height);
 
-    let depth_map = match &ml_results.depth_map {
+    let raw_depth = match &ml_results.depth_map {
         Some(d) => d,
         None    => return Ok(input.clone()),
     };
 
-    let segmentation = ml_results.segmentation.as_ref();
-    let stats = DepthStats::compute(depth_map, config);
+    // ── 1. Median filter the depth map ───────────────────────────────────────
+    let depth = median_filter_5x5(raw_depth, width, height);
 
+    // ── 2. Compute per-region shading signal (local MAD) ──────────────────────
+    let local_shading = compute_per_region_shading(&depth, ml_results, width, height, config);
+
+    // ── 2b. Compute global shading signal (min-max over whole image) ──────────
+    let global_shading = compute_global_shading(&depth, config);
+
+    // ── 2c. Blend local and global shading ────────────────────────────────────
+    // Local preserves fine detail within regions; global preserves relative
+    // depth between regions. Blending gives both.
+    let gw = config.global_depth_weight.clamp(0.0, 1.0);
+    let shading: Vec<f32> = local_shading.iter()
+        .zip(global_shading.iter())
+        .map(|(&l, &g)| l * (1.0 - gw) + g * gw)
+        .collect();
+
+    // ── 3. Background separation threshold ────────────────────────────────────
+    let bg_threshold = compute_bg_threshold(&depth, config);
+
+    // ── 4. Apply shading + background treatment ───────────────────────────────
     for y in 0..height {
         for x in 0..width {
             let idx = (y * width + x) as usize;
-            let depth = *depth_map.get(idx).unwrap_or(&0.5);
-
-            let region = segmentation
-                .and_then(|s| s.regions.get(&(idx as u32)).copied())
-                .unwrap_or(SegmentationRegion::Background);
-
+            let d = depth.get(idx).copied().unwrap_or(0.5);
             let original = input.get_pixel(x, y);
 
-            // Classification hierarchy — BiSeNet is authoritative when available.
-            //
-            // WRONG (old): is_bg = (bisenet_bg) OR (depth > threshold)
-            //   This desaturates cheeks/neck because they are slightly farther than
-            //   the nose tip, even though BiSeNet correctly labeled them as Skin.
-            //
-            // CORRECT: BiSeNet label wins for all labeled regions.
-            //   Depth threshold only applies to pixels BiSeNet labeled Background,
-            //   or when no segmentation was run at all (pure depth fallback).
-            let is_background = if segmentation.is_some() {
-                // Segmentation available: trust BiSeNet completely for labeled regions.
-                // Only pixels BiSeNet already called Background get BG treatment.
-                region == SegmentationRegion::Background
-            } else {
-                // No segmentation: fall back to pure depth threshold.
-                depth > stats.bg_threshold
-            };
+            let is_background = d > bg_threshold;
 
             let adjusted = if is_background {
                 apply_background_treatment(original, config)
             } else {
-                apply_foreground_shading(original, depth, region, config)
+                apply_foreground_shading(original, shading.get(idx).copied().unwrap_or(0.0), config)
             };
 
             output.put_pixel(x, y, adjusted);
@@ -128,144 +102,237 @@ pub fn depth_to_flat(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Global shading (min-max over whole image)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compute global shading signal using min-max normalization over the entire
+/// depth map. Preserves relative depth between all pixels (a far background
+/// pixel gets a different shading value than a near foreground pixel), but
+/// doesn't amplify local detail like MAD does.
+///
+/// Returns `s ∈ [-1, 1]` where positive = nearer (highlight), negative = farther (shadow).
+fn compute_global_shading(depth: &[f32], _config: &DepthToFlatConfig) -> Vec<f32> {
+    if depth.is_empty() {
+        return Vec::new();
+    }
+
+    let min = depth.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max = depth.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let range = max - min;
+
+    if range < 1e-6 {
+        return vec![0.0f32; depth.len()];
+    }
+
+    // Normalize to [0, 1], then shift to [-1, 1] with 0.5 → 0
+    // Invert: low depth (near) → positive (highlight)
+    depth.iter()
+        .map(|&d| {
+            let normalized = (d - min) / range;  // 0 = nearest, 1 = farthest
+            (0.5 - normalized) * 2.0  // near → +1, far → -1
+        })
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-region shading (MAD normalization)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compute the per-pixel shading signal `s ∈ [-1, 1]` using SLIC labels.
+///
+/// For each SLIC cluster:
+/// 1. Collect all depth values.
+/// 2. Compute median and MAD.
+/// 3. Normalize: `s = (depth - median) / (1.4826 * MAD)`, clamped to [-1, 1].
+/// 4. If MAD < `mad_threshold`, set `s = 0` for all pixels in this cluster.
+///
+/// If SLIC labels are not available, falls back to a global median/MAD over
+/// the entire depth map.
+fn compute_per_region_shading(
+    depth: &[f32],
+    ml_results: &MLResults,
+    width: u32,
+    height: u32,
+    config: &DepthToFlatConfig,
+) -> Vec<f32> {
+    let n = (width * height) as usize;
+    let mut shading = vec![0.0f32; n];
+
+    if depth.len() < n {
+        return shading;
+    }
+
+    match &ml_results.slic_labels {
+        Some(labels) if labels.len() >= n => {
+            // ── Per-region MAD normalization ──────────────────────────────────
+            // Group depth values by cluster ID
+            let mut clusters: HashMap<u32, Vec<f32>> = HashMap::new();
+            for i in 0..n {
+                clusters.entry(labels[i]).or_default().push(depth[i]);
+            }
+
+            // Compute (median, MAD) per cluster
+            let mut stats: HashMap<u32, (f32, f32)> = HashMap::new();
+            for (cluster, mut values) in clusters {
+                let median = compute_median(&mut values);
+                let deviations: Vec<f32> = values.iter().map(|&v| (v - median).abs()).collect();
+                let mut deviations = deviations;
+                let mad = compute_median(&mut deviations);
+                stats.insert(cluster, (median, mad));
+            }
+
+            // Normalize each pixel
+            for i in 0..n {
+                let cluster = labels[i];
+                if let Some(&(median, mad)) = stats.get(&cluster) {
+                    if mad < config.mad_threshold {
+                        shading[i] = 0.0; // Low-variance region — skip
+                    } else {
+                        // Invert: depth below median (nearer) → positive s (highlight)
+                        let s = (median - depth[i]) / (1.4826 * mad);
+                        shading[i] = s.clamp(-1.0, 1.0);
+                    }
+                }
+            }
+        }
+        _ => {
+            // ── Global fallback (no SLIC labels) ───────────────────────────────
+            let mut all_depths: Vec<f32> = depth.to_vec();
+            let median = compute_median(&mut all_depths);
+            let deviations: Vec<f32> = depth.iter().map(|&v| (v - median).abs()).collect();
+            let mut deviations = deviations;
+            let mad = compute_median(&mut deviations);
+
+            if mad >= config.mad_threshold {
+                for i in 0..n {
+                    let s = (median - depth[i]) / (1.4826 * mad);
+                    shading[i] = s.clamp(-1.0, 1.0);
+                }
+            }
+        }
+    }
+
+    shading
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contrast curve + Lab L bias
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Apply the contrast curve and Lab L bias to a foreground pixel.
+///
+/// - Contrast curve: `s' = sign(s) * |s|^gamma`
+/// - Lab L bias: `L' = clamp(L + s' * strength * 100, 0, 100)`
+fn apply_foreground_shading(
+    original: Rgba<u8>,
+    s: f32,
+    config: &DepthToFlatConfig,
+) -> Rgba<u8> {
+    if config.strength < 0.001 || s.abs() < 0.001 {
+        return original;
+    }
+
+    let lab = rgba_to_lab(original);
+
+    // Contrast curve
+    let s_curve = s.signum() * s.abs().powf(config.gamma);
+
+    // Lab L bias
+    let new_l = (lab.l + s_curve * config.strength * 100.0).clamp(0.0, 100.0);
+
+    lab_to_rgba(Lab::new(new_l, lab.a, lab.b), original[3])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Background treatment
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Desaturate and optionally darken background pixels.
-///
-/// Works in Lab: pulls a* and b* toward 0 (desaturation) and shifts L
-/// by `bg_lightness_shift`. The hue is not changed — just drained.
 fn apply_background_treatment(original: Rgba<u8>, config: &DepthToFlatConfig) -> Rgba<u8> {
     let lab = rgba_to_lab(original);
 
-    // Desaturate: pull a* and b* toward gray (0, 0)
     let desat = config.bg_desaturation.clamp(0.0, 1.0);
     let new_a = lab.a * (1.0 - desat);
     let new_b = lab.b * (1.0 - desat);
 
-    // Lightness shift (negative = darken)
     let new_l = (lab.l + config.bg_lightness_shift * 100.0).clamp(0.0, 100.0);
 
     lab_to_rgba(Lab::new(new_l, new_a, new_b), original[3])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Foreground shading
+// Depth preprocessing — 5×5 median filter
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Blend photo lightness with depth-derived shading bands.
+/// Apply a 5×5 median filter to the depth map.
 ///
-/// High-detail facial regions (eyes, lips, nose) are passed through with
-/// depth influence reduced to near-zero — BiSeNet boundaries are far more
-/// reliable for those regions than depth geometry.
-fn apply_foreground_shading(
-    original: Rgba<u8>,
-    depth: f32,
-    region: SegmentationRegion,
-    config: &DepthToFlatConfig,
-) -> Rgba<u8> {
-    // High-detail regions: preserve the photo almost entirely.
-    // Depth shading on a 2-pixel eye is noise, not signal.
-    let effective_influence = if region.is_high_detail() {
-        config.depth_influence * 0.15
-    } else {
-        config.depth_influence
-    };
+/// Depth-Anything produces speckle around hair, glasses, and fine detail
+/// boundaries. Median filtering preserves edges while removing speckle —
+/// Gaussian would blur edges into neighbors, softening the very depth
+/// discontinuities we want to detect.
+fn median_filter_5x5(depth: &[f32], width: u32, height: u32) -> Vec<f32> {
+    let w = width as usize;
+    let h = height as usize;
+    let n = w * h;
 
-    // Early out if depth has no influence
-    if effective_influence < 0.001 {
-        return original;
+    if depth.len() < n {
+        return depth.to_vec();
     }
 
-    let num_bands = band_count_for_region(region, config).max(1);
+    let mut filtered = vec![0.0f32; n];
 
-    // Invert depth: Depth-Anything encodes 0=near, 1=far.
-    // For shading, near features (nose tip) should be highlights.
-    let depth_for_shading = 1.0 - depth;
+    // 5×5 window has 25 elements; median is the 13th (index 12) after sorting
+    let mut window = [0.0f32; 25];
 
-    let band_index = if num_bands > 1 {
-        (depth_for_shading * (num_bands as f32 - 1.0))
-            .round()
-            .clamp(0.0, (num_bands - 1) as f32) as u32
-    } else {
-        0
-    };
-
-    let band_position = if num_bands > 1 {
-        band_index as f32 / (num_bands - 1) as f32
-    } else {
-        0.5
-    };
-
-    let lab = rgba_to_lab(original);
-
-    // Depth-derived target lightness
-    let depth_l = depth_target_lightness(lab.l, band_position, config);
-
-    // Blend: photo lightness is primary, depth nudges it
-    let blended_l = if config.preserve_gradients && config.gradient_preservation > 0.0 {
-        // Three-way blend: photo, depth, and soft gradient
-        let preserve = config.gradient_preservation;
-        lab.l * preserve
-            + depth_l * (1.0 - preserve) * effective_influence
-            + lab.l  * (1.0 - preserve) * (1.0 - effective_influence)
-    } else {
-        lerp(lab.l, depth_l, effective_influence)
-    };
-
-    lab_to_rgba(Lab::new(blended_l.clamp(0.0, 100.0), lab.a, lab.b), original[3])
-}
-
-/// Target lightness value for a given band position within a region.
-///
-/// band_position 0.0 = deepest shadow band, 1.0 = brightest highlight band.
-/// Adjustments are relative to the pixel's original L, capped so we never
-/// push a pixel outside a reasonable range.
-fn depth_target_lightness(
-    original_l: f32,
-    band_position: f32,
-    config: &DepthToFlatConfig,
-) -> f32 {
-    let adjustment = if band_position < config.shadow_threshold {
-        // Shadow zone — darken proportional to how far into shadow we are
-        let shadow_depth = if config.shadow_threshold > 0.0 {
-            1.0 - (band_position / config.shadow_threshold)
-        } else {
-            1.0
-        };
-        -20.0 * shadow_depth   // max -20 L units for deepest shadow
-    } else if band_position > config.highlight_threshold {
-        // Highlight zone — lighten proportional to how far into highlight we are
-        let denom = 1.0 - config.highlight_threshold;
-        let highlight_depth = if denom > 0.0 {
-            (band_position - config.highlight_threshold) / denom
-        } else {
-            1.0
-        };
-        15.0 * highlight_depth  // max +15 L units for brightest highlight
-    } else {
-        // Mid-tone — gentle curve, no strong push
-        let mid_range = config.highlight_threshold - config.shadow_threshold;
-        if mid_range > 0.0 {
-            let t = (band_position - config.shadow_threshold) / mid_range;
-            5.0 * (t - 0.5)  // ±2.5 L units across the midtone range
-        } else {
-            0.0
+    for y in 0..h {
+        for x in 0..w {
+            let mut idx = 0;
+            for dy in -2..=2isize {
+                for dx in -2..=2isize {
+                    let nx = (x as isize + dx).clamp(0, w as isize - 1) as usize;
+                    let ny = (y as isize + dy).clamp(0, h as isize - 1) as usize;
+                    window[idx] = depth[ny * w + nx];
+                    idx += 1;
+                }
+            }
+            window.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            filtered[y * w + x] = window[12];
         }
-    };
+    }
 
-    (original_l + adjustment).clamp(0.0, 100.0)
+    filtered
 }
 
-/// Number of depth bands to use for a given region.
-fn band_count_for_region(region: SegmentationRegion, config: &DepthToFlatConfig) -> u32 {
-    if region.is_skin_like() || region.is_high_detail() {
-        config.skin_tone_bands
-    } else if region.is_hair_like() {
-        config.hair_bands
+// ─────────────────────────────────────────────────────────────────────────────
+// Background threshold (Otsu or manual)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn compute_bg_threshold(depth: &[f32], config: &DepthToFlatConfig) -> f32 {
+    if config.use_otsu_threshold {
+        let raw = otsu_threshold(depth);
+        let clamped = raw.clamp(0.3, 0.85);
+        log::debug!("Otsu depth threshold: raw={:.3} clamped={:.3}", raw, clamped);
+        clamped
     } else {
-        // Clothing, accessories, etc. — use clothing_bands
-        config.clothing_bands
+        config.bg_depth_threshold.clamp(0.01, 0.99)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Statistics utilities
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compute the median of a slice (sorts in place).
+fn compute_median(values: &mut [f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = values.len();
+    if n % 2 == 0 {
+        (values[n / 2 - 1] + values[n / 2]) / 2.0
+    } else {
+        values[n / 2]
     }
 }
 
@@ -274,15 +341,9 @@ fn band_count_for_region(region: SegmentationRegion, config: &DepthToFlatConfig)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Compute the Otsu threshold for a depth map (256-bin histogram).
-///
-/// Maximizes between-class variance, finding the natural split between
-/// the foreground (near, low depth) and background (far, high depth) clusters.
-/// For portraits with clear subject/background separation this is very accurate.
-/// Fallback: 0.6 if the histogram is unimodal (no clear split).
 fn otsu_threshold(depth_map: &[f32]) -> f32 {
     const BINS: usize = 256;
 
-    // Build histogram
     let mut hist = [0u32; BINS];
     for &d in depth_map {
         let bin = ((d.clamp(0.0, 1.0)) * (BINS - 1) as f32).round() as usize;
@@ -294,7 +355,6 @@ fn otsu_threshold(depth_map: &[f32]) -> f32 {
         return 0.6;
     }
 
-    // Precompute cumulative sums
     let mut sum_all = 0.0f64;
     for (i, &h) in hist.iter().enumerate() {
         sum_all += i as f64 * h as f64;
@@ -330,7 +390,7 @@ fn otsu_threshold(depth_map: &[f32]) -> f32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Utility functions
+// Lab color utilities
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn rgba_to_lab(rgba: Rgba<u8>) -> Lab {
@@ -350,11 +410,6 @@ fn lab_to_rgba(lab: Lab, alpha: u8) -> Rgba<u8> {
         (rgb.blue  * 255.0).clamp(0.0, 255.0) as u8,
         alpha,
     ])
-}
-
-#[inline]
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

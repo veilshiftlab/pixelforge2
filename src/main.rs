@@ -4,13 +4,10 @@
 //! facial features and translate 3D depth cues into flat color regions.
 
 mod app;
-mod config;
-mod image;
-mod ml;
-mod models;
-mod preset;
-mod processing;
 use eframe::egui;
+// Re-export library modules at the binary crate root so `app/` submodules
+// can use `crate::processing`, `crate::ml`, etc.
+pub use pixelforge::*;
 
 fn main() {
     // Initialize logger

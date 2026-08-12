@@ -1,30 +1,23 @@
 //! Palette generation and quantization
 
 use super::{PaletteConfig, PaletteMode, PresetPalette};
-use crate::ml::{MLResults, SegmentationRegion};
+use crate::ml::MLResults;
 use anyhow::Result;
 use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 use palette::{FromColor, Lab, Srgb};
 use rand::prelude::*;
-use std::collections::HashMap;
 
 /// Generated palette
 #[derive(Debug, Clone)]
 pub struct Palette {
     /// Colors in the palette
     pub colors: Vec<Rgba<u8>>,
-
-    /// Per-region colors (if available)
-    pub regions: HashMap<SegmentationRegion, Vec<Rgba<u8>>>,
 }
 
 impl Palette {
     /// Create a new palette
     pub fn new(colors: Vec<Rgba<u8>>) -> Self {
-        Self {
-            colors,
-            regions: HashMap::new(),
-        }
+        Self { colors }
     }
 
     /// Find the nearest color in the palette
@@ -32,7 +25,7 @@ impl Palette {
         if self.colors.is_empty() {
             return color;
         }
-        
+
         let target_lab = rgb_to_lab(color);
 
         self.colors
@@ -43,24 +36,22 @@ impl Palette {
             .unwrap_or(color)
     }
 
-    /// Find nearest color within a region
-    pub fn nearest_in_region(&self, color: Rgba<u8>, region: SegmentationRegion) -> Rgba<u8> {
-        if let Some(region_colors) = self.regions.get(&region) {
-            if region_colors.is_empty() {
-                return self.nearest(color);
-            }
-            
-            let target_lab = rgb_to_lab(color);
-
-            region_colors
-                .iter()
-                .map(|&c| (c, color_distance_lab(target_lab, rgb_to_lab(c))))
-                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-                .map(|(c, _)| c)
-                .unwrap_or(color)
-        } else {
-            self.nearest(color)
+    /// Find the index of the nearest palette color. Used by palette-mode
+    /// downsampling to pre-quantize every pixel before counting frequencies.
+    pub fn nearest_index(&self, color: Rgba<u8>) -> usize {
+        if self.colors.is_empty() {
+            return 0;
         }
+
+        let target_lab = rgb_to_lab(color);
+
+        self.colors
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (i, color_distance_lab(target_lab, rgb_to_lab(c))))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
 }
 
@@ -68,15 +59,15 @@ impl Palette {
 pub fn generate_palette(
     input: &DynamicImage,
     config: &PaletteConfig,
-    ml_results: Option<&MLResults>,
+    _ml_results: Option<&MLResults>,
 ) -> Result<Palette> {
     match config.mode {
-        PaletteMode::Auto => generate_auto_palette(input, config, ml_results),
+        PaletteMode::Auto => generate_auto_palette(input, config),
         PaletteMode::Preset => generate_preset_palette(config.preset),
         PaletteMode::Custom => Ok(Palette::new(config.custom_colors.iter()
             .map(|&c| Rgba([c.r(), c.g(), c.b(), 255]))
             .collect())),
-        PaletteMode::Hybrid => generate_hybrid_palette(input, config, ml_results),
+        PaletteMode::Hybrid => generate_auto_palette(input, config),
     }
 }
 
@@ -84,52 +75,22 @@ pub fn generate_palette(
 fn generate_auto_palette(
     input: &DynamicImage,
     config: &PaletteConfig,
-    ml_results: Option<&MLResults>,
 ) -> Result<Palette> {
     let (width, height) = input.dimensions();
 
     // Extract all colors
     let mut colors: Vec<Lab> = Vec::new();
-    let mut region_colors: HashMap<SegmentationRegion, Vec<Lab>> = HashMap::new();
-
     for y in 0..height {
         for x in 0..width {
             let pixel = input.get_pixel(x, y);
-            let lab = rgb_to_lab(pixel);
-            colors.push(lab);
-
-            // Track per-region colors if segmentation available
-            if config.per_region_limit {
-                if let Some(ml) = ml_results {
-                    if let Some(seg) = &ml.segmentation {
-                        let idx = (y * width + x) as u32;
-                        if let Some(&region) = seg.regions.get(&idx) {
-                            region_colors.entry(region).or_default().push(lab);
-                        }
-                    }
-                }
-            }
+            colors.push(rgb_to_lab(pixel));
         }
     }
 
     // Run k-means clustering
     let palette_colors = k_means(&colors, config.max_colors as usize);
 
-    let mut palette = Palette::new(palette_colors);
-
-    // Generate per-region palettes
-    if config.per_region_limit {
-        let region_max = (config.max_colors / 4).max(2);
-
-        for (region, colors) in region_colors {
-            if colors.len() > region_max as usize {
-                let region_palette = k_means(&colors, region_max as usize);
-                palette.regions.insert(region, region_palette);
-            }
-        }
-    }
-
-    Ok(palette)
+    Ok(Palette::new(palette_colors))
 }
 
 /// Generate preset palette
@@ -178,39 +139,6 @@ fn generate_preset_palette(preset: PresetPalette) -> Result<Palette> {
     Ok(Palette::new(colors))
 }
 
-/// Generate hybrid palette (auto + overrides)
-fn generate_hybrid_palette(
-    input: &DynamicImage,
-    config: &PaletteConfig,
-    ml_results: Option<&MLResults>,
-) -> Result<Palette> {
-    let mut palette = generate_auto_palette(input, config, ml_results)?;
-
-    // Apply overrides
-    if let Some(skin) = &config.skin_override {
-        palette.regions.insert(
-            SegmentationRegion::Skin,
-            skin.iter().map(|&c| Rgba([c.r(), c.g(), c.b(), 255])).collect(),
-        );
-    }
-
-    if let Some(hair) = &config.hair_override {
-        palette.regions.insert(
-            SegmentationRegion::Hair,
-            hair.iter().map(|&c| Rgba([c.r(), c.g(), c.b(), 255])).collect(),
-        );
-    }
-
-    if let Some(bg) = &config.background_override {
-        palette.regions.insert(
-            SegmentationRegion::Background,
-            bg.iter().map(|&c| Rgba([c.r(), c.g(), c.b(), 255])).collect(),
-        );
-    }
-
-    Ok(palette)
-}
-
 /// Apply palette quantization to image
 pub fn apply_palette(
     input: &DynamicImage,
@@ -234,53 +162,19 @@ pub fn apply_palette(
     Ok(DynamicImage::ImageRgba8(output))
 }
 
-/// Apply palette with region awareness
-pub fn apply_palette_with_regions(
-    input: &DynamicImage,
-    palette: &Palette,
-    ml_results: Option<&MLResults>,
-) -> Result<DynamicImage> {
-    if palette.colors.is_empty() {
-        return Ok(input.clone());
-    }
-
-    let (width, height) = input.dimensions();
-    let mut output = RgbaImage::new(width, height);
-
-    let segmentation = ml_results.and_then(|ml| ml.segmentation.as_ref());
-
-    for y in 0..height {
-        for x in 0..width {
-            let pixel = input.get_pixel(x, y);
-
-            // Find region if available
-            let region = segmentation.and_then(|seg| {
-                let idx = (y * width + x) as u32;
-                seg.regions.get(&idx).copied()
-            });
-
-            // Quantize to nearest palette color
-            let quantized = if let Some(r) = region {
-                palette.nearest_in_region(pixel, r)
-            } else {
-                palette.nearest(pixel)
-            };
-
-            output.put_pixel(x, y, quantized);
-        }
-    }
-
-    Ok(DynamicImage::ImageRgba8(output))
-}
-
 /// K-means clustering for palette extraction
+///
+/// Uses a fixed seed (42) for deterministic output — the same input image
+/// and config always produces the same palette. Without this, `thread_rng()`
+/// gave different initial centroids on every call, causing the pipeline to
+/// produce different results on reprocess.
 fn k_means(colors: &[Lab], k: usize) -> Vec<Rgba<u8>> {
     if colors.is_empty() || k == 0 {
         return vec![];
     }
 
     let k = k.min(colors.len());
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
     // Initialize centroids randomly using slice sampling
     let mut centroids: Vec<Lab> = colors

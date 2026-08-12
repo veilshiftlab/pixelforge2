@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum DownsamplingMethod {
+    /// Quantize the full-res image to the palette first, then pick the most
+    /// common palette color in each downsample block. Eliminates the "smudge"
+    /// effect — every output pixel is a discrete palette color, no averaging.
     #[default]
+    PaletteMode,
     Weighted,
     NearestNeighbor,
     Bilinear,
@@ -27,8 +31,6 @@ pub struct TransformConfig {
     pub offset_y: f32,
     pub flip_horizontal: bool,
     pub flip_vertical: bool,
-    pub clip_to_face: bool,
-    pub clip_padding: f32,
     pub export_scale: u32,
     pub downsampling_method: DownsamplingMethod,
 }
@@ -43,10 +45,43 @@ impl Default for TransformConfig {
             offset_y: 0.0,
             flip_horizontal: false,
             flip_vertical: false,
-            clip_to_face: false,
-            clip_padding: 0.2,
             export_scale: 1,
-            downsampling_method: DownsamplingMethod::Weighted,
+            downsampling_method: DownsamplingMethod::NearestNeighbor,
+        }
+    }
+}
+
+// =============================================================================
+// SLIC Superpixel Configuration
+// =============================================================================
+
+/// Configuration for SLIC superpixel clustering.
+///
+/// SLIC replaces BiSeNet segmentation: it's model-free, domain-agnostic, and
+/// works equally on photo and anime. The 6D feature vector is
+/// `(L, a, b, depth, x·spatial_weight, y·spatial_weight)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlicConfig {
+    /// Number of clusters (superpixels). Default 5, range 3–8.
+    /// Higher = more, smaller regions = finer detail control.
+    #[serde(default = "default_slic_k")]
+    pub k: u32,
+
+    /// Spatial weight (compactness). Default 0.5, range 0–1.
+    /// Higher = blobbier regions (boundaries follow the spatial grid).
+    /// Lower = regions follow color/depth boundaries more faithfully.
+    #[serde(default = "default_slic_spatial_weight")]
+    pub spatial_weight: f32,
+}
+
+fn default_slic_k() -> u32 { 5 }
+fn default_slic_spatial_weight() -> f32 { 0.7 }
+
+impl Default for SlicConfig {
+    fn default() -> Self {
+        Self {
+            k: default_slic_k(),
+            spatial_weight: default_slic_spatial_weight(),
         }
     }
 }
@@ -57,22 +92,11 @@ impl Default for TransformConfig {
 
 /// Depth-to-flat color conversion configuration.
 ///
-/// Controls two distinct jobs:
-///
-/// ## Background separation (most reliable depth use)
-///
-/// Pixels classified as background (by BiSeNet label OR by depth beyond the
-/// threshold) are desaturated and optionally darkened. When `use_otsu_threshold`
-/// is true (default), the foreground/background split is computed automatically
-/// per image using Otsu's method on the depth histogram.
-///
-/// ## Foreground shading reinforcement (moderate reliability)
-///
-/// Within BiSeNet-defined foreground regions, depth nudges the photo's existing
-/// lightness toward discrete tonal bands. `depth_influence` controls how much
-/// weight depth has vs. the original photo shading.  High-detail facial regions
-/// (eyes, lips, nose) automatically receive a greatly reduced influence — depth
-/// geometry at that scale is too noisy to be useful.
+/// After the pipeline repurpose, region classification comes from SLIC
+/// superpixels (`crate::processing::slic`) rather than BiSeNet segmentation.
+/// Within each SLIC region, depth is normalized by MAD (median absolute
+/// deviation) and used to bias Lab L* — producing discrete shading bands
+/// that follow both color and depth boundaries.
 ///
 /// # Depth convention
 ///
@@ -80,50 +104,36 @@ impl Default for TransformConfig {
 /// inverts this for shading so near features (nose tip) become highlights.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepthToFlatConfig {
-    // ── Tonal band counts ─────────────────────────────────────────────────────
+    // ── Per-region shading (Phase 2.3) ────────────────────────────────────────
 
-    /// Number of discrete tonal bands for skin regions (Skin, Neck). Range 1–16.
-    pub skin_tone_bands: u32,
+    /// Shading intensity. How strongly the depth-derived shading signal biases
+    /// Lab L*. 0.0 = no shading, 0.6 = balanced (default), 1.0 = max contrast.
+    #[serde(default = "default_dtf_strength")]
+    pub strength: f32,
 
-    /// Number of tonal bands for hair regions (Hair, Hat). Range 1–16.
-    pub hair_bands: u32,
+    /// Contrast curve exponent. `s' = sign(s) * |s|^gamma`.
+    /// 1.0 = linear, <1.0 = more contrast in midtones (default 0.8), >1.0 = compressed.
+    #[serde(default = "default_dtf_gamma")]
+    pub gamma: f32,
 
-    /// Number of tonal bands for clothing and non-face accessories. Range 1–16.
-    pub clothing_bands: u32,
+    /// MAD (median absolute deviation) threshold for low-variance region skip.
+    /// Regions with MAD below this get no shading (avoids amplifying noise in
+    /// flat backgrounds / solid-color hair). Default 0.02, range 0.01–0.2.
+    /// Lower = shade more regions (only truly flat regions are skipped).
+    #[serde(default = "default_dtf_mad_threshold")]
+    pub mad_threshold: f32,
 
-    /// Number of tonal bands when depth is used for background shading.
-    /// Usually irrelevant (background is desaturated instead), but kept
-    /// for backwards compatibility. Range 1–8.
-    pub background_bands: u32,
-
-    // ── Shading thresholds ────────────────────────────────────────────────────
-
-    /// Band position (0–1) below which pixels enter the shadow zone. Default 0.25.
-    pub shadow_threshold: f32,
-
-    /// Band position (0–1) above which pixels enter the highlight zone. Default 0.75.
-    pub highlight_threshold: f32,
-
-    // ── Gradient preservation ─────────────────────────────────────────────────
-
-    /// When true, blends in some of the original lightness to soften band edges.
-    pub preserve_gradients: bool,
-
-    /// Fraction of original L to preserve when banding is active (0 = pure bands,
-    /// 1 = no banding). Only used when `preserve_gradients` is true. Default 0.0.
-    pub gradient_preservation: f32,
-
-    // ── Depth influence ───────────────────────────────────────────────────────
-
-    /// How strongly depth-derived shading overrides the photo's own lighting.
+    /// Blend between local (per-region MAD) and global (whole-image min-max)
+    /// depth shading. 0.0 = pure local (current behavior), 1.0 = pure global,
+    /// 0.5 = balanced blend (default).
     ///
-    /// 0.0 = photo lightness unchanged (depth has no effect on shading)  
-    /// 0.4 = balanced blend (recommended default)  
-    /// 1.0 = pure depth-derived bands, photo lighting ignored
-    ///
-    /// High-detail facial regions (eyes, lips, nose) are automatically clamped
-    /// to ~15% of this value regardless of the setting.
-    pub depth_influence: f32,
+    /// Local shading preserves fine depth detail within each SLIC region but
+    /// loses global depth relationships (a far background region and a near
+    /// foreground region both get normalized to the same [-1, 1] range).
+    /// Global shading preserves relative depth between all pixels but flattens
+    /// local detail. Blending gives both: local detail with global context.
+    #[serde(default = "default_dtf_global_depth_weight")]
+    pub global_depth_weight: f32,
 
     // ── Background separation ─────────────────────────────────────────────────
 
@@ -147,19 +157,18 @@ pub struct DepthToFlatConfig {
     pub bg_lightness_shift: f32,
 }
 
+fn default_dtf_strength() -> f32 { 0.6 }
+fn default_dtf_gamma() -> f32 { 0.8 }
+fn default_dtf_mad_threshold() -> f32 { 0.02 }
+fn default_dtf_global_depth_weight() -> f32 { 0.5 }
+
 impl Default for DepthToFlatConfig {
     fn default() -> Self {
         Self {
-            skin_tone_bands:       4,
-            hair_bands:            3,
-            clothing_bands:        3,
-            background_bands:      2,
-            shadow_threshold:      0.25,
-            highlight_threshold:   0.75,
-            preserve_gradients:    false,
-            gradient_preservation: 0.0,
-            // New fields
-            depth_influence:       0.4,
+            strength:              default_dtf_strength(),
+            gamma:                 default_dtf_gamma(),
+            mad_threshold:         default_dtf_mad_threshold(),
+            global_depth_weight:   default_dtf_global_depth_weight(),
             use_otsu_threshold:    true,
             bg_depth_threshold:    0.6,
             bg_desaturation:       0.65,
@@ -169,54 +178,22 @@ impl Default for DepthToFlatConfig {
 }
 
 // =============================================================================
-// Feature Preservation Configuration
-// =============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FeaturePreserveConfig {
-    pub eye_size: EyeSize,
-    pub eye_detail: DetailLevel,
-    pub lip_detail: DetailLevel,
-    pub nose_detail: DetailLevel,
-    pub force_eye_highlights: bool,
-    pub distinct_nostrils: bool,
-    pub feature_sharpening: f32,
-}
-
-impl Default for FeaturePreserveConfig {
-    fn default() -> Self {
-        Self {
-            eye_size: EyeSize::Small,
-            eye_detail: DetailLevel::Minimal,
-            lip_detail: DetailLevel::Minimal,
-            nose_detail: DetailLevel::Minimal,
-            force_eye_highlights: true,
-            distinct_nostrils: false,
-            feature_sharpening: 0.5,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum EyeSize {
-    Auto,
-    #[default]
-    Small,
-    Medium,
-    Large,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum DetailLevel {
-    #[default]
-    Minimal,
-    Standard,
-    Full,
-}
-
-// =============================================================================
 // Edge Configuration
 // =============================================================================
+
+/// Outline coloring strategy for the TEED outline pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum OutlineStyle {
+    /// Auto-contrast: darken light pixels, lighten dark pixels by `delta` L* units.
+    /// Outlines read on any background — no fixed black that vanishes on dark regions.
+    #[default]
+    AutoContrast,
+    /// Auto-contrast plus a hue rotation on the Lab a*b* plane (`hue_shift` degrees).
+    /// Dark side → cool shift, light side → warm shift.
+    AutoContrastWithHueShift,
+    /// Fixed black outlines — for retro palettes (Game Boy, NES).
+    Black,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeConfig {
@@ -226,7 +203,25 @@ pub struct EdgeConfig {
     pub custom_edge_color: egui::Color32,
     pub edge_darkener_strength: f32,
     pub anti_alias_edges: bool,
+    // ── TEED outline pass (Phase 2.1) ──────────────────────────────────────────
+    /// How outline colors are chosen. See [`OutlineStyle`].
+    #[serde(default)]
+    pub outline_style: OutlineStyle,
+    /// L* shift in Lab units for auto-contrast outlines. Default 30, range 10–60.
+    #[serde(default = "default_delta")]
+    pub delta: f32,
+    /// Hue rotation degrees for `AutoContrastWithHueShift`. Default 10, range 0–30.
+    #[serde(default = "default_hue_shift")]
+    pub hue_shift: f32,
+    /// TEED edge probability threshold. Pixels above this are edges.
+    /// Default 0.3, range 0.1–0.7. Lower = more edges, higher = only strong edges.
+    #[serde(default = "default_teed_threshold")]
+    pub teed_threshold: f32,
 }
+
+fn default_delta() -> f32 { 30.0 }
+fn default_hue_shift() -> f32 { 10.0 }
+fn default_teed_threshold() -> f32 { 0.3 }
 
 impl Default for EdgeConfig {
     fn default() -> Self {
@@ -237,6 +232,10 @@ impl Default for EdgeConfig {
             custom_edge_color: egui::Color32::BLACK,
             edge_darkener_strength: 0.3,
             anti_alias_edges: false,
+            outline_style: OutlineStyle::AutoContrast,
+            delta: default_delta(),
+            hue_shift: default_hue_shift(),
+            teed_threshold: default_teed_threshold(),
         }
     }
 }
@@ -266,6 +265,9 @@ pub enum EdgeColorMode {
 pub struct PaletteConfig {
     pub mode: PaletteMode,
     pub max_colors: u32,
+    /// Inert after the repurpose: per-region palette limits required BiSeNet
+    /// segmentation, which is gone. Kept for preset-file backwards-compat.
+    #[serde(default)]
     pub per_region_limit: bool,
     pub preset: PresetPalette,
     pub custom_colors: Vec<egui::Color32>,
@@ -281,7 +283,7 @@ impl Default for PaletteConfig {
         Self {
             mode: PaletteMode::Auto,
             max_colors: 16,
-            per_region_limit: true,
+            per_region_limit: false,
             preset: PresetPalette::None,
             custom_colors: Vec::new(),
             skin_override: None,

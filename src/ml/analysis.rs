@@ -3,12 +3,14 @@
 //! Runs the full analysis pipeline on an input image and collects results.
 //! Models are loaded once and cached via the global [`SessionManager`] — calling
 //! `MLAnalysis::analyze` multiple times on different images does not reload models.
+//!
+//! After the pipeline repurpose, only Depth-Anything V2 and TEED run here.
+//! ML outputs are **optional enhancements**: if either model fails to load or
+//! to produce a map, the downstream pipeline degrades gracefully.
 
-use super::{MLConfig, MLResults, FaceDetectionResult, SegmentationResult};
+use super::{MLConfig, MLResults};
 use super::models::{
-    YoloV8FaceDetector, PlaceholderFaceDetector,
     DepthAnythingEstimator, PlaceholderDepthEstimator,
-    BiSeNetSegmenter, PlaceholderSegmenter,
     TeedEdgeDetector, PlaceholderEdgeDetector,
 };
 use crate::models::ModelManager;
@@ -24,7 +26,7 @@ use std::sync::Arc;
 pub struct MLAnalysis;
 
 impl MLAnalysis {
-    /// Run the full ML pipeline on `image`.
+    /// Run the configured ML models on `image`.
     ///
     /// Which models run is controlled by the flags in `config`.
     /// Models are loaded from paths provided by `model_manager`.
@@ -35,23 +37,8 @@ impl MLAnalysis {
     ) -> Result<MLResults> {
         let mut results = MLResults::default();
 
-        if config.face_detection_enabled {
-            let det = run_face_detection(image, model_manager)?;
-            results.face_bounds = det.bounds;
-            results.landmarks   = det.landmarks.clone();
-            results.face        = Some(super::FaceDetectionOutput {
-                bounds:     det.bounds,
-                landmarks:  det.landmarks.map(|l| l.points).unwrap_or_default(),
-                confidence: det.confidence,
-            });
-        }
-
         if config.depth_estimation_enabled {
             results.depth_map = Some(run_depth_estimation(image, model_manager)?);
-        }
-
-        if config.segmentation_enabled {
-            results.segmentation = Some(run_segmentation(image, model_manager)?);
         }
 
         if config.edge_detection_enabled {
@@ -68,27 +55,9 @@ impl MLAnalysis {
 // Each function:
 //   1. Takes a read lock on ModelManager — dropped before inference
 //   2. Constructs the model struct (cheap: session is loaded from disk once;
-//      subsequent calls reuse OS file cache at minimum)
+//      subsequent calls reuse the SessionManager cache)
 //   3. Runs inference and returns the result
-//
-// TODO: integrate with SessionManager cache so the ORT session itself is kept
-// alive across calls rather than being reconstructed each time.
 // ─────────────────────────────────────────────────────────────────────────────
-
-fn run_face_detection(
-    image: &DynamicImage,
-    model_manager: &Arc<RwLock<ModelManager>>,
-) -> Result<FaceDetectionResult> {
-    let model_path = model_manager.read().get_model_path("yolov8_face");
-
-    if let Some(path) = model_path {
-        log::info!("Running face detection (YOLOv8n-Face)");
-        YoloV8FaceDetector::new(&path)?.detect(image)
-    } else {
-        log::warn!("Face detection model unavailable — using placeholder");
-        PlaceholderFaceDetector.detect(image)
-    }
-}
 
 fn run_depth_estimation(
     image: &DynamicImage,
@@ -105,32 +74,17 @@ fn run_depth_estimation(
     }
 }
 
-fn run_segmentation(
-    image: &DynamicImage,
-    model_manager: &Arc<RwLock<ModelManager>>,
-) -> Result<SegmentationResult> {
-    let model_path = model_manager.read().get_model_path("bisenet");
-
-    if let Some(path) = model_path {
-        log::info!("Running face parsing (BiSeNet)");
-        BiSeNetSegmenter::new(&path)?.segment(image)
-    } else {
-        log::warn!("Segmentation model unavailable — using placeholder");
-        PlaceholderSegmenter.segment(image)
-    }
-}
-
 fn run_edge_detection(
     image: &DynamicImage,
     model_manager: &Arc<RwLock<ModelManager>>,
 ) -> Result<Vec<f32>> {
-    let model_path = model_manager.read().get_model_path("teed");
+    let model_path = model_manager.read().get_model_path("edge_detection");
 
     if let Some(path) = model_path {
-        log::info!("Running edge detection (TEED)");
+        log::info!("Running edge detection (DexiNed)");
         TeedEdgeDetector::new(&path)?.detect(image)
     } else {
-        log::warn!("TEED model unavailable — using Sobel placeholder");
+        log::warn!("Edge detection model unavailable — using Sobel placeholder");
         PlaceholderEdgeDetector.detect(image)
     }
 }
