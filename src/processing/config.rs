@@ -11,8 +11,13 @@ pub enum DownsamplingMethod {
     /// Quantize the full-res image to the palette first, then pick the most
     /// common palette color in each downsample block. Eliminates the "smudge"
     /// effect — every output pixel is a discrete palette color, no averaging.
+    /// Phase 4 — D1a: now with bilateral pre-filter for smoother palette snap.
     #[default]
     PaletteMode,
+    /// Phase 4 — D2: area-average downsample + Floyd-Steinberg error diffusion.
+    /// Produces clean pixel-art downscaling with organic dithering. Best for
+    /// small palettes (4-16 colors) where you want smooth gradient transitions.
+    PerceptualDither,
     Weighted,
     NearestNeighbor,
     Bilinear,
@@ -46,7 +51,10 @@ impl Default for TransformConfig {
             flip_horizontal: false,
             flip_vertical: false,
             export_scale: 1,
-            downsampling_method: DownsamplingMethod::NearestNeighbor,
+            // Phase 4 — D3: align code with README. Was NearestNeighbor
+            // which produced aliasing artifacts; PaletteMode (the new
+            // default with bilateral pre-filter) gives crisp output.
+            downsampling_method: DownsamplingMethod::PaletteMode,
         }
     }
 }
@@ -62,8 +70,10 @@ impl Default for TransformConfig {
 /// `(L, a, b, depth, x·spatial_weight, y·spatial_weight)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlicConfig {
-    /// Number of clusters (superpixels). Default 5, range 3–8.
+    /// Number of clusters (superpixels). Default 32, range 5–128.
     /// Higher = more, smaller regions = finer detail control.
+    /// For portraits: 32-64 preserves limbs/face/dress separation.
+    /// For simple images: 8-16 is sufficient.
     #[serde(default = "default_slic_k")]
     pub k: u32,
 
@@ -74,7 +84,7 @@ pub struct SlicConfig {
     pub spatial_weight: f32,
 }
 
-fn default_slic_k() -> u32 { 5 }
+fn default_slic_k() -> u32 { 32 }
 fn default_slic_spatial_weight() -> f32 { 0.7 }
 
 impl Default for SlicConfig {
@@ -140,7 +150,9 @@ pub struct DepthToFlatConfig {
     /// When true, compute the foreground/background depth split automatically
     /// per image using Otsu's method on the depth histogram. Default: true.
     ///
-    /// Disable and set `bg_depth_threshold` manually for fine control.
+    /// **Phase 3**: this is now a *fallback* when SLIC labels are unavailable.
+    /// When SLIC labels are present, region-based background classification
+    /// is used instead (per-SLIC-cluster mean depth + border/size rules).
     pub use_otsu_threshold: bool,
 
     /// Manual depth threshold: pixels with depth > this are background.
@@ -155,12 +167,30 @@ pub struct DepthToFlatConfig {
     /// Negative = darken, positive = lighten. Scaled by ×100 before applying.
     /// Range −1.0 to +1.0. Default −0.08 (subtle darkening).
     pub bg_lightness_shift: f32,
+
+    // ── Phase 3 — region-based background classification ──────────────────────
+
+    /// Minimum cluster size (as a fraction of total image pixels) for a
+    /// SLIC cluster to be classified as background even if it doesn't touch
+    /// the image border. Default 0.15 (15%). Range 0.0–1.0.
+    ///
+    /// A cluster is background if `mean_depth > p70 AND (touches_border OR
+    /// size_pct > bg_cluster_size_pct)`. The border-touch rule catches
+    /// skies / horizon backgrounds; the size rule catches large flat regions
+    /// that don't reach the edge (e.g., a wall behind the subject).
+    #[serde(default = "default_dtf_bg_cluster_size_pct")]
+    pub bg_cluster_size_pct: f32,
 }
 
 fn default_dtf_strength() -> f32 { 0.6 }
 fn default_dtf_gamma() -> f32 { 0.8 }
 fn default_dtf_mad_threshold() -> f32 { 0.02 }
-fn default_dtf_global_depth_weight() -> f32 { 0.5 }
+/// Phase 3 — C6: bias toward global truth (0.6/0.4 split). User's complaint
+/// was "missing out on global depth values" — pure 0.5/0.5 blend destroyed
+/// both signals; 0.6/0.4 keeps global depth relationships dominant while
+/// still letting local detail through.
+fn default_dtf_global_depth_weight() -> f32 { 0.6 }
+fn default_dtf_bg_cluster_size_pct() -> f32 { 0.15 }
 
 impl Default for DepthToFlatConfig {
     fn default() -> Self {
@@ -173,6 +203,7 @@ impl Default for DepthToFlatConfig {
             bg_depth_threshold:    0.6,
             bg_desaturation:       0.65,
             bg_lightness_shift:    -0.08,
+            bg_cluster_size_pct:   default_dtf_bg_cluster_size_pct(),
         }
     }
 }
@@ -181,17 +212,20 @@ impl Default for DepthToFlatConfig {
 // Edge Configuration
 // =============================================================================
 
-/// Outline coloring strategy for the TEED outline pass.
+/// Outline coloring strategy for the edge pass.
+///
+/// Phase 7 — H4: removed `AutoContrastWithHueShift` variant (it was a no-op
+/// kept for backwards-compat; the local-contrast `AutoContrast` mode from
+/// Phase 2 supersedes it). Also removed the associated `delta` and `hue_shift`
+/// fields from `EdgeConfig`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum OutlineStyle {
-    /// Auto-contrast: darken light pixels, lighten dark pixels by `delta` L* units.
-    /// Outlines read on any background — no fixed black that vanishes on dark regions.
+    /// Local-contrast: pick the palette color that maximizes Lab ΔE from
+    /// the 3×3 neighborhood mean of the edge pixel. Outline color varies
+    /// across the image based on local background. (Phase 2 implementation.)
     #[default]
     AutoContrast,
-    /// Auto-contrast plus a hue rotation on the Lab a*b* plane (`hue_shift` degrees).
-    /// Dark side → cool shift, light side → warm shift.
-    AutoContrastWithHueShift,
-    /// Fixed black outlines — for retro palettes (Game Boy, NES).
+    /// Fixed darkest palette color — for retro palettes (Game Boy, NES).
     Black,
 }
 
@@ -203,24 +237,16 @@ pub struct EdgeConfig {
     pub custom_edge_color: egui::Color32,
     pub edge_darkener_strength: f32,
     pub anti_alias_edges: bool,
-    // ── TEED outline pass (Phase 2.1) ──────────────────────────────────────────
+    // ── Edge pass ────────────────────────────────────────────────────────────
     /// How outline colors are chosen. See [`OutlineStyle`].
     #[serde(default)]
     pub outline_style: OutlineStyle,
-    /// L* shift in Lab units for auto-contrast outlines. Default 30, range 10–60.
-    #[serde(default = "default_delta")]
-    pub delta: f32,
-    /// Hue rotation degrees for `AutoContrastWithHueShift`. Default 10, range 0–30.
-    #[serde(default = "default_hue_shift")]
-    pub hue_shift: f32,
     /// TEED edge probability threshold. Pixels above this are edges.
     /// Default 0.3, range 0.1–0.7. Lower = more edges, higher = only strong edges.
     #[serde(default = "default_teed_threshold")]
     pub teed_threshold: f32,
 }
 
-fn default_delta() -> f32 { 30.0 }
-fn default_hue_shift() -> f32 { 10.0 }
 fn default_teed_threshold() -> f32 { 0.3 }
 
 impl Default for EdgeConfig {
@@ -233,8 +259,6 @@ impl Default for EdgeConfig {
             edge_darkener_strength: 0.3,
             anti_alias_edges: false,
             outline_style: OutlineStyle::AutoContrast,
-            delta: default_delta(),
-            hue_shift: default_hue_shift(),
             teed_threshold: default_teed_threshold(),
         }
     }
@@ -282,7 +306,7 @@ impl Default for PaletteConfig {
     fn default() -> Self {
         Self {
             mode: PaletteMode::Auto,
-            max_colors: 16,
+            max_colors: 32,
             per_region_limit: false,
             preset: PresetPalette::None,
             custom_colors: Vec::new(),

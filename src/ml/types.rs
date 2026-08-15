@@ -18,6 +18,12 @@ pub struct MLResults {
     /// same dims as input image). `0 = nearest, 1 = farthest`.
     pub depth_map: Option<Vec<f32>>,
 
+    /// Phase 6 — P1: 5×5 median-filtered depth map, cached so `depth_to_flat`
+    /// doesn't recompute it on every pipeline invocation (every slider tweak).
+    /// Computed once in `MLAnalysis::analyze` after depth inference; cleared
+    /// when ML results are invalidated.
+    pub filtered_depth_map: Option<Vec<f32>>,
+
     /// Edge probability map from TEED (normalized 0.0–1.0, row-major,
     /// same dims as input image). `1.0 = strong edge`.
     pub edge_map: Option<Vec<f32>>,

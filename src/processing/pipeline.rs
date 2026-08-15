@@ -22,7 +22,8 @@ use crate::ml::MLResults;
 use crate::processing::{
     apply_palette, bilinear_downsample,
     compute_combined_importance_map, depth_to_flat, draw_edges, generate_palette,
-    nearest_neighbor_downsample, palette_mode_downsample, weighted_downsample,
+    nearest_neighbor_downsample, palette_mode_downsample,
+    perceptual_dither_downsample, weighted_downsample,
     DepthToFlatConfig, DownsamplingMethod, EdgeConfig,
     Palette, PaletteConfig, TransformConfig,
 };
@@ -47,13 +48,17 @@ pub struct PipelineInput<'a> {
 
 /// What the pipeline returns — pure image data, no GPU types.
 pub struct PipelineOutput {
-    /// Final pixel-art image.
+    /// Final pixel-art image (post-downsample + post-edges).
     pub image: DynamicImage,
     /// Extracted palette as raw RGBA tuples.
     pub palette_colors: Vec<Rgba<u8>>,
-    /// Intermediate: post-transform, pre-downsample.
+    /// Intermediate: **post-transform** (scale/rotate/offset/flip applied),
+    /// pre-downsample. Useful for verifying transform effects.
     pub preprocessed: Option<DynamicImage>,
-    /// Intermediate: post depth-to-flat.
+    /// Intermediate: **post-depth-to-flat** (shading + bg treatment applied),
+    /// pre-transform. Useful for verifying depth-to-flat output before any
+    /// geometric manipulation. Set even when ML is absent (returns the
+    /// unmodified input in that case).
     pub flat: Option<DynamicImage>,
 }
 
@@ -76,23 +81,48 @@ pub fn run(input: &PipelineInput<'_>) -> PipelineOutput {
     // MUST run before geometric transforms: depth_map and SLIC labels are
     // keyed to the ORIGINAL image dimensions.  Transforming first invalidates
     // all pixel index lookups (y * width + x uses the wrong width).
-    let depth_processed = if let Some(ml) = ml_results {
-        depth_to_flat(image, ml, dtf_config).unwrap_or_else(|e| {
-            log::warn!("depth_to_flat: {e}");
-            (*image).clone()
-        })
+    // Result: post-depth-to-flat intermediate (shaded, bg treated, original res).
+    //
+    // Phase 6 — perf: skip the `(*image).clone()` when ML is absent by
+    // returning `Cow<DynamicImage>` so we either borrow or own.
+    use std::borrow::Cow;
+    let depth_processed: Cow<'_, DynamicImage> = if let Some(ml) = ml_results {
+        Cow::Owned(
+            depth_to_flat(image, ml, dtf_config).unwrap_or_else(|e| {
+                log::warn!("depth_to_flat: {e}");
+                (*image).clone()
+            })
+        )
     } else {
-        (*image).clone()
+        Cow::Borrowed(image)
     };
+
+    // Phase 1 — U6: expose post-depth-to-flat image for the preview tab + contact sheet.
+    // Phase 6 — perf: only clone if we own; if borrowed, clone once for the output
+    // (this is the unavoidable cost of supporting a preview tab + the actual pipeline).
+    let flat_for_output: DynamicImage = depth_processed.clone().into_owned();
 
     // ── 2. Geometric transforms ───────────────────────────────────────────────
     // Now safe to resize/rotate/flip — depth coloring is baked in at original res.
-    let preprocessed = apply_transforms(&depth_processed, transform);
+    // Result: post-transform image (what downsample/palette/edge stages see).
+    //
+    // Phase 6 — perf: skip the transforms entirely when no transform is configured
+    // (scale == 1.0, no rotation, no offset, no flips). Returns a borrow in that case.
+    let transform_is_noop = transform.scale == 1.0
+        && transform.rotation == 0.0
+        && transform.offset_x == 0.0
+        && transform.offset_y == 0.0
+        && !transform.flip_horizontal
+        && !transform.flip_vertical;
 
-    // `flat` alias kept so later stages read naturally.
-    // Clone retained for PipelineOutput debug preview before pipeline consumes it.
-    let flat = preprocessed;
-    let flat_for_output = flat.clone();
+    let preprocessed: Cow<'_, DynamicImage> = if transform_is_noop {
+        depth_processed.clone()
+    } else {
+        Cow::Owned(apply_transforms(&depth_processed, transform))
+    };
+
+    // Phase 1 — U7: expose post-transform image for the preview tab + contact sheet.
+    let preprocessed_for_output: DynamicImage = preprocessed.clone().into_owned();
 
     // ── 2b. Resample ML maps to post-transform dimensions ───────────────────────
     // ML maps (depth, edge) are at the original image resolution. After geometric
@@ -100,19 +130,35 @@ pub fn run(input: &PipelineInput<'_>) -> PipelineOutput {
     // (importance map, edge pass) index the correct pixels.
     // Bilinear for depth (continuous data); nearest for edge (probability data).
     let original_dims = (image.width(), image.height());
-    let transformed_dims = (flat.width(), flat.height());
+    let transformed_dims = (preprocessed.width(), preprocessed.height());
     let resampled_ml = resample_ml_maps(*ml_results, original_dims, transformed_dims);
 
     // ── 3. Importance map ────────────────────────────────────────────────────
-    // Uses the resampled depth map (matches `flat` dimensions).
-    let importance = compute_combined_importance_map(&flat, resampled_ml.as_ref());
+    // Uses the resampled depth map (matches `preprocessed` dimensions).
+    let importance = compute_combined_importance_map(&preprocessed, resampled_ml.as_ref());
 
-    // ── 4. Palette extraction (from full-res image) ──────────────────────────
-    // Palette is extracted from the FULL-RES transformed image, before
-    // downsampling. This gives the k-means algorithm the full color
-    // distribution to work with, producing a more representative palette
-    // than extracting from the already-downsampled image.
-    let palette = generate_palette(&flat, pal_config, resampled_ml.as_ref())
+    // ── 4. Palette extraction (from ORIGINAL image, not post-DTF) ──────────
+    // ET-3/ET-4 fix: palette must be extracted from the ORIGINAL image's colors,
+    // not from the post-depth-to-flat image. DTF desaturates the background and
+    // shifts colors via shading — extracting the palette from the post-DTF image
+    // meant vibrant subject colors (blue dress, skin tones) were washed out
+    // because the palette reflected the DTF-processed colors, not the original.
+    //
+    // If transforms are applied, we need the original image at post-transform
+    // dimensions. If no transforms, the original IS the post-transform image.
+    let palette_source: DynamicImage = if transform_is_noop {
+        // No transforms — palette from the original image directly.
+        // Can't borrow depth_processed because it might be Cow::Borrowed(image).
+        // Just clone — palette extraction is not a hot loop (k-means is subsampled).
+        (*image).clone()
+    } else {
+        // Transforms applied — we need the original image with the same transforms
+        // applied (but WITHOUT depth-to-flat). This gives us the original colors
+        // at the post-transform dimensions.
+        apply_transforms(image, transform)
+    };
+
+    let palette = generate_palette(&palette_source, pal_config, resampled_ml.as_ref())
         .unwrap_or_else(|_| Palette::new(vec![]));
 
     // ── 5. Downsample ────────────────────────────────────────────────────────
@@ -120,26 +166,44 @@ pub fn run(input: &PipelineInput<'_>) -> PipelineOutput {
     let oh = *output_height;
     let fallback = |img: &DynamicImage| img.resize_exact(ow, oh, image::imageops::FilterType::Nearest);
 
+    // Phase 6 — perf: `PaletteMode` and `PerceptualDither` both produce
+    // already-quantized output (every pixel is a palette color), so we can
+    // skip `apply_palette` for them. Other methods need the snap-to-palette pass.
+    let downsample_already_quantized = matches!(
+        transform.downsampling_method,
+        DownsamplingMethod::PaletteMode | DownsamplingMethod::PerceptualDither
+    );
+
     let downsampled = match transform.downsampling_method {
         DownsamplingMethod::PaletteMode => {
             // Pre-quantize at full res, then pick most common palette color per block.
-            // This eliminates the "smudge" — every output pixel is a discrete
-            // palette color, no averaging.
-            palette_mode_downsample(&flat, &palette, ow, oh).unwrap_or_else(|_| fallback(&flat))
+            // Phase 4 — D1a: now with bilateral pre-filter to eliminate noisy
+            // alternation on smooth gradients (the source of "smudge").
+            palette_mode_downsample(&preprocessed, &palette, ow, oh).unwrap_or_else(|_| fallback(&preprocessed))
+        }
+        DownsamplingMethod::PerceptualDither => {
+            // Phase 4 — D2: area-average downsample + Floyd-Steinberg error
+            // diffusion. Clean pixel-art downscaling with organic dithering.
+            perceptual_dither_downsample(&preprocessed, &palette, ow, oh).unwrap_or_else(|_| fallback(&preprocessed))
         }
         DownsamplingMethod::Weighted =>
-            weighted_downsample(&flat, &importance, ow, oh).unwrap_or_else(|_| fallback(&flat)),
+            weighted_downsample(&preprocessed, &importance, ow, oh).unwrap_or_else(|_| fallback(&preprocessed)),
         DownsamplingMethod::NearestNeighbor =>
-            nearest_neighbor_downsample(&flat, ow, oh).unwrap_or_else(|_| fallback(&flat)),
+            nearest_neighbor_downsample(&preprocessed, ow, oh).unwrap_or_else(|_| fallback(&preprocessed)),
         DownsamplingMethod::Bilinear =>
-            bilinear_downsample(&flat, ow, oh).unwrap_or_else(|_| fallback(&flat)),
+            bilinear_downsample(&preprocessed, ow, oh).unwrap_or_else(|_| fallback(&preprocessed)),
     };
 
     // ── 6. Palette quantization (snap to palette) ───────────────────────────
-    // For PaletteMode downsampling, the image is already quantized (each pixel
-    // is a palette color). For other methods, snap to palette now.
-    let quantized = apply_palette(&downsampled, &palette)
-        .unwrap_or_else(|e| { log::warn!("apply_palette: {e}"); downsampled.clone() });
+    // For PaletteMode/PerceptualDither downsampling, the image is already
+    // quantized (each pixel is a palette color) — skip the redundant pass.
+    // For other methods, snap to palette now.
+    let quantized = if downsample_already_quantized {
+        downsampled
+    } else {
+        apply_palette(&downsampled, &palette)
+            .unwrap_or_else(|e| { log::warn!("apply_palette: {e}"); downsampled })
+    };
 
     // ── 7. Edge rendering (outline pass) ────────────────────────────────────
     // Runs AFTER palette quantization so outlines use the palette's own colors
@@ -152,7 +216,7 @@ pub fn run(input: &PipelineInput<'_>) -> PipelineOutput {
     PipelineOutput {
         image: final_image,
         palette_colors: palette.colors,
-        preprocessed: None,
+        preprocessed: Some(preprocessed_for_output),
         flat: Some(flat_for_output),
     }
 }
@@ -165,8 +229,11 @@ pub fn run(input: &PipelineInput<'_>) -> PipelineOutput {
 /// dimensions. Bilinear for depth (continuous), nearest for edge (probability).
 ///
 /// Returns `None` if `ml_results` is `None` or no maps need resampling.
-/// Returns a new `MLResults` with resampled maps; `slic_labels` is dropped
-/// (only needed by `depth_to_flat`, which already ran).
+/// Returns a new `MLResults` with resampled maps.
+///
+/// Phase 2 — C9: SLIC labels are now resampled via nearest-neighbor and
+/// carried through to `draw_edges`, which uses them for the Internal vs
+/// Outlines edge-mode classification. Previously they were dropped here.
 fn resample_ml_maps(
     ml_results: Option<&MLResults>,
     original_dims: (u32, u32),
@@ -179,10 +246,11 @@ fn resample_ml_maps(
         // Still return a shallow copy so downstream stages don't mutate the original
         return Some(MLResults {
             depth_map: ml.depth_map.clone(),
+            filtered_depth_map: ml.filtered_depth_map.clone(),
             edge_map: ml.edge_map.clone(),
-            slic_labels: None, // not needed downstream
-            slic_labels_k: None,
-            slic_labels_s: None,
+            slic_labels: ml.slic_labels.clone(), // Phase 2: carry through
+            slic_labels_k: ml.slic_labels_k,
+            slic_labels_s: ml.slic_labels_s,
         });
     }
 
@@ -194,6 +262,12 @@ fn resample_ml_maps(
         resample_nearest(e, original_dims, target_dims)
     });
 
+    // Phase 2 — C9: resample SLIC labels via nearest-neighbor (labels are
+    // discrete — bilinear would produce fractional cluster IDs).
+    let resampled_slic = ml.slic_labels.as_ref().map(|l| {
+        resample_labels_nearest(l, original_dims, target_dims)
+    });
+
     log::debug!(
         "Resampled ML maps: {}x{} → {}x{}",
         original_dims.0, original_dims.1, target_dims.0, target_dims.1
@@ -201,10 +275,15 @@ fn resample_ml_maps(
 
     Some(MLResults {
         depth_map: resampled_depth,
+        // filtered_depth_map stays at original resolution — depth_to_flat
+        // already ran before transforms, so this resampled MLResults is
+        // only used by the importance map and edge pass, which use the
+        // raw `depth_map`.
+        filtered_depth_map: None,
         edge_map: resampled_edge,
-        slic_labels: None,
-        slic_labels_k: None,
-        slic_labels_s: None,
+        slic_labels: resampled_slic,
+        slic_labels_k: ml.slic_labels_k,
+        slic_labels_s: ml.slic_labels_s,
     })
 }
 
@@ -275,6 +354,38 @@ fn resample_nearest(
             let ox = ox.min(ow - 1);
             let oy = oy.min(oh - 1);
             result[ty * tw + tx] = data[oy * ow + ox];
+        }
+    }
+
+    result
+}
+
+/// Nearest-neighbor resampling for SLIC cluster labels (discrete `Vec<u32>`).
+/// Phase 2 — C9: needed so `draw_edges` can do Internal-vs-Outlines
+/// classification at the post-transform resolution.
+fn resample_labels_nearest(
+    labels: &[u32],
+    orig_dims: (u32, u32),
+    target_dims: (u32, u32),
+) -> Vec<u32> {
+    let (ow, oh) = (orig_dims.0 as usize, orig_dims.1 as usize);
+    let (tw, th) = (target_dims.0 as usize, target_dims.1 as usize);
+
+    if ow == tw && oh == th || labels.len() < ow * oh {
+        return labels.to_vec();
+    }
+
+    let mut result = vec![0u32; tw * th];
+    let sx = ow as f32 / tw as f32;
+    let sy = oh as f32 / th as f32;
+
+    for ty in 0..th {
+        for tx in 0..tw {
+            let ox = ((tx as f32 + 0.5) * sx).floor() as usize;
+            let oy = ((ty as f32 + 0.5) * sy).floor() as usize;
+            let ox = ox.min(ow - 1);
+            let oy = oy.min(oh - 1);
+            result[ty * tw + tx] = labels[oy * ow + ox];
         }
     }
 

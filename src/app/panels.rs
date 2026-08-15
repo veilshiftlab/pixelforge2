@@ -2,7 +2,8 @@
 
 use super::state::{AspectRatioMode, PixelForgeApp};
 use crate::processing::{
-    DownsamplingMethod, EdgeMode, OutlineStyle, PaletteMode, PresetPalette,
+    DepthToFlatConfig, DownsamplingMethod, EdgeConfig, EdgeMode, OutlineStyle,
+    PaletteMode, PresetPalette, SlicConfig, TransformConfig,
 };
 use eframe::egui;
 use image::GenericImageView;
@@ -152,50 +153,84 @@ fn badge(ui: &mut egui::Ui, label: &str, active: bool) {
 
 fn depth_to_flat_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     ui.collapsing("🎨 Depth → Flat", |ui| {
+        // ── Per-section reset ──────────────────────────────────────────────────
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Per-region shading (SLIC + MAD)").small().weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("↺ Reset").clicked() {
+                    app.depth_to_flat_config = DepthToFlatConfig::default();
+                }
+            });
+        });
+
         let dtf = &mut app.depth_to_flat_config;
 
-        // ── Per-region shading ──────────────────────────────────────────────────
-        ui.label(egui::RichText::new("Per-region shading (SLIC + MAD)").small().weak());
+        // ── Strength (slider + numeric entry) ────────────────────────────────
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(&mut dtf.strength, 0.0..=1.0)
+                    .text("Strength")
+                    .fixed_decimals(2)
+                    .clamping(egui::SliderClamping::Always),
+            ).on_hover_text(
+                "How strongly depth-derived shading biases Lab L*.\n0 = no shading · 0.4 = balanced · 1.0 = max contrast"
+            );
+        });
 
-        ui.add(
-            egui::Slider::new(&mut dtf.strength, 0.0..=1.0)
-                .text("Strength")
-                .fixed_decimals(2),
-        ).on_hover_text(
-            "How strongly depth-derived shading biases Lab L*.\n0 = no shading · 0.4 = balanced · 1.0 = max contrast"
-        );
+        // ── Gamma ───────────────────────────────────────────────────────────
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(&mut dtf.gamma, 0.5..=2.0)
+                    .text("Gamma")
+                    .fixed_decimals(2)
+                    .clamping(egui::SliderClamping::Always),
+            ).on_hover_text(
+                "Contrast curve exponent: s' = sign(s) × |s|^gamma.\n1.0 = linear · <1.0 = more midtone contrast · >1.0 = compressed"
+            );
+        });
 
-        ui.add(
-            egui::Slider::new(&mut dtf.gamma, 0.5..=2.0)
-                .text("Gamma")
-                .fixed_decimals(2),
-        ).on_hover_text(
-            "Contrast curve exponent: s' = sign(s) × |s|^gamma.\n1.0 = linear · <1.0 = more midtone contrast · >1.0 = compressed"
-        );
+        // ── MAD threshold (range widened to 0.01..=0.4 per plan) ──────────────
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(&mut dtf.mad_threshold, 0.01..=0.4)
+                    .text("MAD threshold")
+                    .fixed_decimals(3)
+                    .clamping(egui::SliderClamping::Always),
+            ).on_hover_text(
+                "Regions with MAD below this get no shading (avoids noise in flat areas).\nLower = shade more regions · Higher = skip noisier regions"
+            );
+        });
 
-        ui.add(
-            egui::Slider::new(&mut dtf.mad_threshold, 0.01..=0.2)
-                .text("MAD threshold")
-                .fixed_decimals(3),
-        ).on_hover_text(
-            "Regions with MAD below this get no shading (avoids noise in flat areas).\nLower = shade more regions · Higher = skip noisier regions"
-        );
-
-        ui.add(
-            egui::Slider::new(&mut dtf.global_depth_weight, 0.0..=1.0)
-                .text("Global depth")
-                .fixed_decimals(2),
-        ).on_hover_text(
-            "Blend between local (per-region MAD) and global (whole-image min-max) depth shading.\n\
-             0.0 = pure local (fine detail, loses global relationships)\n\
-             0.5 = balanced (default)\n\
-             1.0 = pure global (preserves relative depth, flattens local detail)"
-        );
+        // ── Global depth weight (with preset marker at 0.5) ────────────────────
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(&mut dtf.global_depth_weight, 0.0..=1.0)
+                    .text("Global depth")
+                    .fixed_decimals(2)
+                    .clamping(egui::SliderClamping::Always),
+            ).on_hover_text(
+                "Blend between local (per-region MAD) and global (whole-image min-max) depth shading.\n\
+                 0.0 = pure local (fine detail, loses global relationships)\n\
+                 0.5 = balanced (default)\n\
+                 1.0 = pure global (preserves relative depth, flattens local detail)"
+            );
+        });
 
         ui.separator();
 
-        // ── Background separation ────────────────────────────────────────────────
-        ui.label(egui::RichText::new("Background separation").small().weak());
+        // ── Background separation ────────────────────────────────────────────
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Background separation").small().weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("↺ Reset BG").clicked() {
+                    let d = DepthToFlatConfig::default();
+                    dtf.use_otsu_threshold = d.use_otsu_threshold;
+                    dtf.bg_depth_threshold = d.bg_depth_threshold;
+                    dtf.bg_desaturation    = d.bg_desaturation;
+                    dtf.bg_lightness_shift = d.bg_lightness_shift;
+                }
+            });
+        });
 
         ui.horizontal(|ui| {
             ui.checkbox(&mut dtf.use_otsu_threshold, "Auto threshold");
@@ -203,24 +238,33 @@ fn depth_to_flat_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
         });
 
         if !dtf.use_otsu_threshold {
-            ui.add(
-                egui::Slider::new(&mut dtf.bg_depth_threshold, 0.1..=0.95)
-                    .text("BG threshold")
-                    .fixed_decimals(2),
-            ).on_hover_text("Depth value above which pixels are classified as background.\n0 = nearest · 1 = farthest");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Slider::new(&mut dtf.bg_depth_threshold, 0.1..=0.95)
+                        .text("BG threshold")
+                        .fixed_decimals(2)
+                        .clamping(egui::SliderClamping::Always),
+                ).on_hover_text("Depth value above which pixels are classified as background.\n0 = nearest · 1 = farthest");
+            });
         }
 
-        ui.add(
-            egui::Slider::new(&mut dtf.bg_desaturation, 0.0..=1.0)
-                .text("BG desaturate")
-                .fixed_decimals(2),
-        );
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(&mut dtf.bg_desaturation, 0.0..=1.0)
+                    .text("BG desaturate")
+                    .fixed_decimals(2)
+                    .clamping(egui::SliderClamping::Always),
+            );
+        });
 
-        ui.add(
-            egui::Slider::new(&mut dtf.bg_lightness_shift, -0.5..=0.2)
-                .text("BG darken")
-                .fixed_decimals(2),
-        ).on_hover_text("Negative = darken background, positive = lighten");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(&mut dtf.bg_lightness_shift, -0.5..=0.2)
+                    .text("BG darken")
+                    .fixed_decimals(2)
+                    .clamping(egui::SliderClamping::Always),
+            ).on_hover_text("Negative = darken background, positive = lighten");
+        });
     });
 }
 
@@ -228,21 +272,39 @@ fn depth_to_flat_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
 
 fn slic_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     ui.collapsing("🧩 Regions (SLIC)", |ui| {
-        ui.add(
-            egui::Slider::new(&mut app.slic_config.k, 3..=8)
-                .text("Clusters (K)")
-                .fixed_decimals(0),
-        ).on_hover_text(
-            "Number of superpixel regions. Higher = more, smaller regions = finer detail control.\nRe-clusters on next Process."
-        );
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Superpixel clustering").small().weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("↺ Reset").clicked() {
+                    app.slic_config = SlicConfig::default();
+                }
+            });
+        });
 
-        ui.add(
-            egui::Slider::new(&mut app.slic_config.spatial_weight, 0.0..=1.0)
-                .text("Spatial weight")
-                .fixed_decimals(2),
-        ).on_hover_text(
-            "Controls blobbiness vs. detail fidelity.\nHigher = blobbier regions (boundaries follow the spatial grid).\nLower = regions follow color/depth boundaries more faithfully."
-        );
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(&mut app.slic_config.k, 5..=128)
+                    .text("Clusters (K)")
+                    .fixed_decimals(0)
+                    .clamping(egui::SliderClamping::Always),
+            ).on_hover_text(
+                "Number of superpixel regions. Higher = more, smaller regions = finer detail control.\n\
+                 Portraits: 32-64 preserves limbs/face/dress separation.\n\
+                 Simple images: 8-16 is sufficient.\n\
+                 Re-clusters on next Process."
+            );
+        });
+
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(&mut app.slic_config.spatial_weight, 0.0..=1.0)
+                    .text("Spatial weight")
+                    .fixed_decimals(2)
+                    .clamping(egui::SliderClamping::Always),
+            ).on_hover_text(
+                "Controls blobbiness vs. detail fidelity.\nHigher = blobbier regions (boundaries follow the spatial grid).\nLower = regions follow color/depth boundaries more faithfully."
+            );
+        });
 
         // Show cluster info if labels are cached
         if let Some(ref ml) = app.ml_results {
@@ -267,7 +329,14 @@ fn slic_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
 
 fn edge_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     ui.collapsing("✏ Edges", |ui| {
-        ui.label("Mode:");
+        ui.horizontal(|ui| {
+            ui.label("Mode:");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("↺ Reset").clicked() {
+                    app.edge_config = EdgeConfig::default();
+                }
+            });
+        });
         ui.horizontal_wrapped(|ui| {
             for mode in [EdgeMode::None, EdgeMode::Outlines, EdgeMode::Internal, EdgeMode::Both] {
                 if ui.selectable_label(app.edge_config.edge_mode == mode, format!("{:?}", mode)).clicked() {
@@ -277,8 +346,26 @@ fn edge_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
         });
 
         ui.add_space(4.0);
-        ui.add(egui::Slider::new(&mut app.edge_config.thickness,              1..=4).text("Thickness"));
-        ui.add(egui::Slider::new(&mut app.edge_config.edge_darkener_strength, 0.0..=1.0).text("Darkener"));
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(&mut app.edge_config.thickness, 1..=4)
+                    .text("Thickness")
+                    .clamping(egui::SliderClamping::Always),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(&mut app.edge_config.edge_darkener_strength, 0.0..=1.0)
+                    .text("Darken blend")
+                    .fixed_decimals(2)
+                    .clamping(egui::SliderClamping::Always),
+            ).on_hover_text(
+                "ET-5(b): Blends local-contrast outline color toward the darkest palette color.\n\
+                 0.0 = pure local-contrast (varies per pixel)\n\
+                 0.3 = default (70% local-contrast + 30% darkest)\n\
+                 1.0 = pure darkest (same as Black style)"
+            );
+        });
         ui.checkbox(&mut app.edge_config.anti_alias_edges, "Anti-alias");
 
         ui.separator();
@@ -294,15 +381,20 @@ fn edge_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
             }
         });
 
-        ui.add(egui::Slider::new(&mut app.edge_config.teed_threshold, 0.05..=0.8)
-            .text("Edge threshold")
-            .fixed_decimals(2))
-            .on_hover_text(
+        // Edge threshold with preset markers in the tooltip
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(&mut app.edge_config.teed_threshold, 0.05..=0.8)
+                    .text("Edge threshold")
+                    .fixed_decimals(2)
+                    .clamping(egui::SliderClamping::Always),
+            ).on_hover_text(
                 "Edge probability threshold (average-pooled to pixel-art resolution).\n\
+                 Presets: 0.15 = many edges · 0.30 = balanced · 0.50 = thin · 0.70 = minimal\n\
                  Lower = more edges (thicker, denser); higher = fewer edges (thinner, cleaner).\n\
-                 0.3 = balanced default. If edges are too thick, raise this to 0.4–0.5.\n\
                  Falls back to Sobel when the model is unavailable."
             );
+        });
     });
 }
 
@@ -424,12 +516,19 @@ fn transform_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Con
         if let Some(ref proc) = app.image_processor {
             rotation = proc.get_state().2;
         }
-        if ui.add(egui::Slider::new(&mut rotation, -180.0..=180.0).text("Rotate °")).changed() {
-            if let Some(ref mut proc) = app.image_processor {
-                proc.set_rotation(rotation);
+        ui.horizontal(|ui| {
+            if ui.add(
+                egui::Slider::new(&mut rotation, -180.0..=180.0)
+                    .text("Rotate °")
+                    .fixed_decimals(1)
+                    .clamping(egui::SliderClamping::Always),
+            ).changed() {
+                if let Some(ref mut proc) = app.image_processor {
+                    proc.set_rotation(rotation);
+                }
+                super::processing::refresh_input_preview(app, ctx);
             }
-            super::processing::refresh_input_preview(app, ctx);
-        }
+        });
 
         ui.separator();
     } else {
@@ -438,13 +537,21 @@ fn transform_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Con
     }
 
     // ── Pipeline output transforms ────────────────────────────────────────────────
-    ui.label(egui::RichText::new("Output").small().weak());
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Output").small().weak());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("↺ Reset").clicked() {
+                app.transform_config = TransformConfig::default();
+            }
+        });
+    });
     ui.label("Downsampling:");
     egui::ComboBox::from_id_salt("ds_method")
         .selected_text(format!("{:?}", app.transform_config.downsampling_method))
         .show_ui(ui, |ui| {
             for m in [
                 DownsamplingMethod::PaletteMode,
+                DownsamplingMethod::PerceptualDither,
                 DownsamplingMethod::NearestNeighbor,
                 DownsamplingMethod::Weighted,
                 DownsamplingMethod::Bilinear,
@@ -455,7 +562,11 @@ fn transform_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Con
 
     match app.transform_config.downsampling_method {
         DownsamplingMethod::PaletteMode => ui.label(
-            egui::RichText::new("Palette-mode: quantize at full res, pick most common color per block. Crisp, no smudge.")
+            egui::RichText::new("Palette-mode: bilateral pre-filter, quantize at full res, pick most common color per block. Crisp, no smudge (default).")
+            .small().color(egui::Color32::from_rgb(100, 200, 100))
+        ),
+        DownsamplingMethod::PerceptualDither => ui.label(
+            egui::RichText::new("Perceptual-dither: area-average + Floyd-Steinberg error diffusion. Clean gradients via dithering (best for small palettes).")
             .small().color(egui::Color32::from_rgb(100, 200, 100))
         ),
         DownsamplingMethod::NearestNeighbor => ui.label(
@@ -463,7 +574,7 @@ fn transform_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Con
             .small().weak()
         ),
         DownsamplingMethod::Weighted => ui.label(
-            egui::RichText::new("Weighted: averages all pixels in block. May smudge.")
+            egui::RichText::new("Weighted: Lab-space weighted average. May smudge.")
             .small().weak()
         ),
         DownsamplingMethod::Bilinear => ui.label(
@@ -472,10 +583,29 @@ fn transform_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Con
         ),
     };
 
-    ui.add(egui::Slider::new(&mut app.transform_config.scale,     0.1..=4.0  ).text("Scale"));
     ui.horizontal(|ui| {
-        ui.add(egui::Slider::new(&mut app.transform_config.offset_x, -1.0..=1.0).text("X"));
-        ui.add(egui::Slider::new(&mut app.transform_config.offset_y, -1.0..=1.0).text("Y"));
+        ui.add(
+            egui::Slider::new(&mut app.transform_config.scale, 0.1..=4.0)
+                .text("Scale")
+                .fixed_decimals(2)
+                .clamping(egui::SliderClamping::Always),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::Slider::new(&mut app.transform_config.offset_x, -1.0..=1.0)
+                .text("X")
+                .fixed_decimals(2)
+                .clamping(egui::SliderClamping::Always),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::Slider::new(&mut app.transform_config.offset_y, -1.0..=1.0)
+                .text("Y")
+                .fixed_decimals(2)
+                .clamping(egui::SliderClamping::Always),
+        );
     });
 }
 
@@ -492,7 +622,13 @@ fn palette_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
 
     match app.palette_config.mode {
         PaletteMode::Auto => {
-            ui.add(egui::Slider::new(&mut app.palette_config.max_colors, 2..=256).text("Max colors"));
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Slider::new(&mut app.palette_config.max_colors, 2..=128)
+                        .text("Max colors")
+                        .clamping(egui::SliderClamping::Always),
+                );
+            });
         }
         PaletteMode::Preset => {
             egui::ComboBox::from_id_salt("palette_preset")
@@ -514,7 +650,13 @@ fn palette_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
             ui.label(egui::RichText::new("Custom palette editing coming soon").small().weak());
         }
         PaletteMode::Hybrid => {
-            ui.add(egui::Slider::new(&mut app.palette_config.max_colors, 2..=256).text("Auto colors"));
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Slider::new(&mut app.palette_config.max_colors, 2..=128)
+                        .text("Auto colors")
+                        .clamping(egui::SliderClamping::Always),
+                );
+            });
             ui.label(egui::RichText::new("Region overrides configured in color settings.").small().weak());
         }
     }

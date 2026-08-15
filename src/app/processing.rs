@@ -41,6 +41,10 @@ pub fn load_image(app: &mut PixelForgeApp, path: &std::path::Path, ctx: &egui::C
             app.ml_results         = None;
             app.output_image       = None;
             app.processing         = ProcessingState::Idle;
+            // Phase 1 — P6: invalidate cached ML map textures
+            app.ml_depth_texture = None;
+            app.ml_edge_texture  = None;
+            app.ml_slic_texture  = None;
 
             log::info!("Loaded: {}", path.display());
         }
@@ -56,6 +60,10 @@ pub fn clear_image(app: &mut PixelForgeApp) {
     app.ml_results         = None;
     app.output_image       = None;
     app.processing         = ProcessingState::Idle;
+    // Phase 1 — P6: invalidate cached ML map textures
+    app.ml_depth_texture = None;
+    app.ml_edge_texture  = None;
+    app.ml_slic_texture  = None;
 }
 
 /// Refresh the input image texture to reflect current processor transformations
@@ -98,6 +106,277 @@ pub fn export_image(app: &PixelForgeApp) {
             Err(e) => log::error!("Export failed: {}", e),
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contact-sheet export (Phase 1 — U1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Compose a single PNG showing: input → depth map → edge map → SLIC labels →
+/// post-depth-to-flat → output. Each row labeled with source dimensions.
+///
+/// Missing intermediates (e.g. ML not yet run, or pipeline not yet processed)
+/// render as a labeled placeholder row so the contact sheet is always usable.
+pub fn export_contact_sheet(app: &PixelForgeApp) {
+    let Some(input) = &app.input_image else {
+        log::warn!("Contact sheet: no input image loaded");
+        return;
+    };
+
+    let (in_w, in_h) = input.image.dimensions();
+
+    // ── Build rows ───────────────────────────────────────────────────────────
+    let mut rows: Vec<crate::image::ContactSheetRow<'_>> = Vec::with_capacity(7);
+
+    // Row 1: Input image
+    rows.push(crate::image::ContactSheetRow {
+        label:    "INPUT",
+        image:    Some(input.image.clone()),
+        subtitle: Some(Box::leak(
+            format!("{in_w}x{in_h}  source").into_boxed_str(),
+        )),
+        settings: None,
+    });
+
+    // Row 2: Depth map
+    let depth_img = app.ml_results.as_ref()
+        .and_then(|r| r.depth_map.as_deref())
+        .map(|d| ml_depth_to_image(d, in_w, in_h));
+    let depth_sub = if depth_img.is_some() {
+        Some(Box::leak(format!("{in_w}x{in_h}  depth-anything v2").into_boxed_str()) as &str)
+    } else {
+        Some("not run — enable depth estimation and run ML analysis")
+    };
+    rows.push(crate::image::ContactSheetRow {
+        label:    "DEPTH MAP",
+        image:    depth_img,
+        subtitle: depth_sub,
+        settings: None,
+    });
+
+    // Row 3: Edge map
+    let edge_img = app.ml_results.as_ref()
+        .and_then(|r| r.edge_map.as_deref())
+        .map(|e| ml_edge_to_image(e, in_w, in_h));
+    let edge_sub = if edge_img.is_some() {
+        Some(Box::leak(format!("{in_w}x{in_h}  dexined").into_boxed_str()) as &str)
+    } else {
+        Some("not run — enable edge detection and run ML analysis")
+    };
+    rows.push(crate::image::ContactSheetRow {
+        label:    "EDGE MAP",
+        image:    edge_img,
+        subtitle: edge_sub,
+        settings: None,
+    });
+
+    // Row 4: SLIC labels
+    let slic_img = app.ml_results.as_ref()
+        .and_then(|r| r.slic_labels.as_deref())
+        .map(|l| ml_slic_to_image(l, in_w, in_h));
+    let slic_sub: Option<&str> = if slic_img.is_some() {
+        let n_clusters = {
+            let mut s: Vec<u32> = app.ml_results.as_ref()
+                .and_then(|r| r.slic_labels.as_ref())
+                .map(|l| l.iter().copied().collect())
+                .unwrap_or_default();
+            s.sort_unstable();
+            s.dedup();
+            s.len()
+        };
+        Some(Box::leak(
+            format!("{in_w}x{in_h}  k={}  {} regions", app.slic_config.k, n_clusters).into_boxed_str()
+        ) as &str)
+    } else {
+        Some("not computed — run Process once")
+    };
+    rows.push(crate::image::ContactSheetRow {
+        label:    "SLIC REGIONS",
+        image:    slic_img,
+        subtitle: slic_sub,
+        settings: None,
+    });
+
+    // Row 5: Post depth-to-flat
+    let flat_img = app.flat_color_image.as_ref().map(|i| i.clone());
+    let flat_sub = if flat_img.is_some() {
+        Some(Box::leak(
+            format!("{in_w}x{in_h}  post depth-to-flat").into_boxed_str()
+        ) as &str)
+    } else {
+        Some("run Process to populate")
+    };
+    rows.push(crate::image::ContactSheetRow {
+        label:    "FLAT (POST-DTF)",
+        image:    flat_img,
+        subtitle: flat_sub,
+        settings: None,
+    });
+
+    // Row 6: Output
+    let out_img = app.output_image.as_ref().map(|o| o.image.clone());
+    let out_sub = if let Some(o) = &app.output_image {
+        let (ow, oh) = o.image.dimensions();
+        Some(Box::leak(
+            format!("{ow}x{oh}  {} colors", o.palette.len()).into_boxed_str()
+        ) as &str)
+    } else {
+        Some("run Process to populate")
+    };
+    rows.push(crate::image::ContactSheetRow {
+        label:    "OUTPUT",
+        image:    out_img,
+        subtitle: out_sub,
+        settings: None,
+    });
+
+    // ── Row 7: Settings (ET-1) ──────────────────────────────────────────────
+    // All active config values so the contact sheet is reproducible.
+    let dtf = &app.depth_to_flat_config;
+    let slc = &app.slic_config;
+    let edg = &app.edge_config;
+    let pal = &app.palette_config;
+    let trn = &app.transform_config;
+    let mlc = &app.ml_config;
+    let src_name = input.path.as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "(untitled)".to_string());
+
+    let settings_pairs: Vec<(String, String)> = vec![
+        // Source
+        ("SOURCE".into(), src_name),
+        ("INPUT DIMS".into(), format!("{}x{}", in_w, in_h)),
+        // Depth → Flat
+        ("--- DEPTH->FLAT ---".into(), "".into()),
+        ("strength".into(), format!("{:.2}", dtf.strength)),
+        ("gamma".into(), format!("{:.2}", dtf.gamma)),
+        ("mad_threshold".into(), format!("{:.3}", dtf.mad_threshold)),
+        ("global_depth_weight".into(), format!("{:.2}", dtf.global_depth_weight)),
+        ("use_otsu".into(), format!("{}", dtf.use_otsu_threshold)),
+        ("bg_depth_threshold".into(), format!("{:.2}", dtf.bg_depth_threshold)),
+        ("bg_desaturation".into(), format!("{:.2}", dtf.bg_desaturation)),
+        ("bg_lightness_shift".into(), format!("{:.2}", dtf.bg_lightness_shift)),
+        ("bg_cluster_size_pct".into(), format!("{:.2}", dtf.bg_cluster_size_pct)),
+        // SLIC
+        ("--- SLIC ---".into(), "".into()),
+        ("k".into(), format!("{}", slc.k)),
+        ("spatial_weight".into(), format!("{:.2}", slc.spatial_weight)),
+        // Edges
+        ("--- EDGES ---".into(), "".into()),
+        ("edge_mode".into(), format!("{:?}", edg.edge_mode)),
+        ("thickness".into(), format!("{}", edg.thickness)),
+        ("edge_darkener_strength".into(), format!("{:.2}", edg.edge_darkener_strength)),
+        ("anti_alias".into(), format!("{}", edg.anti_alias_edges)),
+        ("outline_style".into(), format!("{:?}", edg.outline_style)),
+        ("teed_threshold".into(), format!("{:.2}", edg.teed_threshold)),
+        // Palette
+        ("--- PALETTE ---".into(), "".into()),
+        ("mode".into(), format!("{:?}", pal.mode)),
+        ("max_colors".into(), format!("{}", pal.max_colors)),
+        ("preset".into(), format!("{:?}", pal.preset)),
+        // Transform / Output
+        ("--- TRANSFORM ---".into(), "".into()),
+        ("output_size".into(), format!("{}", trn.output_size)),
+        ("downsampling_method".into(), format!("{:?}", trn.downsampling_method)),
+        ("scale".into(), format!("{:.2}", trn.scale)),
+        ("rotation".into(), format!("{:.1}", trn.rotation)),
+        ("offset_x".into(), format!("{:.2}", trn.offset_x)),
+        ("offset_y".into(), format!("{:.2}", trn.offset_y)),
+        ("flip_h".into(), format!("{}", trn.flip_horizontal)),
+        ("flip_v".into(), format!("{}", trn.flip_vertical)),
+        ("export_scale".into(), format!("{}x", trn.export_scale)),
+        // ML
+        ("--- ML ---".into(), "".into()),
+        ("depth_estimation".into(), format!("{}", mlc.depth_estimation_enabled)),
+        ("edge_detection".into(), format!("{}", mlc.edge_detection_enabled)),
+    ];
+    rows.push(crate::image::ContactSheetRow {
+        label:    "SETTINGS",
+        image:    None,
+        subtitle:  None,
+        settings: Some(settings_pairs),
+    });
+
+    // ── Compose and save ────────────────────────────────────────────────────
+    // ET-1: widened to 768px to fit longer setting names + values
+    let row_width = 768;
+    match crate::image::compose_contact_sheet(&rows, row_width) {
+        Ok(sheet) => {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("PNG", &["png"])
+                .set_file_name("pixelforge_contact_sheet.png")
+                .save_file()
+            {
+                match ImageExporter::export_png(&sheet, &path, None) {
+                    Ok(_)  => log::info!("Contact sheet saved: {}", path.display()),
+                    Err(e) => log::error!("Contact sheet save failed: {}", e),
+                }
+            }
+        }
+        Err(e) => log::error!("Contact sheet compose failed: {}", e),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ML map → DynamicImage converters (for contact sheet + preview tab)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Turbo colormap — perceptually uniform, better than grayscale for depth.
+fn turbo_colormap(t: f32) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
+    let r = (0.13572138 + t*(4.61539260 + t*(-42.66032258 + t*(132.13108234 + t*(-152.94239396 + t*59.28637943))))) * 255.0;
+    let g = (0.09140261 + t*(2.19418839 + t*(4.84296658  + t*(-14.18503333 + t*(  4.27729857  + t* 2.82956604))))) * 255.0;
+    let b = (0.10667330 + t*(12.64194608 + t*(-60.58204836 + t*(110.36276771 + t*(-89.90310912 + t*27.34824973))))) * 255.0;
+    (r.clamp(0.0, 255.0) as u8, g.clamp(0.0, 255.0) as u8, b.clamp(0.0, 255.0) as u8)
+}
+
+/// Convert a depth map (`Vec<f32>`, [0,1], row-major) to a turbo-colored
+/// RGBA image at the given dimensions.
+pub fn ml_depth_to_image(depth: &[f32], w: u32, h: u32) -> image::DynamicImage {
+    let mut img = image::RgbaImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y * w + x) as usize;
+            let v = depth.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            let (r, g, b) = turbo_colormap(v);
+            img.put_pixel(x, y, image::Rgba([r, g, b, 255]));
+        }
+    }
+    image::DynamicImage::ImageRgba8(img)
+}
+
+/// Convert an edge map (`Vec<f32>`, [0,1], row-major) to a grayscale RGBA image.
+pub fn ml_edge_to_image(edges: &[f32], w: u32, h: u32) -> image::DynamicImage {
+    let mut img = image::RgbaImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y * w + x) as usize;
+            let v = (edges.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0) * 255.0) as u8;
+            img.put_pixel(x, y, image::Rgba([v, v, v, 255]));
+        }
+    }
+    image::DynamicImage::ImageRgba8(img)
+}
+
+/// Convert SLIC cluster labels to a colored RGBA image (one color per cluster).
+pub fn ml_slic_to_image(labels: &[u32], w: u32, h: u32) -> image::DynamicImage {
+    const PALETTE: [[u8; 3]; 16] = [
+        [230,  25,  75], [ 60, 180,  75], [255, 225,  25], [  0, 130, 200],
+        [245, 130,  48], [145,  30, 180], [ 70, 240, 240], [240,  50, 230],
+        [210, 245,  60], [250, 190, 190], [  0, 128, 128], [230, 190, 255],
+        [170, 110,  40], [255, 250, 200], [128, 128, 128], [  0,   0,   0],
+    ];
+    let mut img = image::RgbaImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y * w + x) as usize;
+            let label = labels.get(idx).copied().unwrap_or(0) as usize;
+            let c = PALETTE[label % PALETTE.len()];
+            img.put_pixel(x, y, image::Rgba([c[0], c[1], c[2], 255]));
+        }
+    }
+    image::DynamicImage::ImageRgba8(img)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -257,6 +536,8 @@ pub fn process_image(app: &mut PixelForgeApp, ctx: &egui::Context) {
             || ml.slic_labels_k != Some(app.slic_config.k)
             || ml.slic_labels_s != Some(app.slic_config.spatial_weight);
         if need_recompute {
+            // Phase 1 — P6: invalidate cached SLIC texture before recompute
+            app.ml_slic_texture = None;
             if let Some(ref depth) = ml.depth_map {
                 match crate::processing::slic::slic(&input, Some(depth), &app.slic_config) {
                     Ok(labels) => {
@@ -332,7 +613,7 @@ pub fn process_image(app: &mut PixelForgeApp, ctx: &egui::Context) {
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn upload_texture(ctx: &egui::Context, name: &str, img: &image::DynamicImage) -> egui::TextureHandle {
+pub(crate) fn upload_texture(ctx: &egui::Context, name: &str, img: &image::DynamicImage) -> egui::TextureHandle {
     let rgba = img.to_rgba8();
     let pixels: Vec<egui::Color32> = rgba.pixels()
         .map(|p| egui::Color32::from_rgba_unmultiplied(p.0[0], p.0[1], p.0[2], p.0[3]))

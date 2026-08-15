@@ -23,6 +23,7 @@ fn main() {
 
     let ml = MLResults {
         depth_map: Some(depth_map),
+        filtered_depth_map: None,
         edge_map: Some(edge_map),
         slic_labels: Some(slic_labels),
         slic_labels_k: Some(5),

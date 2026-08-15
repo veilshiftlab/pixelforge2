@@ -24,15 +24,18 @@ image = { version = "0.25", features = ["png", "jpeg", "webp"] }
 #
 # `download-binaries` fetches a pre-built ONNX Runtime shared library at build
 # time that matches the ort crate's expected version (>=1.23.x for ort 2.0-rc.11).
-# The `cuda` feature makes the downloaded binary include CUDA execution provider
-# support, so GPU acceleration works without a separate ONNX Runtime install.
+#
+# Phase 7 — removed `cuda` feature: user confirmed no CUDA GPU in workspace.
+# Without CUDA, the cuda EP was just adding ~5 minutes to release builds
+# (it compiles CUDA stub libraries even when not used). If GPU acceleration
+# is needed later, re-add `cuda` here and the workspace will need a CUDA
+# toolkit install.
 #
 # Do NOT add `load-dynamic` — that feature makes ort look for a system
 # `onnxruntime.dll` at runtime, which can pick up an older version (e.g. 1.17.1
 # from another tool) and cause a version-mismatch panic at startup.
 ort = { version = "2.0.0-rc.11", features = [
     "download-binaries",
-    "cuda",
 ] }
 ndarray = "0.15"
 

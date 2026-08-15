@@ -283,3 +283,47 @@ pub fn normalize_min_max(values: &mut [f32]) {
         *v = ((*v - min) / range).clamp(0.0, 1.0);
     }
 }
+
+/// Normalize a f32 slice to [0.0, 1.0] using **percentile** scaling.
+///
+/// Uses the `lo_pct`-th and `hi_pct`-th percentiles as the [0, 1] endpoints
+/// instead of min/max. Robust to outliers — a few saturated edge pixels
+/// won't collapse the dynamic range.
+///
+/// - `lo_pct`: lower percentile in [0, 1] (e.g. 0.05 for 5th percentile).
+/// - `hi_pct`: upper percentile in [0, 1] (e.g. 0.95 for 95th percentile).
+///
+/// Values below the low percentile clamp to 0; above the high percentile
+/// clamp to 1. If `hi - lo < 1e-6`, falls back to min-max.
+pub fn normalize_percentile(values: &mut [f32], lo_pct: f32, hi_pct: f32) {
+    if values.is_empty() { return; }
+    let lo_pct = lo_pct.clamp(0.0, 1.0);
+    let hi_pct = hi_pct.clamp(0.0, 1.0);
+    if hi_pct <= lo_pct {
+        normalize_min_max(values);
+        return;
+    }
+
+    // Build a sorted copy to look up percentiles. For typical map sizes
+    // (256×256 to 1024×1024) this is fast enough; if it becomes a hot path,
+    // switch to a partial sort / nth_element.
+    let mut sorted: Vec<f32> = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let n = sorted.len();
+    let lo_idx = ((n as f32 - 1.0) * lo_pct).round() as usize;
+    let hi_idx = ((n as f32 - 1.0) * hi_pct).round() as usize;
+    let lo = sorted[lo_idx.min(n - 1)];
+    let hi = sorted[hi_idx.min(n - 1)];
+
+    let range = hi - lo;
+    if range < 1e-6 {
+        // Degenerate case — fall back to plain min-max
+        normalize_min_max(values);
+        return;
+    }
+
+    for v in values.iter_mut() {
+        *v = ((*v - lo) / range).clamp(0.0, 1.0);
+    }
+}

@@ -37,6 +37,18 @@ fn file_menu(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
             ui.close_menu();
         }
 
+        // Contact sheet — always available once an input image is loaded;
+        // missing intermediates render as labeled placeholder rows.
+        if ui.add_enabled(app.input_image.is_some(), egui::Button::new("🖼 Export Contact Sheet…"))
+            .on_hover_text(
+                "Save a single PNG with all pipeline stages stacked: input, depth, edges, SLIC, post-depth-to-flat, output.\n\
+                 Useful for sharing pipeline state in one screenshot.")
+            .clicked()
+        {
+            super::processing::export_contact_sheet(app);
+            ui.close_menu();
+        }
+
         ui.separator();
 
         if ui.button("Exit").clicked() {
@@ -63,9 +75,11 @@ fn edit_menu(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
 fn view_menu(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     ui.menu_button("View", |ui| {
         for (tab, label) in [
-            (PreviewTab::Original, "📷 Original"),
-            (PreviewTab::MLMaps,   "🤖 ML Maps"),
-            (PreviewTab::Output,   "🎨 Output"),
+            (PreviewTab::Original,     "📷 Original"),
+            (PreviewTab::MLMaps,       "🤖 ML Maps"),
+            (PreviewTab::Flat,         "🎨 Flat (post-DTF)"),
+            (PreviewTab::Preprocessed, "📐 Preprocessed"),
+            (PreviewTab::Output,       "✨ Output"),
         ] {
             if ui.selectable_label(app.preview_tab == tab, label).clicked() {
                 app.preview_tab = tab;
@@ -75,7 +89,12 @@ fn view_menu(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
 
         ui.separator();
 
-        ui.add(egui::Slider::new(&mut app.preview_zoom, 0.25..=8.0).text("Zoom"));
+        ui.add(
+            egui::Slider::new(&mut app.preview_zoom, 0.25..=8.0)
+                .text("Zoom")
+                .logarithmic(true)
+                .clamping(egui::SliderClamping::Always),
+        );
 
         for (label, zoom) in [("Fit", 1.0f32), ("2×", 2.0), ("4×", 4.0)] {
             if ui.small_button(label).clicked() {

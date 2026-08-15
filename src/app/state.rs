@@ -28,6 +28,10 @@ pub enum PreviewTab {
     #[default]
     Original,
     MLMaps,
+    /// Post-depth-to-flat intermediate (shading applied, pre-transform)
+    Flat,
+    /// Post-transform, pre-downsample (what the downsample/palette stages see)
+    Preprocessed,
     Output,
 }
 
@@ -84,6 +88,16 @@ pub struct PixelForgeApp {
     // ── Preview ──────────────────────────────────────────────────────────────
     pub preview_tab: PreviewTab,
     pub preview_zoom: f32,
+    /// ML map texture cache (Phase 1 — P6). Built lazily when the ML Maps
+    /// tab is opened; invalidated when `ml_results` changes. Prevents the
+    /// per-frame rebuild that previously happened in `app/preview.rs`.
+    pub ml_depth_texture: Option<TextureHandle>,
+    pub ml_edge_texture:  Option<TextureHandle>,
+    pub ml_slic_texture:  Option<TextureHandle>,
+    /// 1:1 zoom toggle for the ML Maps tab (Phase 1 — C4). When true, maps
+    /// display at native resolution (1 source pixel = 1 screen pixel) and
+    /// the user can scroll/pan inside the scroll area.
+    pub ml_maps_native: bool,
 
     // ── Presets ──────────────────────────────────────────────────────────────
     pub current_preset: Option<String>,
@@ -138,6 +152,10 @@ impl PixelForgeApp {
             custom_output_height: 64,
             preview_tab: PreviewTab::Original,
             preview_zoom: 1.0,
+            ml_depth_texture: None,
+            ml_edge_texture: None,
+            ml_slic_texture: None,
+            ml_maps_native: false,
             current_preset: None,
             show_model_dialog: false,
             show_about_dialog: false,
@@ -176,6 +194,11 @@ impl eframe::App for PixelForgeApp {
                 Ok(Ok(results)) => {
                     self.vram_usage = self.model_manager.read().estimated_vram_usage() / (1024 * 1024);
                     self.ml_results = Some(results);
+                    // Phase 1 — P6: invalidate cached ML map textures so they
+                    // get rebuilt from the new data on next preview frame.
+                    self.ml_depth_texture = None;
+                    self.ml_edge_texture  = None;
+                    self.ml_slic_texture  = None;
                     self.processing = ProcessingState::Complete;
                 }
                 Ok(Err(e)) => {

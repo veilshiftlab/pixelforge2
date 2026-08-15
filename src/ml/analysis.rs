@@ -15,7 +15,7 @@ use super::models::{
 };
 use crate::models::ModelManager;
 use anyhow::Result;
-use image::DynamicImage;
+use image::{DynamicImage, GenericImageView};
 use parking_lot::RwLock;
 use std::sync::Arc;
 
@@ -39,6 +39,17 @@ impl MLAnalysis {
 
         if config.depth_estimation_enabled {
             results.depth_map = Some(run_depth_estimation(image, model_manager)?);
+
+            // Phase 6 — P1: cache the 5×5 median-filtered depth map so
+            // `depth_to_flat` doesn't recompute it on every pipeline
+            // invocation (every slider tweak). The filter is a pure
+            // function of the depth map, so it's safe to share across
+            // pipeline runs that use the same ML results.
+            let (w, h) = image.dimensions();
+            if let Some(ref raw) = results.depth_map {
+                results.filtered_depth_map =
+                    Some(crate::processing::median_filter_5x5(raw, w, h));
+            }
         }
 
         if config.edge_detection_enabled {

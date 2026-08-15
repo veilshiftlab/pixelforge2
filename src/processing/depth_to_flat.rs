@@ -1,38 +1,41 @@
 //! Depth-to-flat color conversion
 //!
-//! # Phase 2.3 — SLIC-driven per-region shading
+//! # Phase 3 — Depth Signal Architecture
 //!
-//! Replaces the BiSeNet-dependent per-region shading with a model-free
-//! approach using SLIC superpixel labels:
+//! Replaces the old `local * (1-gw) + global * gw` blend (which destroyed
+//! both signals — neither local detail nor global depth relationships
+//! survived) with **hierarchical depth normalization**:
 //!
-//! 1. **Median filter** (5×5) on the depth map to remove speckle around hair,
-//!    glasses, and fine detail boundaries.
-//! 2. **Per-region MAD normalization**: for each SLIC cluster, compute the
-//!    median and MAD (median absolute deviation) of the depth values. Normalize
-//!    each pixel's depth to `s = (depth - median) / (1.4826 * MAD)`, clamped to
-//!    [-1, 1]. Regions with MAD < `mad_threshold` get `s = 0` (no shading —
-//!    avoids amplifying noise in flat regions).
-//! 3. **Contrast curve**: `s' = sign(s) * |s|^gamma`. Lower gamma = more
-//!    contrast in midtones.
-//! 4. **Lab L bias**: `L' = clamp(L + s' * strength * 100, 0, 100)`. Near
-//!    features (nose tip) become highlights, far features become shadows.
-//!
-//! Background separation (Otsu/manual threshold + Lab desaturation) is also
-//! applied — background pixels bypass the shading step.
+//! 1. **Median filter** (5×5) on the depth map to remove speckle.
+//! 2. **Global shading** via percentile normalization (2nd/98th, robust
+//!    to outliers). Preserves global truth: far background pixels get
+//!    different shading than near foreground pixels, across SLIC regions.
+//! 3. **Local shading** via per-region MAD normalization (current behavior).
+//! 4. **Hierarchical blend**: `shading = global * gw + local * lw`, then
+//!    clamp to [-1, 1]. Default gw=0.6, lw=0.4 — biases toward global truth
+//!    per user complaint "missing out on global depth values".
+//! 5. **Background classification** is now **region-based** (per-SLIC-cluster):
+//!    a cluster is background if `mean_depth > p70 AND (touches_border OR
+//!    size_pct > bg_cluster_size_pct)`. Eliminates the depth-bleed leakage
+//!    onto subject edges that the old per-pixel `d > threshold` produced.
+//!    Falls back to Otsu/manual threshold when SLIC labels are unavailable.
+//! 6. **Contrast curve + Lab L bias** unchanged: `s' = sign(s) * |s|^gamma`,
+//!    `L' = clamp(L + s' * strength * 100, 0, 100)`.
 //!
 //! # Depth convention
 //!
-//! Depth-Anything V2 outputs **0 = nearest, 1 = farthest**. For shading, near
-//! features should be highlights (high L), so we invert: depth values below
-//! the region median produce positive `s` (lighten), above produce negative
-//! `s` (darken).
+//! Depth-Anything V2 outputs **0 = nearest, 1 = farthest**. For shading,
+//! near features should be highlights (high L), so we invert: depth values
+//! below the percentile/median baseline produce positive `s` (lighten),
+//! above produce negative `s` (darken).
 
 use super::DepthToFlatConfig;
 use crate::ml::MLResults;
 use anyhow::Result;
 use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 use palette::{IntoColor, Lab, Srgb};
-use std::collections::HashMap;
+// Phase 6 — P5: HashMap removed; per-region shading and bg classification
+// now use Vec indexed by cluster ID (cheaper, no hashing overhead).
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
@@ -42,8 +45,8 @@ use std::collections::HashMap;
 ///
 /// Pipeline:
 /// 1. Median-filter the depth map (5×5) to remove speckle.
-/// 2. Compute per-region shading signal (MAD normalization per SLIC cluster).
-/// 3. Separate background (Otsu/manual threshold).
+/// 2. Compute hierarchical shading: global (percentile 2/98) + local (per-region MAD).
+/// 3. Classify background per SLIC cluster (mean depth + border/size rule).
 /// 4. Apply contrast curve + Lab L bias to foreground; desaturate background.
 pub fn depth_to_flat(
     input: &DynamicImage,
@@ -59,34 +62,50 @@ pub fn depth_to_flat(
     };
 
     // ── 1. Median filter the depth map ───────────────────────────────────────
-    let depth = median_filter_5x5(raw_depth, width, height);
+    // Phase 6 — P1: use cached filtered_depth_map if present (computed once
+    // in MLAnalysis::analyze). Falls back to local computation when missing
+    // (e.g., when the pipeline is called with hand-constructed MLResults from
+    // a test binary, or when MLResults was deserialized without the cache).
+    let depth: Vec<f32> = if let Some(cached) = &ml_results.filtered_depth_map {
+        if cached.len() == raw_depth.len() {
+            cached.clone()
+        } else {
+            // Dim mismatch — recompute (defensive against stale cache)
+            median_filter_5x5(raw_depth, width, height)
+        }
+    } else {
+        median_filter_5x5(raw_depth, width, height)
+    };
 
-    // ── 2. Compute per-region shading signal (local MAD) ──────────────────────
-    let local_shading = compute_per_region_shading(&depth, ml_results, width, height, config);
+    // ── 2. Hierarchical shading (C6) ─────────────────────────────────────────
+    // Global preserves relative depth between all pixels (percentile-normalized
+    // so outliers don't collapse the range). Local preserves fine detail
+    // within each SLIC region (MAD-normalized). We sum them with separate
+    // weights instead of averaging — both signals survive.
+    let local_shading  = compute_per_region_shading(&depth, ml_results, width, height, config);
+    let global_shading = compute_global_shading_percentile(&depth);
 
-    // ── 2b. Compute global shading signal (min-max over whole image) ──────────
-    let global_shading = compute_global_shading(&depth, config);
-
-    // ── 2c. Blend local and global shading ────────────────────────────────────
-    // Local preserves fine detail within regions; global preserves relative
-    // depth between regions. Blending gives both.
     let gw = config.global_depth_weight.clamp(0.0, 1.0);
+    let lw = 1.0 - gw; // local weight mirrors global weight for symmetry
     let shading: Vec<f32> = local_shading.iter()
         .zip(global_shading.iter())
-        .map(|(&l, &g)| l * (1.0 - gw) + g * gw)
+        .map(|(&l, &g)| (g * gw + l * lw).clamp(-1.0, 1.0))
         .collect();
 
-    // ── 3. Background separation threshold ────────────────────────────────────
-    let bg_threshold = compute_bg_threshold(&depth, config);
+    // ── 3. Region-based background classification (C8, C13) ──────────────────
+    // Per-SLIC-cluster: bg if mean_depth > p70 AND (touches_border OR size > 15%).
+    // Falls back to per-pixel Otsu/manual threshold when SLIC is unavailable.
+    let bg_mask = classify_background(&depth, ml_results, width, height, config);
 
     // ── 4. Apply shading + background treatment ───────────────────────────────
     for y in 0..height {
         for x in 0..width {
             let idx = (y * width + x) as usize;
-            let d = depth.get(idx).copied().unwrap_or(0.5);
             let original = input.get_pixel(x, y);
-
-            let is_background = d > bg_threshold;
+            let is_background = bg_mask
+                .get(idx)
+                .copied()
+                .unwrap_or(false);
 
             let adjusted = if is_background {
                 apply_background_treatment(original, config)
@@ -102,40 +121,51 @@ pub fn depth_to_flat(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Global shading (min-max over whole image)
+// Global shading — percentile normalization (C6)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Compute global shading signal using min-max normalization over the entire
-/// depth map. Preserves relative depth between all pixels (a far background
-/// pixel gets a different shading value than a near foreground pixel), but
-/// doesn't amplify local detail like MAD does.
+/// Compute global shading signal using **percentile normalization** (2nd/98th).
 ///
-/// Returns `s ∈ [-1, 1]` where positive = nearer (highlight), negative = farther (shadow).
-fn compute_global_shading(depth: &[f32], _config: &DepthToFlatConfig) -> Vec<f32> {
+/// Returns `s ∈ [-1, 1]` where positive = nearer (highlight), negative = farther
+/// (shadow). Uses 2nd/98th percentiles as the [0,1] endpoints instead of
+/// min/max — robust to outliers (a few saturated edge pixels won't collapse
+/// the dynamic range, unlike the old min-max approach).
+fn compute_global_shading_percentile(depth: &[f32]) -> Vec<f32> {
     if depth.is_empty() {
         return Vec::new();
     }
 
-    let min = depth.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max = depth.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let range = max - min;
+    let (p2, p98) = percentiles(depth, 0.02, 0.98);
+    let range = p98 - p2;
 
     if range < 1e-6 {
         return vec![0.0f32; depth.len()];
     }
 
-    // Normalize to [0, 1], then shift to [-1, 1] with 0.5 → 0
-    // Invert: low depth (near) → positive (highlight)
+    // Normalize to [0, 1] via percentile, then shift to [-1, 1] with 0.5 → 0.
+    // Invert: low depth (near) → positive (highlight).
     depth.iter()
         .map(|&d| {
-            let normalized = (d - min) / range;  // 0 = nearest, 1 = farthest
+            let normalized = ((d - p2) / range).clamp(0.0, 1.0);  // 0 = nearest, 1 = farthest
             (0.5 - normalized) * 2.0  // near → +1, far → -1
         })
         .collect()
 }
 
+/// Lookup the `lo_pct`-th and `hi_pct`-th percentiles of a slice.
+/// Sorts a copy — callers should cache the result if reused.
+fn percentiles(values: &[f32], lo_pct: f32, hi_pct: f32) -> (f32, f32) {
+    if values.is_empty() { return (0.0, 0.0); }
+    let mut sorted: Vec<f32> = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    let lo_idx = ((n as f32 - 1.0) * lo_pct).round() as usize;
+    let hi_idx = ((n as f32 - 1.0) * hi_pct).round() as usize;
+    (sorted[lo_idx.min(n - 1)], sorted[hi_idx.min(n - 1)])
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Per-region shading (MAD normalization)
+// Per-region shading (MAD normalization) — unchanged
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Compute the per-pixel shading signal `s ∈ [-1, 1]` using SLIC labels.
@@ -164,29 +194,39 @@ fn compute_per_region_shading(
 
     match &ml_results.slic_labels {
         Some(labels) if labels.len() >= n => {
-            // ── Per-region MAD normalization ──────────────────────────────────
-            // Group depth values by cluster ID
-            let mut clusters: HashMap<u32, Vec<f32>> = HashMap::new();
+            // Phase 6 — P5: use Vec<Vec<f32>> indexed by cluster ID instead of
+            // HashMap. The HashMap had per-pixel hashing overhead on the hot
+            // assignment loop. Vec indexing is O(1) with no hashing.
+            //
+            // SLIC IDs may not be contiguous after Phase 3's
+            // `split_disconnected_clusters`, so size by max(labels)+1.
+            let max_id = labels.iter().copied().max().unwrap_or(0) as usize;
+            let n_clusters = max_id + 1;
+
+            let mut clusters: Vec<Vec<f32>> = vec![Vec::new(); n_clusters];
             for i in 0..n {
-                clusters.entry(labels[i]).or_default().push(depth[i]);
+                let c = labels[i] as usize;
+                if c < n_clusters {
+                    clusters[c].push(depth[i]);
+                }
             }
 
-            // Compute (median, MAD) per cluster
-            let mut stats: HashMap<u32, (f32, f32)> = HashMap::new();
-            for (cluster, mut values) in clusters {
+            let mut stats: Vec<(f32, f32)> = vec![(0.0, 0.0); n_clusters];
+            for (c, mut values) in clusters.into_iter().enumerate() {
+                if values.is_empty() { continue; }
                 let median = compute_median(&mut values);
                 let deviations: Vec<f32> = values.iter().map(|&v| (v - median).abs()).collect();
                 let mut deviations = deviations;
                 let mad = compute_median(&mut deviations);
-                stats.insert(cluster, (median, mad));
+                stats[c] = (median, mad);
             }
 
-            // Normalize each pixel
             for i in 0..n {
-                let cluster = labels[i];
-                if let Some(&(median, mad)) = stats.get(&cluster) {
+                let cluster = labels[i] as usize;
+                if cluster < n_clusters {
+                    let (median, mad) = stats[cluster];
                     if mad < config.mad_threshold {
-                        shading[i] = 0.0; // Low-variance region — skip
+                        shading[i] = 0.0;
                     } else {
                         // Invert: depth below median (nearer) → positive s (highlight)
                         let s = (median - depth[i]) / (1.4826 * mad);
@@ -213,6 +253,115 @@ fn compute_per_region_shading(
     }
 
     shading
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Region-based background classification (C8, C13)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a per-pixel boolean mask: `true` = background, `false` = foreground.
+///
+/// When SLIC labels are available, classification is per-cluster:
+/// ```text
+/// for each SLIC cluster:
+///   mean_depth = mean(depth[cluster])
+///   touches_border = any pixel in cluster is on the image edge
+///   size_pct = len(cluster) / total_pixels
+///   is_background = (mean_depth > p70_global_depth)
+///                && (touches_border || size_pct > bg_cluster_size_pct)
+/// ```
+/// This eliminates the depth-bleed leakage onto subject edges that the old
+/// per-pixel `d > threshold` produced.
+///
+/// When SLIC labels are unavailable, falls back to per-pixel Otsu/manual
+/// threshold (the Phase 1 behavior).
+fn classify_background(
+    depth: &[f32],
+    ml_results: &MLResults,
+    width: u32,
+    height: u32,
+    config: &DepthToFlatConfig,
+) -> Vec<bool> {
+    let n = (width * height) as usize;
+    let mut mask = vec![false; n];
+
+    if depth.len() < n {
+        return mask;
+    }
+
+    let labels = match &ml_results.slic_labels {
+        Some(l) if l.len() >= n => l,
+        _ => {
+            // ── Fallback: per-pixel threshold (Otsu or manual) ─────────────────
+            let threshold = compute_bg_threshold(depth, config);
+            for i in 0..n {
+                mask[i] = depth[i] > threshold;
+            }
+            return mask;
+        }
+    };
+
+    // ── Region-based classification (Phase 3 — C8, C13) ───────────────────────
+    // Phase 6 — P5: Vec-indexed by cluster ID instead of HashMap.
+    // SLIC IDs may not be contiguous after Phase 3's split_disconnected_clusters,
+    // so size by max(labels)+1.
+    let max_id = labels.iter().copied().max().unwrap_or(0) as usize;
+    let n_clusters = max_id + 1;
+    let mut cluster_sum:    Vec<f64> = vec![0.0; n_clusters];
+    let mut cluster_count:  Vec<u32> = vec![0;    n_clusters];
+    let mut cluster_border: Vec<bool> = vec![false; n_clusters];
+
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) as usize;
+            let lbl = labels[i] as usize;
+            if lbl >= n_clusters { continue; }
+            cluster_sum[lbl]   += depth[i] as f64;
+            cluster_count[lbl] += 1;
+            // Border touch: pixel on the outermost row/column of the image
+            let on_border = x == 0 || y == 0 || x == width - 1 || y == height - 1;
+            if on_border {
+                cluster_border[lbl] = true;
+            }
+        }
+    }
+
+    // Compute p70 of the per-cluster mean depth values.
+    let mut cluster_means: Vec<f32> = (0..n_clusters)
+        .filter(|&c| cluster_count[c] > 0)
+        .map(|c| {
+            let count = cluster_count[c] as f32;
+            (cluster_sum[c] as f32 / count.max(1.0)) as f32
+        })
+        .collect();
+    cluster_means.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p70 = if cluster_means.is_empty() {
+        0.6
+    } else {
+        let idx = ((cluster_means.len() as f32 - 1.0) * 0.70).round() as usize;
+        cluster_means[idx.min(cluster_means.len() - 1)]
+    };
+
+    // Decide per-cluster
+    let mut cluster_is_bg: Vec<bool> = vec![false; n_clusters];
+    let size_threshold = (n as f32 * config.bg_cluster_size_pct.clamp(0.0, 1.0)) as u32;
+    for c in 0..n_clusters {
+        if cluster_count[c] == 0 { continue; }
+        let count = cluster_count[c];
+        let mean = cluster_sum[c] as f32 / count.max(1) as f32;
+        let touches_border = cluster_border[c];
+        cluster_is_bg[c] = mean > p70 && (touches_border || count > size_threshold);
+    }
+
+    // Apply to per-pixel mask
+    for i in 0..n {
+        let lbl = labels[i] as usize;
+        if lbl < n_clusters {
+            mask[i] = cluster_is_bg[lbl];
+        }
+    }
+
+    mask
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -270,7 +419,12 @@ fn apply_background_treatment(original: Rgba<u8>, config: &DepthToFlatConfig) ->
 /// boundaries. Median filtering preserves edges while removing speckle —
 /// Gaussian would blur edges into neighbors, softening the very depth
 /// discontinuities we want to detect.
-fn median_filter_5x5(depth: &[f32], width: u32, height: u32) -> Vec<f32> {
+///
+/// Phase 6 — P1: made `pub` so `ml::analysis` can call it once after
+/// depth inference and cache the result in `MLResults.filtered_depth_map`.
+/// `depth_to_flat` then reads the cache instead of recomputing on every
+/// pipeline invocation.
+pub fn median_filter_5x5(depth: &[f32], width: u32, height: u32) -> Vec<f32> {
     let w = width as usize;
     let h = height as usize;
     let n = w * h;
@@ -304,7 +458,7 @@ fn median_filter_5x5(depth: &[f32], width: u32, height: u32) -> Vec<f32> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Background threshold (Otsu or manual)
+// Background threshold fallback (Otsu or manual) — used only when SLIC missing
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn compute_bg_threshold(depth: &[f32], config: &DepthToFlatConfig) -> f32 {

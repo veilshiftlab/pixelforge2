@@ -34,7 +34,7 @@
 //! determine which mode to use. A dimension value of `-1` indicates dynamic.
 
 use crate::ml::preprocess::{
-    normalize_min_max, upsample_map_to_original, PreprocessConfig, preprocess,
+    normalize_percentile, upsample_map_to_original, PreprocessConfig, preprocess,
 };
 use crate::ml::session::{SessionManager, ModelType};
 use anyhow::{anyhow, Result};
@@ -174,7 +174,10 @@ impl TeedEdgeDetector {
             upsample_map_to_original(map_slice, map_w, map_h, &scale)
         };
 
-        normalize_min_max(&mut result);
+        // Phase 2 — C5: percentile normalization (5th/95th) instead of min-max.
+        // A few saturated edge pixels no longer collapse the dynamic range —
+        // mid-strength edges survive the threshold pass.
+        normalize_percentile(&mut result, 0.05, 0.95);
         Ok(result)
     }
 }
@@ -209,7 +212,9 @@ impl PlaceholderEdgeDetector {
             }
         }
 
-        normalize_min_max(&mut edges);
+        // Phase 2 — C5: percentile normalization for the placeholder too,
+        // so the Sobel fallback behaves consistently with the model path.
+        normalize_percentile(&mut edges, 0.05, 0.95);
         Ok(edges)
     }
 }

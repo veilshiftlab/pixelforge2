@@ -63,8 +63,8 @@ fn main() {
         SlicConfig::default(),
     );
 
-    // Test 6: Vary SLIC K
-    for k in [3, 5, 8] {
+    // Test 6: Vary SLIC K (Phase 7+: range widened to 5-128)
+    for k in [5, 16, 32, 64] {
         let name = format!("SLIC K={}", k);
         all_pass &= test_case(
             &name,
@@ -85,8 +85,8 @@ fn main() {
         );
     }
 
-    // Test 8: Outline styles
-    for style in [OutlineStyle::AutoContrast, OutlineStyle::AutoContrastWithHueShift, OutlineStyle::Black] {
+    // Test 8: Outline styles (Phase 7: AutoContrastWithHueShift removed → 2 variants)
+    for style in [OutlineStyle::AutoContrast, OutlineStyle::Black] {
         let name = format!("Outline style={:?}", style);
         all_pass &= test_case_with_edges(
             &name,
@@ -123,6 +123,7 @@ fn test_case(
 
     let ml = MLResults {
         depth_map: Some(depth_map),
+        filtered_depth_map: None,
         edge_map: Some(edge_map),
         slic_labels: Some(slic_labels),
         slic_labels_k: Some(slic_config.k),
@@ -175,6 +176,7 @@ fn test_case_with_edges(
 
     let ml = MLResults {
         depth_map: Some(depth_map),
+        filtered_depth_map: None,
         edge_map: Some(edge_map),
         slic_labels: Some(slic_labels),
         slic_labels_k: Some(5),

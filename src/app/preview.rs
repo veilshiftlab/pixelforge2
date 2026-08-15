@@ -12,9 +12,11 @@ pub fn draw(app: &mut PixelForgeApp, ctx: &egui::Context) {
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.horizontal(|ui| {
             for (tab, label) in [
-                (PreviewTab::Original, "📷 Original"),
-                (PreviewTab::MLMaps,   "🤖 ML Maps"),
-                (PreviewTab::Output,   "🎨 Output"),
+                (PreviewTab::Original,    "📷 Original"),
+                (PreviewTab::MLMaps,      "🤖 ML Maps"),
+                (PreviewTab::Flat,        "🎨 Flat (post-DTF)"),
+                (PreviewTab::Preprocessed, "📐 Preprocessed"),
+                (PreviewTab::Output,      "✨ Output"),
             ] {
                 if ui.selectable_label(app.preview_tab == tab, label).clicked() {
                     app.preview_tab = tab;
@@ -28,9 +30,11 @@ pub fn draw(app: &mut PixelForgeApp, ctx: &egui::Context) {
         ui.separator();
 
         match app.preview_tab {
-            PreviewTab::Original => original_panel(app, ui),
-            PreviewTab::MLMaps   => ml_panel(app, ui, ctx),
-            PreviewTab::Output   => output_panel(app, ui, ctx),
+            PreviewTab::Original    => original_panel(app, ui),
+            PreviewTab::MLMaps      => ml_panel(app, ui, ctx),
+            PreviewTab::Flat        => flat_panel(app, ui, ctx),
+            PreviewTab::Preprocessed => preprocessed_panel(app, ui, ctx),
+            PreviewTab::Output      => output_panel(app, ui, ctx),
         }
     });
 }
@@ -99,7 +103,11 @@ fn original_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ML Maps tab
+// ML Maps tab — Phase 1 fixes:
+//   • C3: NEAREST texture filtering (was LINEAR → gradient pixels)
+//   • P6: cached TextureHandles in app state (rebuilt only on ML change)
+//   • C4: 1:1 native zoom toggle for pixel-accurate inspection
+//   • U5: source resolution label next to each map
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn ml_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -125,10 +133,44 @@ fn ml_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
 
     let (img_w, img_h) = app.input_image.as_ref().unwrap().image.dimensions();
 
-    // Snapshot the lightweight parts before entering the collapsing closures
-    // so we don't hold a borrow on app.ml_results through the whole scroll area.
+    // ── Phase 1 — P6: rebuild cached textures only if missing ──────────────────
+    // The ML maps tab is the only consumer; we keep handles in app state and
+    // invalidate them in `processing::load_image` / `clear_image` / ML result
+    // arrival / SLIC recompute.
+    let needs_depth_tex = app.ml_depth_texture.is_none()
+        && app.ml_results.as_ref().and_then(|r| r.depth_map.as_deref()).is_some();
+    if needs_depth_tex {
+        if let Some(d) = app.ml_results.as_ref().and_then(|r| r.depth_map.as_deref()) {
+            app.ml_depth_texture = Some(build_map_texture(
+                ctx, "ml_depth_cached", d, img_w, img_h, MapKind::Turbo,
+            ));
+        }
+    }
+
+    let needs_edge_tex = app.ml_edge_texture.is_none()
+        && app.ml_results.as_ref().and_then(|r| r.edge_map.as_deref()).is_some();
+    if needs_edge_tex {
+        if let Some(e) = app.ml_results.as_ref().and_then(|r| r.edge_map.as_deref()) {
+            app.ml_edge_texture = Some(build_map_texture(
+                ctx, "ml_edge_cached", e, img_w, img_h, MapKind::Gray,
+            ));
+        }
+    }
+
+    let needs_slic_tex = app.ml_slic_texture.is_none()
+        && app.ml_results.as_ref().and_then(|r| r.slic_labels.as_deref()).is_some();
+    if needs_slic_tex {
+        if let Some(labels) = app.ml_results.as_ref().and_then(|r| r.slic_labels.as_deref()) {
+            app.ml_slic_texture = Some(build_slic_texture(
+                ctx, "ml_slic_cached", labels, img_w, img_h,
+            ));
+        }
+    }
+
+    // Snapshot lightweight state for the closures
     let has_depth = app.ml_results.as_ref().unwrap().depth_map.is_some();
     let has_edge  = app.ml_results.as_ref().unwrap().edge_map.is_some();
+    let has_slic  = app.ml_results.as_ref().unwrap().slic_labels.is_some();
 
     let depth_stats = app.ml_results.as_ref()
         .and_then(|r| r.depth_map.as_deref())
@@ -139,21 +181,6 @@ fn ml_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
             (mn, mx, av)
         });
 
-    // Build textures now (before the scroll area closure captures app)
-    let depth_tex = app.ml_results.as_ref()
-        .and_then(|r| r.depth_map.as_deref())
-        .and_then(|d| depth_texture(d, img_w, img_h, ctx));
-
-    let edge_tex = app.ml_results.as_ref()
-        .and_then(|r| r.edge_map.as_deref())
-        .and_then(|e| edge_texture(e, img_w, img_h, ctx));
-
-    // SLIC label map visualization — shows the superpixel regions so the user
-    // can see how the image is being segmented and tune K / spatial_weight.
-    let slic_tex = app.ml_results.as_ref()
-        .and_then(|r| r.slic_labels.as_ref())
-        .and_then(|labels| slic_label_texture(labels, img_w, img_h, ctx));
-
     let slic_info = app.ml_results.as_ref()
         .and_then(|r| r.slic_labels.as_ref())
         .map(|labels| {
@@ -163,19 +190,41 @@ fn ml_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
             (labels.len(), s.len())
         });
 
+    // Clone the Option<TextureHandle> (cheap Arc) so we can move into closures
+    // without borrowing app.
+    let depth_tex = app.ml_depth_texture.clone();
+    let edge_tex  = app.ml_edge_texture.clone();
+    let slic_tex  = app.ml_slic_texture.clone();
+    let native    = app.ml_maps_native;
+
     let mut rerun = false;
 
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        // ── Top toolbar: 1:1 toggle + zoom presets ───────────────────────────
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut app.ml_maps_native, "1:1 (native resolution)")
+                .on_hover_text(
+                    "Display each map at 1 source pixel = 1 screen pixel.\n\
+                     Disable to fit-to-width. Useful for inspecting exact ML output.");
+            ui.separator();
+            ui.label(egui::RichText::new(format!("Source: {}×{}", img_w, img_h)).small().weak());
+        });
+        ui.separator();
 
         // ── Depth map ───────────────────────────────────────────────────────
         ui.collapsing("📐 Depth Map", |ui| {
             if has_depth {
                 ui.colored_label(egui::Color32::GREEN, "✅ Generated");
                 if let Some((mn, mx, av)) = depth_stats {
-                    ui.label(format!("Range {:.3}–{:.3}  avg {:.3}", mn, mx, av));
+                    ui.label(egui::RichText::new(
+                        format!("Range {:.3}–{:.3}  avg {:.3}", mn, mx, av)
+                    ).small().weak());
                 }
+                ui.label(egui::RichText::new(
+                    format!("{}×{} (Depth-Anything V2)", img_w, img_h)
+                ).small().weak());
                 if let Some(ref tex) = depth_tex {
-                    map_image(ui, tex.id(), img_w, img_h);
+                    map_image(ui, tex.id(), img_w, img_h, native);
                 }
             } else {
                 ui.label("Not run");
@@ -186,8 +235,11 @@ fn ml_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.collapsing("✏ Edge Map (DexiNed)", |ui| {
             if has_edge {
                 ui.colored_label(egui::Color32::GREEN, "✅ Generated");
+                ui.label(egui::RichText::new(
+                    format!("{}×{} (DexiNed, ImageNet norm)", img_w, img_h)
+                ).small().weak());
                 if let Some(ref tex) = edge_tex {
-                    map_image(ui, tex.id(), img_w, img_h);
+                    map_image(ui, tex.id(), img_w, img_h, native);
                 }
             } else {
                 ui.label("Not run");
@@ -197,14 +249,19 @@ fn ml_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
 
         // ── SLIC regions ───────────────────────────────────────────────────
         ui.collapsing("🧩 SLIC Regions", |ui| {
-            if let Some(ref tex) = slic_tex {
+            if has_slic {
                 if let Some((n_pixels, n_clusters)) = slic_info {
-                    ui.label(format!("{} pixels, {} active clusters", n_pixels, n_clusters));
+                    ui.label(egui::RichText::new(
+                        format!("{}×{}  ·  {} pixels  ·  {} active clusters",
+                            img_w, img_h, n_pixels, n_clusters)
+                    ).small().weak());
                 }
                 ui.label(egui::RichText::new(
                     "Each color = one superpixel. Adjust K and Spatial weight in the left panel, then Re-process."
                 ).small().weak());
-                map_image(ui, tex.id(), img_w, img_h);
+                if let Some(ref tex) = slic_tex {
+                    map_image(ui, tex.id(), img_w, img_h, native);
+                }
             } else {
                 ui.label("Not computed — run Process once first.");
             }
@@ -214,10 +271,121 @@ fn ml_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
         if ui.add_enabled(!is_running, egui::Button::new("🔄 Re-run Analysis")).clicked() {
             rerun = true;
         }
+        let _ = native; // suppress unused warning
     });
 
     if rerun {
         super::processing::run_ml_analysis(app, ctx);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Flat (post-depth-to-flat) tab — Phase 1 — U6
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn flat_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
+    let is_running = matches!(app.processing, crate::processing::ProcessingState::Running(_));
+
+    let info = app.flat_color_image.as_ref().map(|img| {
+        let (w, h) = img.dimensions();
+        let tex = super::processing::upload_texture(ctx, "flat_preview", img);
+        (w, h, tex.id(), img as *const _ as usize)
+    });
+
+    if let Some((w, h, tex_id, _)) = info {
+        let available = ui.available_size();
+        let scale = fit_scale(w, h, available) * app.preview_zoom;
+        let dw = w as f32 * scale;
+        let dh = h as f32 * scale;
+
+        ui.horizontal(|ui| {
+            ui.label(format!("{}×{}  ·  post depth-to-flat  ·  {:.1}×", w, h, scale));
+            for (label, zoom) in [("Fit", 1.0f32), ("2×", 2.0), ("4×", 4.0)] {
+                if ui.small_button(label).clicked() { app.preview_zoom = zoom; }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_enabled(!is_running, egui::Button::new("🔄 Re-process")).clicked() {
+                    super::processing::process_image(app, ctx);
+                }
+            });
+        });
+
+        ui.separator();
+
+        egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+            let avail = ui.available_size();
+            ui.vertical(|ui| {
+                if dh < avail.y { ui.add_space((avail.y - dh) * 0.5); }
+                ui.horizontal(|ui| {
+                    if dw < avail.x { ui.add_space((avail.x - dw) * 0.5); }
+                    ui.image(egui::load::SizedTexture::new(tex_id, egui::Vec2::new(dw, dh)));
+                });
+            });
+        });
+    } else {
+        ui.vertical_centered(|ui| {
+            ui.add_space(80.0);
+            ui.label("Post-depth-to-flat image will appear here after processing.");
+            ui.add_space(12.0);
+            if ui.add_enabled(app.input_image.is_some() && !is_running, egui::Button::new("▶ Process Now")).clicked() {
+                super::processing::process_image(app, ctx);
+            }
+        });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Preprocessed (post-transform) tab — Phase 1 — U7
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn preprocessed_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
+    let is_running = matches!(app.processing, crate::processing::ProcessingState::Running(_));
+
+    let info = app.preprocessed_image.as_ref().map(|img| {
+        let (w, h) = img.dimensions();
+        let tex = super::processing::upload_texture(ctx, "preprocessed_preview", img);
+        (w, h, tex.id())
+    });
+
+    if let Some((w, h, tex_id)) = info {
+        let available = ui.available_size();
+        let scale = fit_scale(w, h, available) * app.preview_zoom;
+        let dw = w as f32 * scale;
+        let dh = h as f32 * scale;
+
+        ui.horizontal(|ui| {
+            ui.label(format!("{}×{}  ·  post-transform  ·  {:.1}×", w, h, scale));
+            for (label, zoom) in [("Fit", 1.0f32), ("2×", 2.0), ("4×", 4.0)] {
+                if ui.small_button(label).clicked() { app.preview_zoom = zoom; }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_enabled(!is_running, egui::Button::new("🔄 Re-process")).clicked() {
+                    super::processing::process_image(app, ctx);
+                }
+            });
+        });
+
+        ui.separator();
+
+        egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+            let avail = ui.available_size();
+            ui.vertical(|ui| {
+                if dh < avail.y { ui.add_space((avail.y - dh) * 0.5); }
+                ui.horizontal(|ui| {
+                    if dw < avail.x { ui.add_space((avail.x - dw) * 0.5); }
+                    ui.image(egui::load::SizedTexture::new(tex_id, egui::Vec2::new(dw, dh)));
+                });
+            });
+        });
+    } else {
+        ui.vertical_centered(|ui| {
+            ui.add_space(80.0);
+            ui.label("Post-transform image will appear here after processing.");
+            ui.add_space(12.0);
+            if ui.add_enabled(app.input_image.is_some() && !is_running, egui::Button::new("▶ Process Now")).clicked() {
+                super::processing::process_image(app, ctx);
+            }
+        });
     }
 }
 
@@ -327,65 +495,96 @@ fn drop_zone(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Texture builders — called once per frame while the maps tab is open.
-// egui caches textures by name and pixel data, so repeated calls with the
-// same data are a no-op after the first upload.
+// Texture builders — Phase 1 fixes:
+//   • C3: NEAREST filtering (was LINEAR → gradient pixels along map edges)
+//   • P6: cached in app state, rebuilt only when ML results change
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn depth_texture(depth: &[f32], w: u32, h: u32, ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    if depth.len() != (w * h) as usize { return None; }
-    let pixels: Vec<egui::Color32> = depth.iter()
-        .map(|&d| { let (r,g,b) = turbo(d.clamp(0.0,1.0)); egui::Color32::from_rgb(r,g,b) })
-        .collect();
-    Some(ctx.load_texture("ml_depth", egui::ColorImage { size: [w as usize, h as usize], pixels }, egui::TextureOptions::default()))
+#[derive(Clone, Copy)]
+enum MapKind {
+    Turbo,  // depth
+    Gray,   // edges
 }
 
-fn edge_texture(edges: &[f32], w: u32, h: u32, ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    if edges.len() != (w * h) as usize { return None; }
-    let pixels: Vec<egui::Color32> = edges.iter()
-        .map(|&e| { let v = (e.clamp(0.0,1.0)*255.0) as u8; egui::Color32::from_rgb(v,v,v) })
-        .collect();
-    Some(ctx.load_texture("ml_edges", egui::ColorImage { size: [w as usize, h as usize], pixels }, egui::TextureOptions::default()))
+/// Build a single egui texture from a flat f32 map. NEAREST filtering is
+/// critical — linear would interpolate between adjacent depth/edge values
+/// and produce the gradient pixels the user reported in the preview.
+fn build_map_texture(
+    ctx: &egui::Context,
+    name: &str,
+    data: &[f32],
+    w: u32,
+    h: u32,
+    kind: MapKind,
+) -> egui::TextureHandle {
+    let pixels: Vec<egui::Color32> = data.iter().map(|&v| {
+        let v = v.clamp(0.0, 1.0);
+        match kind {
+            MapKind::Turbo => {
+                let (r, g, b) = turbo(v);
+                egui::Color32::from_rgb(r, g, b)
+            }
+            MapKind::Gray => {
+                let g8 = (v * 255.0) as u8;
+                egui::Color32::from_rgb(g8, g8, g8)
+            }
+        }
+    }).collect();
+
+    ctx.load_texture(
+        name,
+        egui::ColorImage { size: [w as usize, h as usize], pixels },
+        egui::TextureOptions::NEAREST,
+    )
 }
 
-/// SLIC label map → colored texture. Each cluster ID gets a distinct color
-/// so the user can see how the image is being segmented.
-fn slic_label_texture(labels: &[u32], w: u32, h: u32, ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    if labels.len() != (w * h) as usize { return None; }
-
-    // Distinct colors for up to 16 cluster IDs (cycled if more)
-    let palette: [egui::Color32; 16] = [
-        egui::Color32::from_rgb(230,  25,  75),  // red
-        egui::Color32::from_rgb( 60, 180,  75),  // green
-        egui::Color32::from_rgb(255, 225,  25),  // yellow
-        egui::Color32::from_rgb(  0, 130, 200),  // blue
-        egui::Color32::from_rgb(245, 130,  48),  // orange
-        egui::Color32::from_rgb(145,  30, 180),  // purple
-        egui::Color32::from_rgb( 70, 240, 240),  // cyan
-        egui::Color32::from_rgb(240,  50, 230),  // magenta
-        egui::Color32::from_rgb(210, 245,  60),  // lime
-        egui::Color32::from_rgb(250, 190, 190),  // pink
-        egui::Color32::from_rgb(  0, 128, 128),  // teal
-        egui::Color32::from_rgb(230, 190, 255),  // lavender
-        egui::Color32::from_rgb(170, 110,  40),  // brown
-        egui::Color32::from_rgb(255, 250, 200),  // beige
-        egui::Color32::from_rgb(128, 128, 128),  // gray
-        egui::Color32::from_rgb(  0,   0,   0),  // black
+/// Build a colored texture from SLIC cluster labels. One color per cluster ID.
+fn build_slic_texture(
+    ctx: &egui::Context,
+    name: &str,
+    labels: &[u32],
+    w: u32,
+    h: u32,
+) -> egui::TextureHandle {
+    const PALETTE: [egui::Color32; 16] = [
+        egui::Color32::from_rgb(230,  25,  75),
+        egui::Color32::from_rgb( 60, 180,  75),
+        egui::Color32::from_rgb(255, 225,  25),
+        egui::Color32::from_rgb(  0, 130, 200),
+        egui::Color32::from_rgb(245, 130,  48),
+        egui::Color32::from_rgb(145,  30, 180),
+        egui::Color32::from_rgb( 70, 240, 240),
+        egui::Color32::from_rgb(240,  50, 230),
+        egui::Color32::from_rgb(210, 245,  60),
+        egui::Color32::from_rgb(250, 190, 190),
+        egui::Color32::from_rgb(  0, 128, 128),
+        egui::Color32::from_rgb(230, 190, 255),
+        egui::Color32::from_rgb(170, 110,  40),
+        egui::Color32::from_rgb(255, 250, 200),
+        egui::Color32::from_rgb(128, 128, 128),
+        egui::Color32::from_rgb(  0,   0,   0),
     ];
-
     let pixels: Vec<egui::Color32> = labels.iter()
-        .map(|&label| palette[(label as usize) % palette.len()])
+        .map(|&label| PALETTE[(label as usize) % PALETTE.len()])
         .collect();
-
-    Some(ctx.load_texture("ml_slic", egui::ColorImage { size: [w as usize, h as usize], pixels }, egui::TextureOptions::default()))
+    ctx.load_texture(
+        name,
+        egui::ColorImage { size: [w as usize, h as usize], pixels },
+        egui::TextureOptions::NEAREST,
+    )
 }
 
-/// Display a map scaled to fit the available panel width (never upscale)
-fn map_image(ui: &mut egui::Ui, id: egui::TextureId, map_w: u32, map_h: u32) {
-    let avail = ui.available_width();
-    let scale = (avail / map_w as f32).min(1.0);
-    let dw = map_w as f32 * scale;
-    let dh = map_h as f32 * scale;
+/// Display a map. When `native` is true, render at 1:1 (1 source pixel = 1
+/// screen pixel); otherwise fit-to-width. Both modes use NEAREST filtering
+/// because the texture itself was uploaded with NEAREST.
+fn map_image(ui: &mut egui::Ui, id: egui::TextureId, map_w: u32, map_h: u32, native: bool) {
+    let (dw, dh) = if native {
+        (map_w as f32, map_h as f32)
+    } else {
+        let avail = ui.available_width();
+        let scale = (avail / map_w as f32).min(1.0);
+        (map_w as f32 * scale, map_h as f32 * scale)
+    };
     ui.image(egui::load::SizedTexture::new(id, egui::Vec2::new(dw, dh)));
 }
 
