@@ -45,6 +45,8 @@ pub fn load_image(app: &mut PixelForgeApp, path: &std::path::Path, ctx: &egui::C
             app.ml_depth_texture = None;
             app.ml_edge_texture  = None;
             app.ml_slic_texture  = None;
+            // Phase 8 — clear stale warnings from any previous image
+            app.pipeline_warnings.clear();
 
             log::info!("Loaded: {}", path.display());
         }
@@ -64,6 +66,8 @@ pub fn clear_image(app: &mut PixelForgeApp) {
     app.ml_depth_texture = None;
     app.ml_edge_texture  = None;
     app.ml_slic_texture  = None;
+    // Phase 8 — clear stale warnings
+    app.pipeline_warnings.clear();
 }
 
 /// Refresh the input image texture to reflect current processor transformations
@@ -503,6 +507,10 @@ pub fn run_ml_analysis(app: &mut PixelForgeApp, ctx: &egui::Context) {
 pub fn process_image(app: &mut PixelForgeApp, ctx: &egui::Context) {
     if app.input_image.is_none() || app.image_processor.is_none() { return; }
 
+    // Phase 8 — clear stale warnings from the previous run. New warnings
+    // will be populated by `pipeline::run` and surfaced in the preview banner.
+    app.pipeline_warnings.clear();
+
     app.processing = ProcessingState::Running(ProcessingStatus {
         progress: 0.05,
         stage: "Starting…".into(),
@@ -593,6 +601,9 @@ pub fn process_image(app: &mut PixelForgeApp, ctx: &egui::Context) {
     // Store intermediates for debugging
     app.preprocessed_image = output.preprocessed;
     app.flat_color_image   = output.flat;
+
+    // Phase 8 — surface pipeline warnings to the UI.
+    app.pipeline_warnings = output.warnings;
 
     // Upload final texture
     let texture = upload_texture(ctx, "output_image", &output.image);

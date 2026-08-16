@@ -1,17 +1,37 @@
 //! Edge detection and drawing implementation
 //!
-//! # Phase 2 — Edge Pipeline Overhaul
+//! # Phase 3 + Phase 4 — Edge pipeline rework
 //!
-//! The edge pipeline now produces crisp, single-pixel-wide line segments
-//! composited at the correct location with **local-contrast** color, instead
-//! of the previous "colored overlay mask" approach that used one global
-//! palette color for every edge in the image.
+//! Phase 3 adds a cleanup stage between skeletonization and classification:
+//! gap-bridging, isolated-noise drop, and short-segment drop. The result is
+//! cleaner, more continuous edge lines with less single-pixel noise.
 //!
-//! ## Pipeline
+//! Phase 4 replaces the old single `AutoContrast` outline mode with three
+//! explicit modes (see `OutlineStyle`):
+//! - `LocalColorShift` (default) — edge = local mean Lab, shifted darker
+//!   and optionally hue-rotated, snapped to nearest palette entry.
+//! - `Black` — fixed darkest palette color.
+//! - `MaxContrast` — the old AutoContrast behavior (max-ΔE from local mean).
+//!
+//! # Phase 6 — Sobel fallback percentile normalization
+//!
+//! The Sobel fallback path (used when ML edge detection is unavailable) now
+//! percentile-normalizes the gradient (5/95) before thresholding, so the
+//! `teed_threshold` slider works on both ML and Sobel paths. Previously the
+//! Sobel path hardcoded threshold=0.3 and ignored the user's setting.
+//!
+//! # Phase 7 — EdgeMode::Internal fallback fix
+//!
+//! When SLIC labels are unavailable, `EdgeMode::Internal` no longer silently
+//! behaves like `EdgeMode::Both`. It falls back to border-touching edges only
+//! (silhouette edges detectable without region labels) and emits a warning.
+//! `Outlines` and `Both` keep their backward-compatible behavior.
+//!
+//! # Full pipeline
 //!
 //! 1. **Edge map normalization** (`ml/models/teed.rs`): percentile (5/95)
 //!    instead of min-max. A few saturated pixels no longer collapse the
-//!    dynamic range.
+//!    dynamic range. Phase 6: Sobel fallback now does the same.
 //! 2. **Downsample to pixel-art resolution**: **max-pool** the full-res edge
 //!    map (preserves sparse 1px lines that average-pooling diluted below
 //!    threshold — the source of "edges break midway").
@@ -21,17 +41,19 @@
 //!    Weak edges connected to strong seeds survive; isolated noise drops.
 //! 5. **Zhang-Suen skeletonization**: thins the binary mask to a true
 //!    1-pixel-wide line network. This is the "make it lines not pixels" step.
-//! 6. **Edge-mode classification** (C9): if SLIC labels are available, an
-//!    edge pixel is classified as `Outline` if its 3×3 neighborhood spans
-//!    ≥2 cluster labels (silhouette), else `Internal` (within-region detail).
-//!    `EdgeMode::Outlines` keeps only outlines; `Internal` keeps only
-//!    internal; `Both` keeps everything.
-//! 7. **Compositing** with local-contrast color: for each edge pixel, take
-//!    the mean Lab color of its 3×3 neighborhood and pick the palette color
-//!    that **maximizes** Lab ΔE from that local mean. Outline color now
-//!    varies across the image — a blue attire edge gets a complementary
-//!    color, the jawline edge gets a different color.
-//! 8. **Edge-direction AA**: if `anti_alias_edges` is on, apply 2-tap
+//! 6. **Phase 3 — Cleanup**: gap-bridging (connect skeleton segments
+//!    separated by 1-2px gaps), isolated-noise drop (remove skeleton pixels
+//!    with zero skeleton neighbors), short-segment drop (remove connected
+//!    components shorter than `min_segment_length`).
+//! 7. **Edge-mode classification** (C9 + Phase 7): if SLIC labels are
+//!    available, an edge pixel is classified as `Outline` if its 3×3
+//!    neighborhood spans ≥2 cluster labels (silhouette), else `Internal`
+//!    (within-region detail). `EdgeMode::Outlines` keeps only outlines;
+//!    `Internal` keeps only internal; `Both` keeps everything. When SLIC
+//!    is missing, `Internal` falls back to border-touching edges + warns.
+//! 8. **Phase 4 — Compositing**: color each edge pixel according to
+//!    `outline_style` (see `compute_outline_color`).
+//! 9. **Edge-direction AA**: if `anti_alias_edges` is on, apply 2-tap
 //!    blending **only along the line's normal direction** (per-polyline).
 //!    Interior palette pixels are untouched — no more full-image blur.
 //!
@@ -40,7 +62,8 @@
 //! Outlines are drawn **after** palette quantization and use the palette's
 //! own colors (never out-of-palette colors). Strict palettes like Game Boy
 //! are safe — `OutlineStyle::Black` falls back to the palette's darkest
-//! entry when local-contrast would otherwise pick a non-black color.
+//! entry. `LocalColorShift` snaps its shifted color to the nearest palette
+//! entry, so it's also palette-legal.
 
 use super::palette::{PaletteLab, rgb_to_lab};
 use super::{EdgeConfig, EdgeMode, OutlineStyle, Palette};
@@ -65,12 +88,17 @@ use palette::Lab;
 /// `slic_labels` (optional, post-transform resolution) drives the
 /// `EdgeMode::Internal` vs `Outlines` classification. When `None`, all
 /// edges are treated as outlines (backward-compatible behavior).
+///
+/// Phase 8: `warnings` is appended to when a silent fallback occurs inside
+/// this function (e.g. the Phase 7 Internal-mode SLIC fallback in
+/// `classify_edges`). The caller surfaces these to the UI.
 pub fn draw_edges(
     input: &DynamicImage,
     ml_results: Option<&MLResults>,
     original_dims: (u32, u32),
     config: &EdgeConfig,
     palette: &Palette,
+    warnings: &mut Vec<String>,
 ) -> Result<DynamicImage> {
     if matches!(config.edge_mode, EdgeMode::None) {
         return Ok(input.clone());
@@ -81,27 +109,47 @@ pub fn draw_edges(
 
     // ── Detect edges ────────────────────────────────────────────────────────
     // Prefer ML edge map; fall back to Sobel when the model isn't available.
+    // Phase 6: Sobel fallback now respects `config.teed_threshold` (was
+    // hardcoded 0.3). The gradient is percentile-normalized (5/95) so the
+    // threshold is on the same scale as ML edge probabilities.
+    // Phase 8: if ML results exist but no edge_map, warn that Sobel fallback
+    // is in use (the user enabled ML but the edge model didn't load).
     let edge_mask = if let Some(ml) = ml_results {
         if let Some(edge_map) = &ml.edge_map {
             downsample_edge_mask(edge_map, original_dims, width, height, config.teed_threshold)
         } else {
-            sobel_edge_mask(input, 0.3)
+            let msg = "ML results present but edge_map missing; using Sobel fallback. \
+                       (Edge detection model may not have loaded.)";
+            log::warn!("{}", msg);
+            warnings.push(msg.into());
+            sobel_edge_mask(input, config.teed_threshold)
         }
     } else {
-        sobel_edge_mask(input, 0.3)
+        // No ML at all — Sobel fallback. Don't warn here; the user explicitly
+        // didn't run ML analysis. The pipeline caller can detect ml_results
+        // absence separately if desired.
+        sobel_edge_mask(input, config.teed_threshold)
     };
 
     // ── Skeletonize (C1) — thin to 1px-wide ridges ──────────────────────────
     let skeleton = skeletonize(&edge_mask, width, height);
 
+    // ── Phase 3 — Cleanup: gap-bridging + noise drop + short-segment drop ───
+    // Produces a cleaner line network with fewer single-pixel noise artifacts
+    // and fewer broken-line gaps. Output is a binary mask (255 = edge, 0 = bg).
+    let cleaned = cleanup_edge_mask(&skeleton, width, height, config.min_segment_length);
+
     // ── Edge-mode classification (C9) — Internal vs Outlines ────────────────
     // If SLIC labels are available at the post-transform resolution, classify
     // each edge pixel: outline if its 3×3 neighborhood spans ≥2 labels.
+    // Phase 8: pass `warnings` so the Phase 7 Internal-mode fallback can push.
     let slic_labels: Option<&[u32]> = ml_results
         .and_then(|ml| ml.slic_labels.as_deref());
-    let classification = classify_edges(&skeleton, slic_labels, width, height, config.edge_mode);
+    let classification = classify_edges(
+        &cleaned, slic_labels, width, height, config.edge_mode, warnings,
+    );
 
-    // ── Compositing with local-contrast color (C2) ─────────────────────────
+    // ── Phase 4 — Compositing with chosen outline style ─────────────────────
     let palette_lab = PaletteLab::from_palette(palette);
 
     for y in 0..height {
@@ -124,7 +172,7 @@ pub fn draw_edges(
 
     // ── Edge-direction AA (C10) ─────────────────────────────────────────────
     if config.anti_alias_edges {
-        anti_alias_edges_directional(&mut output, &skeleton, width, height);
+        anti_alias_edges_directional(&mut output, &cleaned, width, height);
     }
 
     Ok(DynamicImage::ImageRgba8(output))
@@ -313,6 +361,187 @@ fn skeletonize(mask: &[u8], width: u32, height: u32) -> Vec<u8> {
     img.iter().map(|&v| if v > 0 { 255 } else { 0 }).collect()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 3 — Edge mask cleanup (gap-bridging + noise drop + short-segment drop)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Clean up a skeletonized edge mask.
+///
+/// Three sub-stages, applied in order:
+///
+/// 1. **Gap-bridging**: for each skeleton pixel, look in a 5×5 neighborhood
+///    for other skeleton pixels that aren't 8-connected to it. If found,
+///    draw a Bresenham line connecting them. One pass only — avoids
+///    over-connecting distinct features.
+///
+/// 2. **Isolated-noise drop**: remove skeleton pixels with zero skeleton
+///    neighbors in 8-connectivity. These are single-pixel noise that
+///    can't be part of a real line.
+///
+/// 3. **Short-segment drop**: run connected-components labeling (8-conn)
+///    on the skeleton and drop components shorter than `min_segment_length`
+///    pixels. Removes small noise clusters that survived step 2.
+///
+/// Input/output: binary mask, 255 = edge, 0 = background.
+fn cleanup_edge_mask(
+    skeleton: &[u8],
+    width: u32,
+    height: u32,
+    min_segment_length: u32,
+) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let n = w * h;
+    if skeleton.len() < n {
+        return skeleton.to_vec();
+    }
+
+    // Working copy as bool for efficiency.
+    let mut mask: Vec<bool> = skeleton.iter().map(|&v| v > 0).collect();
+
+    // ── Step 1: Gap-bridging (single pass) ──────────────────────────────────
+    // Snapshot before modification so we read original skeleton state.
+    let snap = mask.clone();
+    for y in 0..h {
+        for x in 0..w {
+            let idx = y * w + x;
+            if !snap[idx] { continue; }
+
+            // Look in 5×5 (Chebyshev distance 2) for other skeleton pixels
+            // that aren't 8-connected (distance > 1).
+            for dy in -2i32..=2 {
+                for dx in -2i32..=2 {
+                    if dx.abs() <= 1 && dy.abs() <= 1 { continue; }  // skip 3×3
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 { continue; }
+                    let nidx = (ny as usize) * w + (nx as usize);
+                    if !snap[nidx] { continue; }
+
+                    // Found a candidate endpoint within distance 2. Bridge
+                    // with a Bresenham line (interior pixels get set).
+                    draw_line_bresenham(&mut mask, x as i32, y as i32, nx, ny, w, h);
+                }
+            }
+        }
+    }
+
+    // ── Step 2: Isolated-noise drop ─────────────────────────────────────────
+    let snap = mask.clone();
+    for y in 0..h {
+        for x in 0..w {
+            let idx = y * w + x;
+            if !snap[idx] { continue; }
+
+            let mut has_neighbor = false;
+            'neigh: for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    if dx == 0 && dy == 0 { continue; }
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 { continue; }
+                    let nidx = (ny as usize) * w + (nx as usize);
+                    if snap[nidx] {
+                        has_neighbor = true;
+                        break 'neigh;
+                    }
+                }
+            }
+            if !has_neighbor {
+                mask[idx] = false;
+            }
+        }
+    }
+
+    // ── Step 3: Short-segment drop (connected-components labeling, 8-conn) ──
+    if min_segment_length > 1 {
+        let mut labels: Vec<u32> = vec![0; n];
+        let mut component_sizes: Vec<u32> = vec![0];  // label 0 = background
+        let mut next_label: u32 = 1;
+        let mut queue: Vec<usize> = Vec::new();
+
+        for seed in 0..n {
+            if !mask[seed] || labels[seed] != 0 { continue; }
+
+            // BFS the connected component starting at `seed`.
+            let label = next_label;
+            next_label += 1;
+            component_sizes.push(0);
+            let mut size = 0u32;
+
+            queue.clear();
+            queue.push(seed);
+            labels[seed] = label;
+
+            while let Some(i) = queue.pop() {
+                size += 1;
+                let cx = i % w;
+                let cy = i / w;
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        if dx == 0 && dy == 0 { continue; }
+                        let nx = cx as i32 + dx;
+                        let ny = cy as i32 + dy;
+                        if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 { continue; }
+                        let ni = (ny as usize) * w + (nx as usize);
+                        if mask[ni] && labels[ni] == 0 {
+                            labels[ni] = label;
+                            queue.push(ni);
+                        }
+                    }
+                }
+            }
+
+            component_sizes[label as usize] = size;
+        }
+
+        // Drop components shorter than the threshold.
+        for i in 0..n {
+            let lbl = labels[i] as usize;
+            if lbl == 0 { continue; }
+            if component_sizes[lbl] < min_segment_length {
+                mask[i] = false;
+            }
+        }
+    }
+
+    mask.iter().map(|&v| if v { 255 } else { 0 }).collect()
+}
+
+/// Draw a Bresenham line between two points, setting interior pixels to `true`.
+/// Endpoints are assumed already set by the caller. Used by gap-bridging.
+fn draw_line_bresenham(
+    mask: &mut [bool],
+    x0: i32, y0: i32,
+    x1: i32, y1: i32,
+    w: usize, h: usize,
+) {
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let mut x = x0;
+    let mut y = y0;
+
+    loop {
+        if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
+            let idx = (y as usize) * w + (x as usize);
+            mask[idx] = true;
+        }
+        if x == x1 && y == y1 { break; }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+    }
+}
+
 /// One sub-iteration of Zhang-Suen. Returns the list of pixel indices to
 /// remove. `sub_a = true` for sub-iteration A, `false` for B.
 ///
@@ -387,14 +616,22 @@ fn zhang_suen_pass(img: &[u8], w: usize, h: usize, sub_a: bool) -> Vec<usize> {
 ///   exactly 1 SLIC label (within-region detail).
 /// - `EdgeMode::Both`: keep all skeleton pixels.
 ///
-/// When SLIC labels are unavailable, every edge is treated as an outline
-/// (preserves previous behavior).
+/// When SLIC labels are unavailable:
+/// - `Outlines` and `Both` fall back to keeping all skeleton pixels (every
+///   edge is treated as an outline — backward-compatible).
+/// - `Internal` falls back to border-touching edges only (silhouette edges
+///   detected without region labels) and emits a warning. Previously it
+///   silently behaved like `Both`, which was incorrect — internal edges
+///   cannot be identified without region labels. Phase 7 fix.
+///   Phase 8: the warning is now also pushed to `warnings` so the UI can
+///   surface it (was previously only `log::warn!`).
 fn classify_edges(
     skeleton: &[u8],
     slic_labels: Option<&[u32]>,
     width: u32,
     height: u32,
     mode: EdgeMode,
+    warnings: &mut Vec<String>,
 ) -> Vec<bool> {
     let n = (width * height) as usize;
     let mut keep = vec![false; n];
@@ -405,9 +642,43 @@ fn classify_edges(
     let labels = match slic_labels {
         Some(l) if l.len() >= n => l,
         _ => {
-            // No SLIC labels — treat every edge as outline
-            for i in 0..n {
-                keep[i] = skeleton[i] > 0;
+            // No SLIC labels — mode-aware fallback (Phase 7).
+            match mode {
+                EdgeMode::Outlines | EdgeMode::Both => {
+                    // No SLIC → treat all edges as outlines (backward-compat).
+                    for i in 0..n {
+                        keep[i] = skeleton[i] > 0;
+                    }
+                }
+                EdgeMode::Internal => {
+                    // No SLIC → can't identify internal edges.
+                    // Fall back to border-touching edges only (detectable
+                    // without SLIC) and warn. Phase 7 fix: previously
+                    // this silently behaved like Both.
+                    // Phase 8: also push to `warnings` so the UI surfaces it.
+                    let msg = "EdgeMode::Internal requires SLIC labels; \
+                               falling back to border-touching edges only.";
+                    log::warn!("{}", msg);
+                    warnings.push(msg.into());
+                    let wu = w as usize;
+                    let hu = h as usize;
+                    for y in 0..hu {
+                        for x in 0..wu {
+                            let idx = y * wu + x;
+                            if skeleton[idx] == 0 { continue; }
+                            // Border-touching = pixel is on image edge OR
+                            // has a non-skeleton 4-neighbor (silhouette).
+                            let on_border = x == 0 || y == 0
+                                || x == wu - 1 || y == hu - 1;
+                            let has_bg_neighbor = (x > 0 && skeleton[idx - 1] == 0)
+                                || (x < wu - 1 && skeleton[idx + 1] == 0)
+                                || (y > 0 && skeleton[idx - wu] == 0)
+                                || (y < hu - 1 && skeleton[idx + wu] == 0);
+                            keep[idx] = on_border || has_bg_neighbor;
+                        }
+                    }
+                }
+                EdgeMode::None => {}  // already handled by early return in draw_edges
             }
             return keep;
         }
@@ -454,25 +725,21 @@ fn classify_edges(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Outline color — local-contrast (C2) + Black fallback
+// Phase 4 — Outline color: LocalColorShift / Black / MaxContrast
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Compute the outline color for an edge pixel.
 ///
-/// - `AutoContrast` (default): local-contrast — pick the palette color that
-///   maximizes Lab ΔE from the mean Lab of the 3×3 neighborhood around the
-///   edge pixel. Outline color varies across the image based on local
-///   background. (Phase 2 implementation.)
+/// Phase 4: three explicit modes (see `OutlineStyle`).
 ///
-///   ET-5(b): `edge_darkener_strength` blends the local-contrast result
-///   toward the darkest palette color. At 0.0, pure local-contrast. At 1.0,
-///   pure darkest (same as `Black` style). Default 0.3 = 70% local-contrast
-///   + 30% darkest. Gives edges a slight dark bias for readability without
-///   losing the local-contrast variation.
-///
+/// - `LocalColorShift` (default): edge color = local 3×3 mean Lab, shifted
+///   darker by `edge_l_shift` L* units and optionally hue-rotated by
+///   `edge_hue_shift` degrees, then snapped to nearest palette entry.
+///   Subtle, follows local color family.
 /// - `Black`: always use the palette's darkest color (lowest Lab L*).
-///   For strict retro palettes (Game Boy, NES) where outline color must
-///   be fixed.
+///   For strict retro palettes (Game Boy, NES).
+/// - `MaxContrast`: the old AutoContrast behavior — max-ΔE from local mean,
+///   optionally blended toward darkest by `edge_darkener_strength`. Loud.
 fn compute_outline_color(
     image: &RgbaImage,
     x: u32,
@@ -486,24 +753,13 @@ fn compute_outline_color(
         return Rgba([0, 0, 0, 255]);
     }
 
-    // Find the darkest palette color (lowest Lab L*) — used by both styles.
-    let mut darkest_idx = 0usize;
-    let mut darkest_l = f32::MAX;
-    for (i, &lab) in palette_lab.lab.iter().enumerate() {
-        if lab.l < darkest_l {
-            darkest_l = lab.l;
-            darkest_idx = i;
-        }
-    }
-    let darkest_rgb = palette_lab.rgb[darkest_idx];
-
     match config.outline_style {
         OutlineStyle::Black => {
-            darkest_rgb
+            darkest_palette_color(palette_lab)
         }
 
-        OutlineStyle::AutoContrast => {
-            // Local-contrast: max ΔE from mean Lab of 3×3 neighborhood.
+        OutlineStyle::MaxContrast => {
+            // Old AutoContrast: max ΔE from local mean.
             let mean_lab = neighborhood_mean_lab(image, x, y, width, height);
             let local_contrast = palette_lab.furthest_from(mean_lab);
 
@@ -512,10 +768,62 @@ fn compute_outline_color(
             if t < 0.001 {
                 local_contrast
             } else {
-                blend_rgb(local_contrast, darkest_rgb, t)
+                blend_rgb(local_contrast, darkest_palette_color(palette_lab), t)
             }
         }
+
+        OutlineStyle::LocalColorShift => {
+            // Local 3×3 mean Lab, shifted darker + optional hue rotation,
+            // then snapped to nearest palette entry.
+            let mean_lab = neighborhood_mean_lab(image, x, y, width, height);
+            let shifted = shift_lab(
+                mean_lab,
+                -config.edge_l_shift,  // negative = darker
+                config.edge_hue_shift,
+            );
+            palette_lab.nearest_to(shifted)
+        }
     }
+}
+
+/// Return the palette entry with the lowest Lab L* (darkest color).
+/// Used by `Black` and `MaxContrast` modes.
+fn darkest_palette_color(palette_lab: &PaletteLab) -> Rgba<u8> {
+    if palette_lab.rgb.is_empty() {
+        return Rgba([0, 0, 0, 255]);
+    }
+    let mut darkest_idx = 0usize;
+    let mut darkest_l = f32::MAX;
+    for (i, &lab) in palette_lab.lab.iter().enumerate() {
+        if lab.l < darkest_l {
+            darkest_l = lab.l;
+            darkest_idx = i;
+        }
+    }
+    palette_lab.rgb[darkest_idx]
+}
+
+/// Shift a Lab color: apply `dl` to L* (clamped to [0, 100]) and rotate the
+/// a*b* hue by `hue_deg` degrees (counter-clockwise in the a*b* plane).
+///
+/// Fast path: if `hue_deg` is approximately 0, skip the polar conversion.
+fn shift_lab(lab: Lab, dl: f32, hue_deg: f32) -> Lab {
+    let new_l = (lab.l + dl).clamp(0.0, 100.0);
+
+    if hue_deg.abs() < 0.001 {
+        return Lab::new(new_l, lab.a, lab.b);
+    }
+
+    // Convert (a, b) → polar (C, h), rotate h, convert back.
+    let a = lab.a as f64;
+    let b = lab.b as f64;
+    let chroma = (a * a + b * b).sqrt();
+    let hue = b.atan2(a);  // radians
+    let rotated = hue + (hue_deg as f64).to_radians();
+    let new_a = (chroma * rotated.cos()) as f32;
+    let new_b = (chroma * rotated.sin()) as f32;
+
+    Lab::new(new_l, new_a, new_b)
 }
 
 /// Linear RGB blend: `result = a * (1 - t) + b * t`.
@@ -655,9 +963,33 @@ fn put_pixel_safe_offset(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Sobel-based binary edge mask — used when the ML edge model is unavailable.
+///
+/// Phase 6: percentile-normalizes the gradient (5/95) before thresholding so
+/// the threshold is on the same scale as ML edge probabilities. Previously
+/// the gradient was raw magnitude / 255 (different distribution than ML
+/// probabilities), and the threshold was hardcoded to 0.3 — so the user's
+/// `teed_threshold` slider did nothing when ML was unavailable.
 fn sobel_edge_mask(input: &DynamicImage, threshold: f32) -> Vec<u8> {
     let gradient = sobel_gradient(input);
-    gradient.iter().map(|&g| if g > threshold { 255 } else { 0 }).collect()
+    let normalized = percentile_normalize_5_95(&gradient);
+    normalized.iter().map(|&g| if g > threshold { 255 } else { 0 }).collect()
+}
+
+/// Percentile-normalize a slice to [0, 1] using the 5th and 95th percentiles
+/// as endpoints (robust to outliers, same scheme as ML edge map normalization
+/// in `ml/models/teed.rs`).
+fn percentile_normalize_5_95(values: &[f32]) -> Vec<f32> {
+    if values.is_empty() { return Vec::new(); }
+    // `percentiles` is `pub(crate)` in `depth_to_flat.rs`, re-exported at
+    // `crate::processing::*` via `pub use depth_to_flat::*`.
+    let (p5, p95) = crate::processing::percentiles(values, 0.05, 0.95);
+    let range = p95 - p5;
+    if range < 1e-6 {
+        return vec![0.0f32; values.len()];
+    }
+    values.iter()
+        .map(|&v| ((v - p5) / range).clamp(0.0, 1.0))
+        .collect()
 }
 
 /// Compute Sobel gradient magnitude

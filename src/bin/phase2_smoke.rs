@@ -35,8 +35,8 @@ fn main() {
         all_pass &= test_one(&image, &ml, edges, "default");
     }
 
-    // Test all 3 OutlineStyle variants (Phase 7: AutoContrastWithHueShift removed → 2 variants)
-    for style in [OutlineStyle::AutoContrast, OutlineStyle::Black] {
+    // Test all 3 Phase 4 OutlineStyle variants
+    for style in [OutlineStyle::LocalColorShift, OutlineStyle::Black, OutlineStyle::MaxContrast] {
         let edges = EdgeConfig { outline_style: style, edge_mode: EdgeMode::Both, ..Default::default() };
         all_pass &= test_one(&image, &ml, edges, "style");
     }

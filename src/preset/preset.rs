@@ -76,8 +76,6 @@ impl Preset {
                 edges: EdgeConfig {
                     edge_mode: crate::processing::EdgeMode::Outlines,
                     thickness: 1,
-                    edge_color_mode: crate::processing::EdgeColorMode::DarkestShade,
-                    custom_edge_color: egui::Color32::BLACK,
                     edge_darkener_strength: 0.3,
                     anti_alias_edges: false,
                     ..Default::default()
@@ -85,14 +83,8 @@ impl Preset {
                 palette: PaletteConfig {
                     mode: crate::processing::PaletteMode::Auto,
                     max_colors: 12,
-                    per_region_limit: false,
                     preset: crate::processing::PresetPalette::None,
                     custom_colors: Vec::new(),
-                    skin_override: None,
-                    hair_override: None,
-                    eye_override: None,
-                    lip_override: None,
-                    background_override: None,
                 },
             },
 
@@ -114,8 +106,6 @@ impl Preset {
                 edges: EdgeConfig {
                     edge_mode: crate::processing::EdgeMode::Both,
                     thickness: 1,
-                    edge_color_mode: crate::processing::EdgeColorMode::DarkestShade,
-                    custom_edge_color: egui::Color32::BLACK,
                     edge_darkener_strength: 0.4,
                     anti_alias_edges: false,
                     ..Default::default()
@@ -123,14 +113,8 @@ impl Preset {
                 palette: PaletteConfig {
                     mode: crate::processing::PaletteMode::Auto,
                     max_colors: 32,
-                    per_region_limit: false,
                     preset: crate::processing::PresetPalette::None,
                     custom_colors: Vec::new(),
-                    skin_override: None,
-                    hair_override: None,
-                    eye_override: None,
-                    lip_override: None,
-                    background_override: None,
                 },
             },
 
@@ -152,8 +136,6 @@ impl Preset {
                 edges: EdgeConfig {
                     edge_mode: crate::processing::EdgeMode::Outlines,
                     thickness: 1,
-                    edge_color_mode: crate::processing::EdgeColorMode::Black,
-                    custom_edge_color: egui::Color32::BLACK,
                     edge_darkener_strength: 0.2,
                     anti_alias_edges: false,
                     outline_style: crate::processing::OutlineStyle::Black,
@@ -162,14 +144,8 @@ impl Preset {
                 palette: PaletteConfig {
                     mode: crate::processing::PaletteMode::Preset,
                     max_colors: 4,
-                    per_region_limit: false,
                     preset: crate::processing::PresetPalette::GameBoy,
                     custom_colors: Vec::new(),
-                    skin_override: None,
-                    hair_override: None,
-                    eye_override: None,
-                    lip_override: None,
-                    background_override: None,
                 },
             },
         ]

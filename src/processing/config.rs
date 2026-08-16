@@ -130,8 +130,25 @@ pub struct DepthToFlatConfig {
     /// Regions with MAD below this get no shading (avoids amplifying noise in
     /// flat backgrounds / solid-color hair). Default 0.02, range 0.01–0.2.
     /// Lower = shade more regions (only truly flat regions are skipped).
+    ///
+    /// Phase 2: now gates BOTH the local and global shading signals on a
+    /// per-pixel basis. Previously only the local signal was zeroed for
+    /// flat regions; the global signal still applied and amplified ML depth
+    /// noise on flat anime faces. The flat mask now zeros the final blended
+    /// shading for pixels whose cluster MAD is below this threshold.
     #[serde(default = "default_dtf_mad_threshold")]
     pub mad_threshold: f32,
+
+    /// Maximum Lab L* shift DTF can apply, in L* units. Default 40.0
+    /// (range 0.0–100.0). The actual shift is `strength * l_shift_scale`
+    /// (clamped via the shading signal's [-1, 1] range).
+    ///
+    /// Phase 2: replaces the implicit `× 100` scale that produced ±60 L*
+    /// shifts at default `strength=0.6` — too aggressive, washed out
+    /// vibrant colors. Default 40 caps the shift at ±24 L*. Users wanting
+    /// the old behavior can set `l_shift_scale = 100`.
+    #[serde(default = "default_dtf_l_shift_scale")]
+    pub l_shift_scale: f32,
 
     /// Blend between local (per-region MAD) and global (whole-image min-max)
     /// depth shading. 0.0 = pure local (current behavior), 1.0 = pure global,
@@ -185,6 +202,11 @@ pub struct DepthToFlatConfig {
 fn default_dtf_strength() -> f32 { 0.6 }
 fn default_dtf_gamma() -> f32 { 0.8 }
 fn default_dtf_mad_threshold() -> f32 { 0.02 }
+/// Phase 2 — caps the DTF L* shift at a more reasonable level. The old
+/// implicit `× 100` produced ±60 L* shifts at default strength=0.6, washing
+/// out vibrant colors. Default 40 gives ±24 L* — visible shading without
+/// destroying original colors.
+fn default_dtf_l_shift_scale() -> f32 { 40.0 }
 /// Phase 3 — C6: bias toward global truth (0.6/0.4 split). User's complaint
 /// was "missing out on global depth values" — pure 0.5/0.5 blend destroyed
 /// both signals; 0.6/0.4 keeps global depth relationships dominant while
@@ -198,6 +220,7 @@ impl Default for DepthToFlatConfig {
             strength:              default_dtf_strength(),
             gamma:                 default_dtf_gamma(),
             mad_threshold:         default_dtf_mad_threshold(),
+            l_shift_scale:         default_dtf_l_shift_scale(),
             global_depth_weight:   default_dtf_global_depth_weight(),
             use_otsu_threshold:    true,
             bg_depth_threshold:    0.6,
@@ -214,27 +237,29 @@ impl Default for DepthToFlatConfig {
 
 /// Outline coloring strategy for the edge pass.
 ///
-/// Phase 7 — H4: removed `AutoContrastWithHueShift` variant (it was a no-op
-/// kept for backwards-compat; the local-contrast `AutoContrast` mode from
-/// Phase 2 supersedes it). Also removed the associated `delta` and `hue_shift`
-/// fields from `EdgeConfig`.
+/// Phase 4: replaced the old `AutoContrast` variant (max-ΔE from local mean,
+/// which often produced jarringly different hues) with three explicit modes:
+///
+/// - `LocalColorShift` (default): edge color = local 3×3 mean Lab, shifted
+///   darker by `edge_l_shift` L* units and optionally hue-rotated by
+///   `edge_hue_shift` degrees, then snapped to nearest palette entry.
+///   Subtle, follows local color family.
+/// - `Black`: always use the palette's darkest color. For strict retro
+///   palettes (Game Boy, NES).
+/// - `MaxContrast`: the old AutoContrast behavior — max-ΔE from local mean.
+///   Loud, often a different hue than surroundings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum OutlineStyle {
-    /// Local-contrast: pick the palette color that maximizes Lab ΔE from
-    /// the 3×3 neighborhood mean of the edge pixel. Outline color varies
-    /// across the image based on local background. (Phase 2 implementation.)
     #[default]
-    AutoContrast,
-    /// Fixed darkest palette color — for retro palettes (Game Boy, NES).
+    LocalColorShift,
     Black,
+    MaxContrast,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeConfig {
     pub edge_mode: EdgeMode,
     pub thickness: u32,
-    pub edge_color_mode: EdgeColorMode,
-    pub custom_edge_color: egui::Color32,
     pub edge_darkener_strength: f32,
     pub anti_alias_edges: bool,
     // ── Edge pass ────────────────────────────────────────────────────────────
@@ -245,21 +270,43 @@ pub struct EdgeConfig {
     /// Default 0.3, range 0.1–0.7. Lower = more edges, higher = only strong edges.
     #[serde(default = "default_teed_threshold")]
     pub teed_threshold: f32,
+
+    /// Phase 3 — Minimum length (in pixels) for a skeleton segment to survive
+    /// cleanup. Segments shorter than this are dropped as noise. Default 3,
+    /// range 1–20. Lower = keep more detail (and noise); higher = keep only
+    /// longer, more confident lines.
+    #[serde(default = "default_min_segment_length")]
+    pub min_segment_length: u32,
+
+    /// Phase 4 — L* shift applied to local mean Lab for `LocalColorShift` mode.
+    /// Positive = darker edges. Default 25.0, range 0.0–60.0.
+    #[serde(default = "default_edge_l_shift")]
+    pub edge_l_shift: f32,
+
+    /// Phase 4 — Hue rotation in degrees for `LocalColorShift` mode.
+    /// Default 0.0 (no rotation). Range -180.0–180.0. Positive rotates
+    /// counter-clockwise in Lab a*b* plane.
+    #[serde(default = "default_edge_hue_shift")]
+    pub edge_hue_shift: f32,
 }
 
 fn default_teed_threshold() -> f32 { 0.3 }
+fn default_min_segment_length() -> u32 { 3 }
+fn default_edge_l_shift() -> f32 { 25.0 }
+fn default_edge_hue_shift() -> f32 { 0.0 }
 
 impl Default for EdgeConfig {
     fn default() -> Self {
         Self {
             edge_mode: EdgeMode::Outlines,
             thickness: 1,
-            edge_color_mode: EdgeColorMode::DarkestShade,
-            custom_edge_color: egui::Color32::BLACK,
             edge_darkener_strength: 0.3,
             anti_alias_edges: false,
-            outline_style: OutlineStyle::AutoContrast,
+            outline_style: OutlineStyle::LocalColorShift,
             teed_threshold: default_teed_threshold(),
+            min_segment_length: default_min_segment_length(),
+            edge_l_shift: default_edge_l_shift(),
+            edge_hue_shift: default_edge_hue_shift(),
         }
     }
 }
@@ -273,14 +320,6 @@ pub enum EdgeMode {
     Both,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum EdgeColorMode {
-    Black,
-    #[default]
-    DarkestShade,
-    Custom,
-}
-
 // =============================================================================
 // Palette Configuration
 // =============================================================================
@@ -289,17 +328,8 @@ pub enum EdgeColorMode {
 pub struct PaletteConfig {
     pub mode: PaletteMode,
     pub max_colors: u32,
-    /// Inert after the repurpose: per-region palette limits required BiSeNet
-    /// segmentation, which is gone. Kept for preset-file backwards-compat.
-    #[serde(default)]
-    pub per_region_limit: bool,
     pub preset: PresetPalette,
     pub custom_colors: Vec<egui::Color32>,
-    pub skin_override: Option<Vec<egui::Color32>>,
-    pub hair_override: Option<Vec<egui::Color32>>,
-    pub eye_override: Option<egui::Color32>,
-    pub lip_override: Option<egui::Color32>,
-    pub background_override: Option<Vec<egui::Color32>>,
 }
 
 impl Default for PaletteConfig {
@@ -307,14 +337,8 @@ impl Default for PaletteConfig {
         Self {
             mode: PaletteMode::Auto,
             max_colors: 32,
-            per_region_limit: false,
             preset: PresetPalette::None,
             custom_colors: Vec::new(),
-            skin_override: None,
-            hair_override: None,
-            eye_override: None,
-            lip_override: None,
-            background_override: None,
         }
     }
 }

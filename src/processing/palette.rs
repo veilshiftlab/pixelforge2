@@ -1,7 +1,6 @@
 //! Palette generation and quantization
 
 use super::{PaletteConfig, PaletteMode, PresetPalette};
-use crate::ml::MLResults;
 use anyhow::Result;
 use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 use palette::{FromColor, Lab, Srgb};
@@ -131,11 +130,13 @@ impl PaletteLab {
     }
 }
 
-/// Generate palette from image
+/// Generate palette from image.
+///
+/// Phase 9: removed the unused `_ml_results` parameter (was a leftover from
+/// the dropped face-parsing pipeline; never read by any code path).
 pub fn generate_palette(
     input: &DynamicImage,
     config: &PaletteConfig,
-    _ml_results: Option<&MLResults>,
 ) -> Result<Palette> {
     match config.mode {
         PaletteMode::Auto => generate_auto_palette(input, config),
@@ -147,14 +148,29 @@ pub fn generate_palette(
     }
 }
 
-/// Auto-generate palette using k-means clustering
+/// Auto-generate palette using k-means clustering.
+///
+/// # Chroma-weighted subsampling (desaturation fix)
+///
+/// The palette is extracted from the image via k-means in Lab space. On
+/// real images, vibrant colors (blue dress, warm skin) are often a small
+/// minority of total pixels — the image is dominated by gray/dark regions
+/// (background, hair, shadows). Uniform random subsampling under-represents
+/// vibrant colors, causing k-means to allocate most centroids to gray
+/// regions and completely miss vibrant colors.
+///
+/// Fix: subsample with probability proportional to **chroma**
+/// (C = sqrt(a² + b²)). High-chroma pixels are oversampled, so k-means
+/// sees enough vibrant pixels to allocate dedicated centroids. This
+/// ensures the palette always contains entries for vibrant colors
+/// regardless of their pixel count in the original image.
 fn generate_auto_palette(
     input: &DynamicImage,
     config: &PaletteConfig,
 ) -> Result<Palette> {
     let (width, height) = input.dimensions();
 
-    // Extract all colors
+    // Extract all colors as Lab
     let mut colors: Vec<Lab> = Vec::new();
     for y in 0..height {
         for x in 0..width {
@@ -163,18 +179,76 @@ fn generate_auto_palette(
         }
     }
 
-    // Phase 6 — P3: subsample to 16K pixels before k-means.
-    // K-means is robust to subsampling — palette quality is unaffected
-    // (k-means converges to the same centroids with ~16K random samples
-    // as with millions). Cuts k-means runtime from O(N * K * iters) to
-    // O(16K * K * iters) — 60× speedup on a 1024² image.
+    // Chroma-weighted subsampling to 16K pixels.
+    //
+    // Each pixel gets a weight of (1 + chroma). High-chroma pixels are
+    // oversampled so k-means allocates centroids to vibrant regions.
+    //
+    // Why (1 + chroma) and not just chroma?
+    // - Pixels with chroma=0 (pure gray) still need representation (gray
+    //   is a valid and important color in most images).
+    // - (1 + chroma) ensures grays have a base weight of 1, while vibrant
+    //   pixels (chroma 30-80) get weight 31-81 — ~40-80× more likely to
+    //   be sampled than gray.
+    //
+    // Algorithm: weighted sampling without replacement via prefix-sum binary
+    // search. Builds a cumulative-weight array once (O(N)), then each sample
+    // is O(log N) via binary search. Total: O(N + S·log N) where S=16K and
+    // N=~1M → ~400K operations (was ~16 billion with the old linear scan).
+    // Duplicates handled by over-sampling 10% and deduplicating — collision
+    // rate is ~S/N ≈ 1.6%, so one extra pass is enough.
     const MAX_SAMPLES: usize = 16_384;
     let colors: Vec<Lab> = if colors.len() > MAX_SAMPLES {
-        use rand::seq::SliceRandom;
         let mut rng = rand::rngs::StdRng::seed_from_u64(42); // deterministic
-        let mut sample = colors;
-        sample.partial_shuffle(&mut rng, MAX_SAMPLES);
-        sample.into_iter().take(MAX_SAMPLES).collect()
+
+        // Compute weights: w[i] = 1 + chroma(colors[i])
+        let weights: Vec<f32> = colors.iter()
+            .map(|&c| 1.0 + (c.a * c.a + c.b * c.b).sqrt())
+            .collect();
+
+        // Build prefix-sum array for binary search.
+        // cumsum[i] = sum of weights[0..=i].
+        let mut cumsum: Vec<f64> = Vec::with_capacity(weights.len());
+        let mut acc = 0.0f64;
+        for &w in &weights {
+            acc += w as f64;
+            cumsum.push(acc);
+        }
+        let total_weight = acc;
+
+        // Weighted sampling with over-sampling + dedup.
+        // Generate ~10% extra samples to compensate for duplicate collisions,
+        // then dedup and take the first MAX_SAMPLES unique indices.
+        let target_unique = MAX_SAMPLES;
+        let mut sampled_indices: std::collections::HashSet<usize> =
+            std::collections::HashSet::with_capacity(target_unique);
+
+        // Keep sampling in batches until we have enough unique indices.
+        while sampled_indices.len() < target_unique {
+            let needed = target_unique - sampled_indices.len();
+            let batch_size = (needed * 110 / 100).max(64); // 10% extra, min 64
+            for _ in 0..batch_size {
+                let target = rng.gen::<f64>() * total_weight;
+                // Binary search for the first index where cumsum[i] >= target.
+                let idx = match cumsum.binary_search_by(|&c| {
+                    c.partial_cmp(&target).unwrap_or(std::cmp::Ordering::Equal)
+                }) {
+                    Ok(i) => i,
+                    Err(i) => i.min(weights.len() - 1),
+                };
+                sampled_indices.insert(idx);
+            }
+            // Safety: if we somehow can't make progress (extremely degenerate
+            // weight distribution), break to avoid infinite loop.
+            if sampled_indices.len() >= colors.len() {
+                break;
+            }
+        }
+
+        sampled_indices.into_iter()
+            .take(target_unique)
+            .map(|i| colors[i])
+            .collect()
     } else {
         colors
     };
@@ -269,6 +343,24 @@ pub fn apply_palette(
 /// and config always produces the same palette. Without this, `thread_rng()`
 /// gave different initial centroids on every call, causing the pipeline to
 /// produce different results on reprocess.
+///
+/// # Saturation preservation (desaturation fix)
+///
+/// Two changes prevent the "washed-out colors" bug where vibrant subject
+/// colors (blue dress, warm skin) collapsed to grayish centroids:
+///
+/// 1. **K-means++ initialization** (replaces uniform random sampling):
+///    spreads initial centroids across the color space so vibrant outliers
+///    get their own centroid from the start. Uniform random could place
+///    all centroids in the dominant gray/background region, causing
+///    vibrant colors to be absorbed into grayish clusters.
+///
+/// 2. **Medoid snap after convergence**: replaces each centroid with the
+///    actual pixel closest to it (the "medoid"). Mean-based centroids are
+///    synthetic averages that reduce chroma (opposite hue directions
+///    cancel). The medoid is a real color that exists in the image, so
+///    vibrant regions stay vibrant — the medoid of a blue-dress cluster
+///    is an actual blue pixel, not a grayish average.
 fn k_means(colors: &[Lab], k: usize) -> Vec<Rgba<u8>> {
     if colors.is_empty() || k == 0 {
         return vec![];
@@ -277,47 +369,154 @@ fn k_means(colors: &[Lab], k: usize) -> Vec<Rgba<u8>> {
     let k = k.min(colors.len());
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
-    // Initialize centroids randomly using slice sampling
-    let mut centroids: Vec<Lab> = colors
-        .choose_multiple(&mut rng, k)
-        .copied()
+    // ── K-means++ initialization ────────────────────────────────────────────
+    // Pick the first centroid randomly, then each subsequent centroid with
+    // probability proportional to D(x)² (squared distance from nearest
+    // existing centroid). This spreads centroids across the color space.
+    let mut centroids: Vec<Lab> = Vec::with_capacity(k);
+
+    // First centroid: uniform random.
+    let first_idx = rng.gen_range(0..colors.len());
+    centroids.push(colors[first_idx]);
+
+    // Subsequent centroids: weighted by D(x)².
+    // `min_dists[i]` = squared distance from colors[i] to nearest centroid.
+    let mut min_dists: Vec<f32> = colors
+        .iter()
+        .map(|&c| squared_distance_lab(c, centroids[0]))
         .collect();
 
-    // Iterate
-    for _ in 0..20 {
-        // Assign colors to nearest centroid
-        let mut clusters: Vec<Vec<Lab>> = vec![Vec::new(); k];
-
-        for &color in colors {
-            let nearest = centroids
-                .iter()
-                .enumerate()
-                .map(|(i, &c)| (i, color_distance_lab(color, c)))
-                .min_by(|a, b| a.1.total_cmp(&b.1))
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-
-            clusters[nearest].push(color);
+    for _ in 1..k {
+        let total: f64 = min_dists.iter().map(|&d| d as f64).sum();
+        if total <= 0.0 {
+            // All remaining pixels are duplicates of existing centroids —
+            // just pick randomly to fill the remaining slots.
+            let idx = rng.gen_range(0..colors.len());
+            centroids.push(colors[idx]);
+        } else {
+            // Weighted random selection: pick index with probability
+            // proportional to min_dists[i].
+            let target = rng.gen::<f64>() * total;
+            let mut acc = 0.0f64;
+            let mut chosen = colors.len() - 1;
+            for (i, &d) in min_dists.iter().enumerate() {
+                acc += d as f64;
+                if acc >= target {
+                    chosen = i;
+                    break;
+                }
+            }
+            centroids.push(colors[chosen]);
         }
 
-        // Update centroids
-        for (i, cluster) in clusters.iter().enumerate() {
-            if !cluster.is_empty() {
-                let sum_l: f32 = cluster.iter().map(|c| c.l).sum();
-                let sum_a: f32 = cluster.iter().map(|c| c.a).sum();
-                let sum_b: f32 = cluster.iter().map(|c| c.b).sum();
-                let count = cluster.len() as f32;
-
-                centroids[i] = Lab::new(sum_l / count, sum_a / count, sum_b / count);
+        // Update min_dists with the new centroid.
+        let new_centroid = centroids[centroids.len() - 1];
+        for (i, &color) in colors.iter().enumerate() {
+            let d = squared_distance_lab(color, new_centroid);
+            if d < min_dists[i] {
+                min_dists[i] = d;
             }
         }
     }
 
-    // Convert centroids to RGB
-    centroids
+    // ── Lloyd's iterations (assign + update) ────────────────────────────────
+    for _ in 0..20 {
+        // Assign colors to nearest centroid
+        let mut clusters: Vec<Vec<usize>> = vec![Vec::new(); k];
+
+        for (i, &color) in colors.iter().enumerate() {
+            let nearest = centroids
+                .iter()
+                .enumerate()
+                .map(|(j, &c)| (j, squared_distance_lab(color, c)))
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(j, _)| j)
+                .unwrap_or(0);
+
+            clusters[nearest].push(i);
+        }
+
+        // Update centroids as cluster means
+        let mut changed = false;
+        for (j, cluster) in clusters.iter().enumerate() {
+            if cluster.is_empty() { continue; }
+            let sum_l: f32 = cluster.iter().map(|&i| colors[i].l).sum();
+            let sum_a: f32 = cluster.iter().map(|&i| colors[i].a).sum();
+            let sum_b: f32 = cluster.iter().map(|&i| colors[i].b).sum();
+            let count = cluster.len() as f32;
+            let new_centroid = Lab::new(sum_l / count, sum_a / count, sum_b / count);
+            if squared_distance_lab(new_centroid, centroids[j]) > 1e-6 {
+                changed = true;
+            }
+            centroids[j] = new_centroid;
+        }
+
+        if !changed { break; }
+    }
+
+    // ── Medoid snap: replace each centroid with the actual pixel closest to it ──
+    // Mean-based centroids reduce chroma (opposite hues cancel). The medoid
+    // is a real pixel color, so vibrant regions stay vibrant.
+    let mut final_palette: Vec<Lab> = Vec::with_capacity(k);
+
+    // Final assignment to get clusters.
+    let mut clusters: Vec<Vec<usize>> = vec![Vec::new(); k];
+    for (i, &color) in colors.iter().enumerate() {
+        let nearest = centroids
+            .iter()
+            .enumerate()
+            .map(|(j, &c)| (j, squared_distance_lab(color, c)))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(j, _)| j)
+            .unwrap_or(0);
+        clusters[nearest].push(i);
+    }
+
+    for (j, cluster) in clusters.iter().enumerate() {
+        if cluster.is_empty() {
+            // Empty cluster — keep the centroid as-is (will be converted to RGB).
+            final_palette.push(centroids[j]);
+            continue;
+        }
+        // Find the pixel in this cluster closest to the centroid (medoid).
+        let centroid = centroids[j];
+        let mut best_dist = f32::MAX;
+        let mut best_idx = cluster[0];
+        for &i in cluster {
+            let d = squared_distance_lab(colors[i], centroid);
+            if d < best_dist {
+                best_dist = d;
+                best_idx = i;
+            }
+        }
+        final_palette.push(colors[best_idx]);
+    }
+
+    // ── Debug log: dump palette for verification ────────────────────────────
+    if log::log_enabled!(log::Level::Debug) {
+        let palette_str: Vec<String> = final_palette.iter()
+            .map(|&lab| {
+                let rgb = lab_to_rgb(lab);
+                format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+            })
+            .collect();
+        log::debug!("k-means palette ({} colors): {}", final_palette.len(), palette_str.join(" "));
+    }
+
+    // Convert to RGB
+    final_palette
         .iter()
         .map(|&lab| lab_to_rgb(lab))
         .collect()
+}
+
+/// Squared Euclidean distance in Lab space (no sqrt — cheaper, same ordering).
+#[inline]
+fn squared_distance_lab(a: Lab, b: Lab) -> f32 {
+    let dl = a.l - b.l;
+    let da = a.a - b.a;
+    let db = a.b - b.b;
+    dl * dl + da * da + db * db
 }
 
 /// Convert RGB to Lab color space

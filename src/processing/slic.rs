@@ -121,10 +121,17 @@ pub fn slic(
     // ── K-means iterations (windowed) ────────────────────────────────────────
     let mut labels = vec![0u32; n_pixels];
 
-    for _iteration in 0..10 {
+    // Performance: reuse the distances buffer across iterations instead of
+    // allocating 4MB per iteration.
+    let mut distances = vec![f32::MAX; n_pixels];
+    let w_usize = width as usize;
+
+    // Standard SLIC uses 3-5 iterations. Was 10, which is overkill and
+    // doubles runtime. Early-exit on convergence still applies.
+    for _iteration in 0..5 {
         // ── Assignment step: for each centroid, search only its 2S×2S window ─
         // Track minimum distance per pixel across all centroids.
-        let mut distances = vec![f32::MAX; n_pixels];
+        for d in distances.iter_mut() { *d = f32::MAX; }
         for (c_idx, centroid) in centroids.iter().enumerate() {
             let (cx, cy) = centroid_pos[c_idx];
             let x_start = (cx - grid_s as i32).max(0);
@@ -133,8 +140,9 @@ pub fn slic(
             let y_end   = (cy + grid_s as i32).min(hi - 1);
 
             for y in y_start..=y_end {
+                let row_start = (y as usize) * w_usize;
                 for x in x_start..=x_end {
-                    let i = (y as usize) * (width as usize) + (x as usize);
+                    let i = row_start + (x as usize);
                     let d = squared_distance(&features[i], centroid);
                     if d < distances[i] {
                         distances[i] = d;
@@ -221,31 +229,23 @@ fn build_features(
     let h = height as usize;
     let max_dim = width.max(height) as f32;
 
-    // ── Lab color per pixel (vectorized) ─────────────────────────────────────
-    let lab_l: Vec<f32> = (0..n_pixels)
-        .map(|i| {
-            let x = (i % w) as u32;
-            let y = (i / w) as u32;
-            let p = rgba.get_pixel(x, y);
-            rgba_to_lab(*p).l
-        })
-        .collect();
-    let lab_a: Vec<f32> = (0..n_pixels)
-        .map(|i| {
-            let x = (i % w) as u32;
-            let y = (i / w) as u32;
-            let p = rgba.get_pixel(x, y);
-            rgba_to_lab(*p).a
-        })
-        .collect();
-    let lab_b: Vec<f32> = (0..n_pixels)
-        .map(|i| {
-            let x = (i % w) as u32;
-            let y = (i / w) as u32;
-            let p = rgba.get_pixel(x, y);
-            rgba_to_lab(*p).b
-        })
-        .collect();
+    // ── Lab color per pixel (single conversion, not 3×) ──────────────────────
+    // Performance fix: was calling rgba_to_lab() 3 times per pixel (once for
+    // each of L, a, b). Now calls it once and splits the result. Also uses
+    // raw pixel buffer indexing instead of get_pixel() to avoid bounds-check
+    // overhead on 1M+ pixels.
+    let mut lab_l = Vec::with_capacity(n_pixels);
+    let mut lab_a = Vec::with_capacity(n_pixels);
+    let mut lab_b = Vec::with_capacity(n_pixels);
+    let rgba_buf = rgba.as_raw();  // &Vec<u8>, 4 bytes per pixel
+    for i in 0..n_pixels {
+        let off = i * 4;
+        let p = Rgba([rgba_buf[off], rgba_buf[off+1], rgba_buf[off+2], rgba_buf[off+3]]);
+        let lab = rgba_to_lab(p);
+        lab_l.push(lab.l);
+        lab_a.push(lab.a);
+        lab_b.push(lab.b);
+    }
 
     // ── Depth (with 0.5 fallback when missing) ────────────────────────────────
     let depth: Vec<f32> = (0..n_pixels)
@@ -305,12 +305,20 @@ fn build_features(
 /// Compute a single percentile across the union of two gradient slices.
 /// Used to get one normalization factor for both dL/dx and dL/dy (they
 /// share the same physical meaning — magnitude of L* gradient).
+///
+/// Performance: uses `select_nth_unstable_by` which is O(N) average
+/// (quickselect partition) instead of O(N log N) full sort. On a 2M-element
+/// array this is ~10× faster than sorting.
 fn percentile(a: &[f32], b: &[f32], pct: f32) -> f32 {
     let mut combined: Vec<f32> = a.iter().chain(b.iter()).copied().collect();
-    combined.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
     if combined.is_empty() { return 1.0; }
     let idx = ((combined.len() as f32 - 1.0) * pct).round() as usize;
-    combined[idx.min(combined.len() - 1)]
+    let idx = idx.min(combined.len() - 1);
+    // Partition so that the element at index `idx` is in its sorted position.
+    combined.select_nth_unstable_by(idx, |x, y| {
+        x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    combined[idx]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

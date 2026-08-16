@@ -85,8 +85,8 @@ fn main() {
         );
     }
 
-    // Test 8: Outline styles (Phase 7: AutoContrastWithHueShift removed → 2 variants)
-    for style in [OutlineStyle::AutoContrast, OutlineStyle::Black] {
+    // Test 8: Phase 4 outline styles (3 variants)
+    for style in [OutlineStyle::LocalColorShift, OutlineStyle::Black, OutlineStyle::MaxContrast] {
         let name = format!("Outline style={:?}", style);
         all_pass &= test_case_with_edges(
             &name,

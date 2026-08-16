@@ -177,6 +177,22 @@ fn depth_to_flat_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
             );
         });
 
+        // ── L* shift scale (Phase 2) ─────────────────────────────────────────
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(&mut dtf.l_shift_scale, 0.0..=100.0)
+                    .text("L shift scale")
+                    .fixed_decimals(0)
+                    .clamping(egui::SliderClamping::Always),
+            ).on_hover_text(
+                "Phase 2 — Maximum Lab L* shift DTF can apply.\n\
+                 Actual shift = strength × l_shift_scale (clamped via shading signal).\n\
+                 40 = balanced (default, ±24 L* at strength 0.6)\n\
+                 100 = old behavior (±60 L*, washes out vibrant colors)\n\
+                 0 = no shift (DTF produces no shading)"
+            );
+        });
+
         // ── Gamma ───────────────────────────────────────────────────────────
         ui.horizontal(|ui| {
             ui.add(
@@ -372,13 +388,66 @@ fn edge_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("DexiNed outline pass").small().weak());
 
         // Outline style — determines how outline colors are chosen from the palette
+        // Phase 4: three modes — LocalColorShift (default), Black, MaxContrast.
         ui.label("Outline style:");
         ui.horizontal_wrapped(|ui| {
-            for style in [OutlineStyle::AutoContrast, OutlineStyle::Black] {
+            for style in [
+                OutlineStyle::LocalColorShift,
+                OutlineStyle::Black,
+                OutlineStyle::MaxContrast,
+            ] {
                 if ui.selectable_label(app.edge_config.outline_style == style, format!("{:?}", style)).clicked() {
                     app.edge_config.outline_style = style;
                 }
             }
+        });
+
+        // Phase 4 — LocalColorShift parameters (only relevant when that mode is active)
+        if app.edge_config.outline_style == OutlineStyle::LocalColorShift {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Slider::new(&mut app.edge_config.edge_l_shift, 0.0..=60.0)
+                        .text("Edge L* shift")
+                        .fixed_decimals(0)
+                        .clamping(egui::SliderClamping::Always),
+                ).on_hover_text(
+                    "Phase 4 — L* shift applied to local 3×3 mean Lab for LocalColorShift mode.\n\
+                     Edge color = local mean shifted darker by this many L* units,\n\
+                     then snapped to nearest palette entry.\n\
+                     25 = default (visible darkening, still in local color family)\n\
+                     0 = no shift (edge = local mean, blends in)\n\
+                     60 = strong darkening (near-black on light backgrounds)"
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Slider::new(&mut app.edge_config.edge_hue_shift, -180.0..=180.0)
+                        .text("Edge hue shift°")
+                        .fixed_decimals(0)
+                        .clamping(egui::SliderClamping::Always),
+                ).on_hover_text(
+                    "Phase 4 — Optional hue rotation (degrees) for LocalColorShift mode.\n\
+                     0 = no rotation (default).\n\
+                     Positive = counter-clockwise in Lab a*b* plane.\n\
+                     Useful for stylized effects (e.g. shift all edges slightly cooler)."
+                );
+            });
+        }
+
+        // Phase 3 — Min segment length slider
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Slider::new(&mut app.edge_config.min_segment_length, 1..=20)
+                    .text("Min segment")
+                    .fixed_decimals(0)
+                    .clamping(egui::SliderClamping::Always),
+            ).on_hover_text(
+                "Phase 3 — Minimum length (in pixels) for a skeleton segment to survive cleanup.\n\
+                 Segments shorter than this are dropped as noise.\n\
+                 3 = default (drops single-pixel and 2px noise)\n\
+                 1 = keep all (no segment drop)\n\
+                 10+ = keep only long, confident lines"
+            );
         });
 
         // Edge threshold with preset markers in the tooltip

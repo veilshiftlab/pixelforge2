@@ -1,59 +1,39 @@
 //! Downsampling and Importance Map Implementation
 //!
-//! # Phase 4 — Smudge fix
+//! # PaletteMode — Median-based block reduction
 //!
-//! Three changes target the "color smudge" artifact reported at small output
-//! sizes:
+//! `palette_mode_downsample` computes the **per-channel median** in Lab space
+//! for each output block, then snaps the median to the nearest palette entry.
+//! This replaced the old mode-pick approach (pre-quantize every pixel, then
+//! pick the most common palette entry per block) which caused:
 //!
-//! 1. **D1a — Bilateral pre-filter before palette snap.** In
-//!    `palette_mode_downsample`, a 3×3 bilateral filter on the input image
-//!    eliminates the noisy alternation on smooth gradients that broke
-//!    mode-picking (a smooth red gradient would snap to alternating
-//!    palette entries pixel-by-pixel, and per-block mode-picking became
-//!    essentially random).
+//! - **Sepia/warm drift**: the bilateral pre-filter blended neighboring colors
+//!   in Lab space, and on real images with warm-dominated content this caused
+//!   a systematic warm shift on cooler colors.
+//! - **Color suppression**: mode-pick majority-vote could suppress minority
+//!   colors (a 60% gray + 40% blue block → gray, losing the blue entirely).
+//! - **Lossy pre-quantization**: every pixel was snapped to a palette entry
+//!   before block reduction, introducing quantization error before the
+//!   median/mode even ran.
 //!
-//! 2. **D1b — Average in Lab space, not linear RGB.** In
-//!    `weighted_downsample`, each contributing pixel converts to Lab
-//!    before accumulation. Linear RGB averaging of saturated red and
-//!    saturated blue produces muddy purple; Lab averaging preserves hue.
+//! The median approach fixes all three: no bilateral filter, no
+//! pre-quantization, and median doesn't average (so no chroma reduction).
+//! Edge preservation in downsampling is unnecessary — the edge model
+//! (DexiNed/TEED) transfers edge information in a dedicated phase.
 //!
-//! 3. **D1c — Cap importance weight at 2.0× (was 5.0×).** A single
-//!    high-importance edge pixel inside a 1024-pixel block was dominating
-//!    the weighted average, producing a "smudge of one color" regardless
-//!    of what the other 1023 pixels wanted. 2.0× is strong enough to
-//!    preserve edges but no longer washes out the block.
+//! # Other Methods
 //!
-//! Plus a new downsampling method:
-//!
-//! 4. **D2 — `PerceptualDither`.** Area-average downsample → snap to
-//!    nearest palette color in Lab → Floyd-Steinberg error diffusion.
-//!    Produces clean pixel-art downscaling with no smudge and organic
-//!    dithering patterns. The professional pixel-art approach.
-//!
-//! 5. **D1 perf — Stack array instead of HashMap.**
-//!    `palette_mode_downsample` was allocating a `HashMap<usize, u32>` per
-//!    output pixel (1024 allocs for a 32×32 output). Replaced with a
-//!    stack-allocated `[u32; 256]` array, zeroed once per output pixel via
-//!    `fill(0)`.
+//! - **PerceptualDither**: area-average + Floyd-Steinberg error diffusion.
+//!   Clean pixel-art downscaling with organic dithering.
+//! - **Weighted**: Lab-space weighted average using importance map.
+//! - **NearestNeighbor / Bilinear**: standard resampling.
 //!
 //! # Importance Map
 //!
 //! The importance map assigns a weight to each pixel, indicating how
 //! important it is to preserve that pixel's color during downsampling.
-//! Importance is derived from:
-//!
-//! 1. **Depth Gradients** (capped at 2.0×): edges of 3D forms
-//! 2. **Image Edges**: Sobel-detected edges in the original image
-//!
-//! # Downsampling Methods
-//!
-//! | Method | Description | Use Case |
-//! |--------|-------------|----------|
-//! | PaletteMode | Bilateral-filter, snap, pick most common per block | Crisp discrete output, no smudge (default) |
-//! | PerceptualDither | Area-average + Floyd-Steinberg | Clean pro pixel-art (new in Phase 4) |
-//! | Weighted | Lab-space weighted average | Smooth, preserves detail |
-//! | NearestNeighbor | Pick center pixel | Retro/pixel art style |
-//! | Bilinear | Smooth interpolation | Soft, blended look |
+//! Importance is derived from depth gradients (capped at 2.0×) and
+//! Sobel-detected image edges.
 
 use super::palette::{PaletteLab, rgb_to_lab, lab_to_rgb};
 use super::Palette;
@@ -61,10 +41,6 @@ use crate::ml::MLResults;
 use anyhow::Result;
 use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 use palette::Lab;
-
-/// Max palette size we'll handle in stack-allocated per-block counters.
-/// Palette colors above this index fall back to the HashMap path (rare).
-const MAX_PALETTE_SIZE: usize = 256;
 
 // =============================================================================
 // Weighted Downsampling (D1b — Lab-space averaging)
@@ -175,33 +151,45 @@ pub fn nearest_neighbor_downsample(
 // Palette-mode downsampling (D1a — bilateral pre-filter; D1 perf — stack array)
 // =============================================================================
 
-/// Palette-mode downsampling — the key fix for "smudge" artifacts.
+/// Palette-mode downsampling — median-based block reduction.
 ///
-/// For each output pixel, this finds the corresponding region in the input
-/// image, counts how many times each palette color appears in that region,
-/// and picks the **most common** (mode) palette color.
+/// For each output pixel, collects all input pixels in the corresponding
+/// block, computes the **per-channel median** in Lab space, then snaps
+/// the median to the nearest palette entry.
 ///
-/// # Phase 4 — D1a: bilateral pre-filter
+/// # Why median (not mode or mean)?
 ///
-/// Before snapping each input pixel to its nearest palette color, the input
-/// image is run through a 3×3 bilateral filter. This eliminates the noisy
-/// alternation on smooth gradients: a smooth red gradient would otherwise
-/// snap to alternating palette entries pixel-by-pixel, and per-block
-/// mode-picking became essentially random (the source of "smudge").
+/// - **Mode** (old approach): picks the most common pre-quantized palette
+///   entry per block. Requires pre-quantizing every pixel first (lossy),
+///   and majority-vote can suppress minority colors (e.g., a block with
+///   60% gray + 40% blue → gray, losing the blue entirely).
+/// - **Mean**: averages Lab values. Reduces chroma (opposite hues cancel),
+///   producing washed-out/sepia results on real images.
+/// - **Median** (current): picks the middle Lab value per channel. Robust
+///   to outliers (edges, noise), preserves color (doesn't average), and
+///   doesn't require pre-quantization. For a 60/40 gray+blue block, the
+///   median would be blue-gray — a better representation than pure gray.
 ///
-/// Bilateral filtering preserves edges while smoothing flats — exactly
-/// what we want before quantization.
+/// # No bilateral pre-filter
 ///
-/// # Phase 4 — D1 perf: stack array instead of HashMap
+/// The old bilateral pre-filter (sigma_color=12.0) was removed because:
+/// 1. It blended neighboring colors in Lab space, which on real images
+///    with warm-dominated content (skin, warm backgrounds) caused a
+///    systematic warm/sepia drift on cooler colors.
+/// 2. Median is already robust to the noise the bilateral filter was
+///    designed to fix (noisy palette-snap alternation on gradients).
 ///
-/// The per-output-pixel `HashMap<usize, u32>` was allocating 1024 HashMaps
-/// for a 32×32 output. Replaced with a stack `[u32; 256]` array zeroed
-/// via `fill(0)` once per output pixel.
+/// # Edge preservation
+///
+/// Edge preservation in downsampling is unnecessary — the edge model
+/// (DexiNed/TEED) transfers edge information in a dedicated phase that
+/// runs after downsampling. The downsample just needs to produce clean,
+/// color-accurate flat regions.
 ///
 /// # Arguments
 ///
-/// * `input` - The input image (any size, should already be palette-quantized)
-/// * `palette` - The palette to use for per-pixel quantization before counting
+/// * `input` - The input image (any resolution)
+/// * `palette` - The palette to snap the median to
 /// * `output_width` - Target width in pixels
 /// * `output_height` - Target height in pixels
 pub fn palette_mode_downsample(
@@ -215,33 +203,18 @@ pub fn palette_mode_downsample(
     }
 
     let (input_width, input_height) = input.dimensions();
-
-    // ── Phase 4 — D1a: bilateral pre-filter ────────────────────────────────
-    // Smooths flat regions while preserving edges, so palette snap doesn't
-    // produce noisy alternation on smooth gradients.
-    // Phase 6 — perf: `bilateral_filter_3x3_rgba` returns RgbaImage directly,
-    // avoiding one redundant `to_rgba8()` conversion.
-    let rgba = bilateral_filter_3x3_rgba(input);
-
-    // Pre-quantize every input pixel to its nearest palette color index.
+    let rgba = input.to_rgba8();
     let palette_lab = PaletteLab::from_palette(palette);
-    let palette_indices: Vec<usize> = rgba.pixels()
-        .map(|p| {
-            let lab = rgb_to_lab(Rgba([p[0], p[1], p[2], 255]));
-            // Use PaletteLab's cached Lab values for O(K) lookup instead of
-            // recomputing per palette entry.
-            palette_index_nearest(&palette_lab, lab)
-        })
-        .collect();
 
     let mut output = RgbaImage::new(output_width, output_height);
 
     let scale_x = input_width as f32 / output_width as f32;
     let scale_y = input_height as f32 / output_height as f32;
 
-    // Phase 4 — D1 perf: stack-allocated counter array, zeroed per output pixel.
-    // Avoids 1024 HashMap allocations on a 32×32 output.
-    let mut counts: [u32; MAX_PALETTE_SIZE] = [0; MAX_PALETTE_SIZE];
+    // Reusable buffers for median computation (avoid per-block allocation).
+    let mut l_buf: Vec<f32> = Vec::with_capacity(1024);
+    let mut a_buf: Vec<f32> = Vec::with_capacity(1024);
+    let mut b_buf: Vec<f32> = Vec::with_capacity(1024);
 
     for out_y in 0..output_height {
         for out_x in 0..output_width {
@@ -250,37 +223,54 @@ pub fn palette_mode_downsample(
             let in_x_end = ((out_x + 1) as f32 * scale_x).ceil().min(input_width as f32) as u32;
             let in_y_end = ((out_y + 1) as f32 * scale_y).ceil().min(input_height as f32) as u32;
 
-            // Zero counters for this output pixel
-            for c in counts.iter_mut() { *c = 0; }
+            // Collect Lab values for all pixels in this block.
+            l_buf.clear();
+            a_buf.clear();
+            b_buf.clear();
 
             for in_y in in_y_start..in_y_end {
                 for in_x in in_x_start..in_x_end {
-                    let idx = (in_y * input_width + in_x) as usize;
-                    if idx < palette_indices.len() {
-                        let pi = palette_indices[idx];
-                        if pi < MAX_PALETTE_SIZE {
-                            counts[pi] += 1;
-                        }
-                    }
+                    let p = rgba.get_pixel(in_x, in_y);
+                    let lab = rgb_to_lab(*p);
+                    l_buf.push(lab.l);
+                    a_buf.push(lab.a);
+                    b_buf.push(lab.b);
                 }
             }
 
-            // Pick the most common palette color (mode)
-            let mut best_idx = 0usize;
-            let mut best_count = 0u32;
-            for (i, &c) in counts.iter().enumerate() {
-                if c > best_count {
-                    best_count = c;
-                    best_idx = i;
-                }
+            if l_buf.is_empty() {
+                output.put_pixel(out_x, out_y, Rgba([0, 0, 0, 255]));
+                continue;
             }
 
-            let color = palette.colors.get(best_idx).copied().unwrap_or(Rgba([0, 0, 0, 255]));
+            // Compute per-channel median.
+            let median_l = median_f32(&mut l_buf);
+            let median_a = median_f32(&mut a_buf);
+            let median_b = median_f32(&mut b_buf);
+
+            // Snap the median Lab to the nearest palette entry.
+            let median_lab = Lab::new(median_l, median_a, median_b);
+            let color = palette_lab.nearest_to(median_lab);
             output.put_pixel(out_x, out_y, color);
         }
     }
 
     Ok(DynamicImage::ImageRgba8(output))
+}
+
+/// Compute the median of a slice of f32 values (sorts in place).
+fn median_f32(values: &mut Vec<f32>) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    // Use `sort_by` with `total_cmp` for NaN-safety.
+    values.sort_by(|a, b| a.total_cmp(b));
+    let n = values.len();
+    if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        (values[n / 2 - 1] + values[n / 2]) * 0.5
+    }
 }
 
 /// Return the index of the palette entry nearest to `target_lab`.
@@ -463,99 +453,6 @@ fn area_average_downsample(
     }
 
     DynamicImage::ImageRgba8(output)
-}
-
-// =============================================================================
-// Bilateral filter (D1a helper)
-// =============================================================================
-
-/// 3×3 bilateral filter — edge-preserving smoothing.
-///
-/// Each output pixel is a weighted average of its 3×3 neighborhood where
-/// weights depend on **both spatial proximity** (Gaussian on distance) and
-/// **color similarity** (Gaussian on Lab ΔE). Pixels far in color from
-/// the center contribute almost nothing, so edges are preserved while
-/// flat regions are smoothed.
-///
-/// This is the pre-quantization step in `palette_mode_downsample` —
-/// smoothing flats eliminates the noisy palette-snap alternation that
-/// was breaking per-block mode-picking (the source of "smudge").
-/// Phase 6 — perf: returns `RgbaImage` directly (was `DynamicImage`) so callers
-/// that need the rgba buffer (which is everyone — `palette_mode_downsample`
-/// calls `.pixels()` on it) skip one `to_rgba8()` conversion.
-fn bilateral_filter_3x3_rgba(input: &DynamicImage) -> RgbaImage {
-    let (w, h) = input.dimensions();
-    let rgba_in = input.to_rgba8();
-    let mut rgba_out = RgbaImage::new(w, h);
-
-    // Pre-compute Lab for every input pixel (used for color-similarity weight).
-    let mut lab_in: Vec<Lab> = Vec::with_capacity((w * h) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            lab_in.push(rgb_to_lab(*rgba_in.get_pixel(x, y)));
-        }
-    }
-
-    // Sigma parameters: tuned for "smooth flats, preserve edges".
-    let sigma_space = 1.2;   // ~one pixel radius
-    let sigma_color = 25.0;  // Lab ΔE threshold for "same region"
-
-    let wi = w as i32;
-    let hi = h as i32;
-
-    for y in 0..hi {
-        for x in 0..wi {
-            let idx = (y as usize) * (w as usize) + (x as usize);
-            let center_lab = lab_in[idx];
-            let center_alpha = rgba_in.get_pixel(x as u32, y as u32)[3];
-
-            let mut l_sum = 0.0f64;
-            let mut a_sum = 0.0f64;
-            let mut b_sum = 0.0f64;
-            let mut weight_sum = 0.0f64;
-
-            for dy in -1..=1i32 {
-                for dx in -1..=1i32 {
-                    let nx = x + dx;
-                    let ny = y + dy;
-                    if nx < 0 || ny < 0 || nx >= wi || ny >= hi { continue; }
-                    let nidx = (ny as usize) * (w as usize) + (nx as usize);
-                    let n_lab = lab_in[nidx];
-
-                    // Spatial weight: Gaussian on Euclidean distance (1 or √2)
-                    let dist_sq = (dx * dx + dy * dy) as f32;
-                    let w_space = (-dist_sq / (2.0 * sigma_space * sigma_space)).exp();
-
-                    // Color weight: Gaussian on Lab ΔE
-                    let dl = center_lab.l - n_lab.l;
-                    let da = center_lab.a - n_lab.a;
-                    let db = center_lab.b - n_lab.b;
-                    let color_dist_sq = dl * dl + da * da + db * db;
-                    let w_color = (-color_dist_sq / (2.0 * sigma_color * sigma_color)).exp();
-
-                    let w_total = w_space * w_color;
-                    l_sum += n_lab.l as f64 * w_total as f64;
-                    a_sum += n_lab.a as f64 * w_total as f64;
-                    b_sum += n_lab.b as f64 * w_total as f64;
-                    weight_sum += w_total as f64;
-                }
-            }
-
-            if weight_sum > 0.0 {
-                let filtered_lab = Lab::new(
-                    (l_sum / weight_sum) as f32,
-                    (a_sum / weight_sum) as f32,
-                    (b_sum / weight_sum) as f32,
-                );
-                let rgb = lab_to_rgb(filtered_lab);
-                rgba_out.put_pixel(x as u32, y as u32, Rgba([rgb[0], rgb[1], rgb[2], center_alpha]));
-            } else {
-                rgba_out.put_pixel(x as u32, y as u32, *rgba_in.get_pixel(x as u32, y as u32));
-            }
-        }
-    }
-
-    rgba_out
 }
 
 // =============================================================================

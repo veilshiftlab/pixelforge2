@@ -29,6 +29,15 @@ pub fn draw(app: &mut PixelForgeApp, ctx: &egui::Context) {
 
         ui.separator();
 
+        // Phase 8 — Pipeline warnings banner (dismissible).
+        // Shows when the last pipeline run emitted any silent-fallback warnings.
+        // Each warning is a yellow line; the "Dismiss" button clears the vec
+        // until the next pipeline run repopulates it.
+        if !app.pipeline_warnings.is_empty() {
+            warnings_banner(app, ui);
+            ui.separator();
+        }
+
         match app.preview_tab {
             PreviewTab::Original    => original_panel(app, ui),
             PreviewTab::MLMaps      => ml_panel(app, ui, ctx),
@@ -37,6 +46,41 @@ pub fn draw(app: &mut PixelForgeApp, ctx: &egui::Context) {
             PreviewTab::Output      => output_panel(app, ui, ctx),
         }
     });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 8 — Pipeline warnings banner
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Render a dismissible yellow banner listing pipeline warnings.
+///
+/// Each warning is one line. The "Dismiss" button clears
+/// `app.pipeline_warnings`; the next `process_image` run repopulates it.
+fn warnings_banner(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
+    egui::Frame::group(ui.style())
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 160, 0)))
+        .fill(egui::Color32::from_rgb(60, 50, 0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("⚠ Pipeline warnings:")
+                        .strong()
+                        .color(egui::Color32::from_rgb(255, 220, 100)),
+                );
+                if ui.button("Dismiss").clicked() {
+                    app.pipeline_warnings.clear();
+                }
+            });
+            // Iterate over a snapshot so we can mutate `app` inside the loop
+            // if needed (we don't here, but it future-proofs the closure).
+            let warnings: Vec<String> = app.pipeline_warnings.clone();
+            for w in &warnings {
+                ui.label(
+                    egui::RichText::new(format!("• {w}"))
+                        .color(egui::Color32::from_rgb(255, 220, 100)),
+                );
+            }
+        });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

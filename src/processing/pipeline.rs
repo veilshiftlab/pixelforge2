@@ -60,6 +60,12 @@ pub struct PipelineOutput {
     /// geometric manipulation. Set even when ML is absent (returns the
     /// unmodified input in that case).
     pub flat: Option<DynamicImage>,
+    /// Phase 8 — Human-readable warnings emitted by silent pipeline
+    /// fallbacks (depth_to_flat failure, palette empty, edge render failure,
+    /// EdgeMode::Internal SLIC fallback, etc.). Empty when all stages ran
+    /// cleanly. The UI surfaces these in a dismissible banner so users see
+    /// *why* output is degenerate instead of guessing from logs.
+    pub warnings: Vec<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -71,11 +77,19 @@ pub struct PipelineOutput {
 /// All stages are infallible from the caller's perspective: failures fall
 /// back gracefully (log a warning, pass the image through unchanged) rather
 /// than aborting. Only genuinely unrecoverable errors (OOM, etc.) propagate.
+///
+/// Phase 8: every silent fallback appends a human-readable message to
+/// `PipelineOutput.warnings`. The UI surfaces these in a dismissible banner
+/// so users see *why* output is degenerate instead of guessing from logs.
 pub fn run(input: &PipelineInput<'_>) -> PipelineOutput {
     let PipelineInput {
         image, ml_results, transform, depth_to_flat: dtf_config,
         edges, palette: pal_config, output_width, output_height,
     } = input;
+
+    // Phase 8 — collect warnings from silent fallbacks. Each fallback below
+    // pushes a human-readable message here in addition to logging.
+    let mut warnings: Vec<String> = Vec::new();
 
     // ── 1. Depth → flat color ────────────────────────────────────────────────
     // MUST run before geometric transforms: depth_map and SLIC labels are
@@ -89,7 +103,9 @@ pub fn run(input: &PipelineInput<'_>) -> PipelineOutput {
     let depth_processed: Cow<'_, DynamicImage> = if let Some(ml) = ml_results {
         Cow::Owned(
             depth_to_flat(image, ml, dtf_config).unwrap_or_else(|e| {
-                log::warn!("depth_to_flat: {e}");
+                let msg = format!("Depth-to-flat conversion failed: {e}. Using original image.");
+                log::warn!("{}", msg);
+                warnings.push(msg);
                 (*image).clone()
             })
         )
@@ -137,34 +153,53 @@ pub fn run(input: &PipelineInput<'_>) -> PipelineOutput {
     // Uses the resampled depth map (matches `preprocessed` dimensions).
     let importance = compute_combined_importance_map(&preprocessed, resampled_ml.as_ref());
 
-    // ── 4. Palette extraction (from ORIGINAL image, not post-DTF) ──────────
-    // ET-3/ET-4 fix: palette must be extracted from the ORIGINAL image's colors,
-    // not from the post-depth-to-flat image. DTF desaturates the background and
-    // shifts colors via shading — extracting the palette from the post-DTF image
-    // meant vibrant subject colors (blue dress, skin tones) were washed out
-    // because the palette reflected the DTF-processed colors, not the original.
+    // ── 4. Palette extraction (from POST-DTF image, same as downsampling input) ─
+    // Palette must be extracted from the same image that downsampling quantizes
+    // (i.e. `preprocessed` = post-DTF + post-transform). Otherwise the palette
+    // reflects original colors while quantization operates on shaded colors, and
+    // palette-snap partially undoes the DTF shading.
     //
-    // If transforms are applied, we need the original image at post-transform
-    // dimensions. If no transforms, the original IS the post-transform image.
-    let palette_source: DynamicImage = if transform_is_noop {
-        // No transforms — palette from the original image directly.
-        // Can't borrow depth_processed because it might be Cow::Borrowed(image).
-        // Just clone — palette extraction is not a hot loop (k-means is subsampled).
-        (*image).clone()
-    } else {
-        // Transforms applied — we need the original image with the same transforms
-        // applied (but WITHOUT depth-to-flat). This gives us the original colors
-        // at the post-transform dimensions.
-        apply_transforms(image, transform)
-    };
+    // The old "ET-3/ET-4 fix" extracted the palette from the original image to
+    // avoid washed-out colors — but that diagnosis was a false flag. The real
+    // cause of washed-out colors was DTF applying ±60 L* shifts (default
+    // strength=0.6, implicit ×100 scale). Phase 2 introduces an explicit
+    // `l_shift_scale` config (default 40) that caps the shift at a more
+    // reasonable ±24 L*, so the palette can safely come from post-DTF.
+    let palette = generate_palette(&preprocessed, pal_config)
+        .unwrap_or_else(|e| {
+            let msg = format!("Palette extraction failed: {e}. Using empty palette.");
+            log::warn!("{}", msg);
+            warnings.push(msg);
+            Palette::new(vec![])
+        });
 
-    let palette = generate_palette(&palette_source, pal_config, resampled_ml.as_ref())
-        .unwrap_or_else(|_| Palette::new(vec![]));
+    // Phase 8 — also warn if the palette ended up empty (e.g. Preset mode with
+    // `PresetPalette::None`, or Auto mode on a degenerate input). Empty palette
+    // makes PaletteMode/PerceptualDither fall back to nearest-neighbor, and
+    // makes Black/LocalColorShift edge modes fall back to pure black.
+    if palette.colors.is_empty() {
+        warnings.push(
+            "Palette is empty (no colors extracted or selected). \
+             PaletteMode/PerceptualDither will fall back to nearest-neighbor; \
+             edge colors will be pure black.".into()
+        );
+    }
 
     // ── 5. Downsample ────────────────────────────────────────────────────────
     let ow = *output_width;
     let oh = *output_height;
-    let fallback = |img: &DynamicImage| img.resize_exact(ow, oh, image::imageops::FilterType::Nearest);
+    // Phase 8 — fallback closure now also pushes a warning so the user sees
+    // that their chosen downsampling method failed (e.g. PaletteMode with an
+    // empty palette) and was replaced with nearest-neighbor resize.
+    // `mut` is required because the closure captures `&mut warnings`.
+    let mut fallback = |img: &DynamicImage, method_name: &str| {
+        let msg = format!(
+            "{method_name} downsampling failed; falling back to nearest-neighbor resize."
+        );
+        log::warn!("{}", msg);
+        warnings.push(msg);
+        img.resize_exact(ow, oh, image::imageops::FilterType::Nearest)
+    };
 
     // Phase 6 — perf: `PaletteMode` and `PerceptualDither` both produce
     // already-quantized output (every pixel is a palette color), so we can
@@ -179,19 +214,24 @@ pub fn run(input: &PipelineInput<'_>) -> PipelineOutput {
             // Pre-quantize at full res, then pick most common palette color per block.
             // Phase 4 — D1a: now with bilateral pre-filter to eliminate noisy
             // alternation on smooth gradients (the source of "smudge").
-            palette_mode_downsample(&preprocessed, &palette, ow, oh).unwrap_or_else(|_| fallback(&preprocessed))
+            palette_mode_downsample(&preprocessed, &palette, ow, oh)
+                .unwrap_or_else(|_| fallback(&preprocessed, "PaletteMode"))
         }
         DownsamplingMethod::PerceptualDither => {
             // Phase 4 — D2: area-average downsample + Floyd-Steinberg error
             // diffusion. Clean pixel-art downscaling with organic dithering.
-            perceptual_dither_downsample(&preprocessed, &palette, ow, oh).unwrap_or_else(|_| fallback(&preprocessed))
+            perceptual_dither_downsample(&preprocessed, &palette, ow, oh)
+                .unwrap_or_else(|_| fallback(&preprocessed, "PerceptualDither"))
         }
         DownsamplingMethod::Weighted =>
-            weighted_downsample(&preprocessed, &importance, ow, oh).unwrap_or_else(|_| fallback(&preprocessed)),
+            weighted_downsample(&preprocessed, &importance, ow, oh)
+                .unwrap_or_else(|_| fallback(&preprocessed, "Weighted")),
         DownsamplingMethod::NearestNeighbor =>
-            nearest_neighbor_downsample(&preprocessed, ow, oh).unwrap_or_else(|_| fallback(&preprocessed)),
+            nearest_neighbor_downsample(&preprocessed, ow, oh)
+                .unwrap_or_else(|_| fallback(&preprocessed, "NearestNeighbor")),
         DownsamplingMethod::Bilinear =>
-            bilinear_downsample(&preprocessed, ow, oh).unwrap_or_else(|_| fallback(&preprocessed)),
+            bilinear_downsample(&preprocessed, ow, oh)
+                .unwrap_or_else(|_| fallback(&preprocessed, "Bilinear")),
     };
 
     // ── 6. Palette quantization (snap to palette) ───────────────────────────
@@ -202,14 +242,26 @@ pub fn run(input: &PipelineInput<'_>) -> PipelineOutput {
         downsampled
     } else {
         apply_palette(&downsampled, &palette)
-            .unwrap_or_else(|e| { log::warn!("apply_palette: {e}"); downsampled })
+            .unwrap_or_else(|e| {
+                let msg = format!("Palette quantization failed: {e}. Using unquantized image.");
+                log::warn!("{}", msg);
+                warnings.push(msg);
+                downsampled
+            })
     };
 
     // ── 7. Edge rendering (outline pass) ────────────────────────────────────
     // Runs AFTER palette quantization so outlines use the palette's own colors
     // (darkest for light pixels, lightest for dark pixels).
-    let final_image = draw_edges(&quantized, resampled_ml.as_ref(), transformed_dims, edges, &palette).unwrap_or_else(|e| {
-        log::warn!("draw_edges: {e}");
+    // Phase 8: passes `&mut warnings` so the Phase 7 Internal-mode SLIC
+    // fallback inside `classify_edges` can surface its message to the UI.
+    let final_image = draw_edges(
+        &quantized, resampled_ml.as_ref(), transformed_dims, edges, &palette,
+        &mut warnings,
+    ).unwrap_or_else(|e| {
+        let msg = format!("Edge rendering failed: {e}. Output has no edges.");
+        log::warn!("{}", msg);
+        warnings.push(msg);
         quantized
     });
 
@@ -218,6 +270,7 @@ pub fn run(input: &PipelineInput<'_>) -> PipelineOutput {
         palette_colors: palette.colors,
         preprocessed: Some(preprocessed_for_output),
         flat: Some(flat_for_output),
+        warnings,
     }
 }
 

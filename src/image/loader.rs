@@ -5,15 +5,6 @@ use image::DynamicImage;
 use std::path::Path;
 use super::transform::ImageProcessor;
 
-/// Image data container (immutable image + metadata)
-pub struct ImageData {
-    /// The loaded image
-    pub image: DynamicImage,
-
-    /// Original file path
-    pub path: Option<std::path::PathBuf>,
-}
-
 /// Image loader
 pub struct ImageLoader;
 

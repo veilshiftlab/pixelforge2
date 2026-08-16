@@ -19,8 +19,15 @@
 //!    size_pct > bg_cluster_size_pct)`. Eliminates the depth-bleed leakage
 //!    onto subject edges that the old per-pixel `d > threshold` produced.
 //!    Falls back to Otsu/manual threshold when SLIC labels are unavailable.
-//! 6. **Contrast curve + Lab L bias** unchanged: `s' = sign(s) * |s|^gamma`,
-//!    `L' = clamp(L + s' * strength * 100, 0, 100)`.
+//! 6. **Contrast curve + Lab L bias**: `s' = sign(s) * |s|^gamma`,
+//!    `L' = clamp(L + s' * strength * l_shift_scale, 0, 100)`.
+//!    Phase 2: `l_shift_scale` (default 40) replaces the implicit ×100
+//!    that produced ±60 L* shifts at default strength=0.6.
+//! 7. **Phase 2 — Flat-region mask**: per-pixel mask `∈ {0, 1}` built from
+//!    per-cluster MAD. When a cluster's MAD < `mad_threshold`, ALL shading
+//!    (global + local) is zeroed for its pixels. Previously only the local
+//!    signal was gated, leaving flat regions (e.g. 2D anime faces with
+//!    ML-imposed spurious depth variance) vulnerable to extreme shifts.
 //!
 //! # Depth convention
 //!
@@ -82,14 +89,24 @@ pub fn depth_to_flat(
     // so outliers don't collapse the range). Local preserves fine detail
     // within each SLIC region (MAD-normalized). We sum them with separate
     // weights instead of averaging — both signals survive.
-    let local_shading  = compute_per_region_shading(&depth, ml_results, width, height, config);
+    //
+    // Phase 2: also compute a per-pixel flat mask from the per-cluster MAD.
+    // When a cluster's MAD is below `mad_threshold`, ALL shading (global +
+    // local) is zeroed for its pixels. This prevents the global signal from
+    // amplifying ML depth noise on flat regions (e.g. 2D anime faces where
+    // ML imposes spurious depth variance on what should be flat).
+    let (local_shading, per_cluster_mad) = compute_per_region_shading(
+        &depth, ml_results, width, height, config,
+    );
     let global_shading = compute_global_shading_percentile(&depth);
+    let flat_mask = compute_flat_mask(&depth, ml_results, width, height, config, &per_cluster_mad);
 
     let gw = config.global_depth_weight.clamp(0.0, 1.0);
     let lw = 1.0 - gw; // local weight mirrors global weight for symmetry
     let shading: Vec<f32> = local_shading.iter()
         .zip(global_shading.iter())
-        .map(|(&l, &g)| (g * gw + l * lw).clamp(-1.0, 1.0))
+        .zip(flat_mask.iter())
+        .map(|((&l, &g), &fm)| (g * gw + l * lw).clamp(-1.0, 1.0) * fm)
         .collect();
 
     // ── 3. Region-based background classification (C8, C13) ──────────────────
@@ -154,7 +171,12 @@ fn compute_global_shading_percentile(depth: &[f32]) -> Vec<f32> {
 
 /// Lookup the `lo_pct`-th and `hi_pct`-th percentiles of a slice.
 /// Sorts a copy — callers should cache the result if reused.
-fn percentiles(values: &[f32], lo_pct: f32, hi_pct: f32) -> (f32, f32) {
+///
+/// Phase 6: made `pub(crate)` so `edges::sobel_edge_mask` can reuse it for
+/// percentile-normalizing the Sobel gradient (puts the fallback on the same
+/// scale as ML edge probabilities, so `teed_threshold` means the same thing
+/// for both paths).
+pub(crate) fn percentiles(values: &[f32], lo_pct: f32, hi_pct: f32) -> (f32, f32) {
     if values.is_empty() { return (0.0, 0.0); }
     let mut sorted: Vec<f32> = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -178,18 +200,24 @@ fn percentiles(values: &[f32], lo_pct: f32, hi_pct: f32) -> (f32, f32) {
 ///
 /// If SLIC labels are not available, falls back to a global median/MAD over
 /// the entire depth map.
+///
+/// Phase 2: returns `(shading, per_cluster_mad)` where `per_cluster_mad` is
+/// a `Vec<f32>` indexed by cluster ID. The caller uses this to build a flat
+/// mask that gates the *global* shading signal too (previously only the
+/// local signal was gated, leaving flat regions vulnerable to ML depth noise
+/// amplified by global percentile normalization).
 fn compute_per_region_shading(
     depth: &[f32],
     ml_results: &MLResults,
     width: u32,
     height: u32,
     config: &DepthToFlatConfig,
-) -> Vec<f32> {
+) -> (Vec<f32>, Vec<f32>) {
     let n = (width * height) as usize;
     let mut shading = vec![0.0f32; n];
 
     if depth.len() < n {
-        return shading;
+        return (shading, Vec::new());
     }
 
     match &ml_results.slic_labels {
@@ -221,6 +249,9 @@ fn compute_per_region_shading(
                 stats[c] = (median, mad);
             }
 
+            // Phase 2: extract per-cluster MAD so the caller can build a flat mask.
+            let per_cluster_mad: Vec<f32> = stats.iter().map(|&(_, m)| m).collect();
+
             for i in 0..n {
                 let cluster = labels[i] as usize;
                 if cluster < n_clusters {
@@ -234,6 +265,8 @@ fn compute_per_region_shading(
                     }
                 }
             }
+
+            (shading, per_cluster_mad)
         }
         _ => {
             // ── Global fallback (no SLIC labels) ───────────────────────────────
@@ -243,16 +276,76 @@ fn compute_per_region_shading(
             let mut deviations = deviations;
             let mad = compute_median(&mut deviations);
 
+            // Phase 2: single-element MAD vector signals "whole-image flat"
+            // to the flat-mask builder.
+            let per_cluster_mad = vec![mad];
+
             if mad >= config.mad_threshold {
                 for i in 0..n {
                     let s = (median - depth[i]) / (1.4826 * mad);
                     shading[i] = s.clamp(-1.0, 1.0);
                 }
             }
+
+            (shading, per_cluster_mad)
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2 — Flat-region mask
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a per-pixel flat mask `∈ {0.0, 1.0}`.
+///
+/// `1.0` = region has meaningful depth variance → apply shading.
+/// `0.0` = region is flat (MAD < `mad_threshold`) → skip all shading.
+///
+/// When SLIC labels are available, the mask is per-cluster (all pixels in a
+/// flat cluster get 0.0). When SLIC is unavailable, the mask is whole-image
+/// (the single global MAD from `compute_per_region_shading` decides).
+///
+/// This gate is applied to the *final blended* shading (global + local), so
+/// flat regions are protected from both signals. Previously only the local
+/// signal was gated, leaving flat regions vulnerable to the global percentile
+/// normalization amplifying ML depth noise (e.g. 2D anime faces with ML-imposed
+/// spurious depth variance on what should be flat cheek/forehead regions).
+fn compute_flat_mask(
+    _depth: &[f32],
+    ml_results: &MLResults,
+    width: u32,
+    height: u32,
+    config: &DepthToFlatConfig,
+    per_cluster_mad: &[f32],
+) -> Vec<f32> {
+    let n = (width * height) as usize;
+    let mut mask = vec![1.0f32; n];
+
+    if per_cluster_mad.is_empty() {
+        return mask;
+    }
+
+    match &ml_results.slic_labels {
+        Some(labels) if labels.len() >= n => {
+            for i in 0..n {
+                let cluster = labels[i] as usize;
+                if cluster < per_cluster_mad.len() {
+                    if per_cluster_mad[cluster] < config.mad_threshold {
+                        mask[i] = 0.0;
+                    }
+                }
+            }
+        }
+        _ => {
+            // No SLIC labels — `per_cluster_mad` is the single global MAD.
+            // If global MAD is below threshold, the whole image is flat.
+            if per_cluster_mad[0] < config.mad_threshold {
+                for m in &mut mask { *m = 0.0; }
+            }
         }
     }
 
-    shading
+    mask
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -371,7 +464,9 @@ fn classify_background(
 /// Apply the contrast curve and Lab L bias to a foreground pixel.
 ///
 /// - Contrast curve: `s' = sign(s) * |s|^gamma`
-/// - Lab L bias: `L' = clamp(L + s' * strength * 100, 0, 100)`
+/// - Lab L bias: `L' = clamp(L + s' * strength * l_shift_scale, 0, 100)`
+///   Phase 2: `l_shift_scale` (default 40) replaces the implicit ×100 that
+///   produced ±60 L* shifts at default strength=0.6.
 fn apply_foreground_shading(
     original: Rgba<u8>,
     s: f32,
@@ -387,7 +482,9 @@ fn apply_foreground_shading(
     let s_curve = s.signum() * s.abs().powf(config.gamma);
 
     // Lab L bias
-    let new_l = (lab.l + s_curve * config.strength * 100.0).clamp(0.0, 100.0);
+    // Phase 2: uses configurable `l_shift_scale` (default 40) instead of the
+    // implicit ×100 that produced ±60 L* shifts at default strength=0.6.
+    let new_l = (lab.l + s_curve * config.strength * config.l_shift_scale).clamp(0.0, 100.0);
 
     lab_to_rgba(Lab::new(new_l, lab.a, lab.b), original[3])
 }

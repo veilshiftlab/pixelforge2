@@ -72,6 +72,13 @@ pub struct PixelForgeApp {
     // ── Pipeline state ───────────────────────────────────────────────────────
     pub processing: ProcessingState,
 
+    /// Phase 8 — Warnings collected by the last pipeline run. Each silent
+    /// fallback (depth_to_flat failure, palette empty, edge render failure,
+    /// EdgeMode::Internal SLIC fallback, etc.) pushes a human-readable
+    /// message here. The UI surfaces them in a dismissible yellow banner
+    /// below the preview tabs. Cleared at the start of each `process_image`.
+    pub pipeline_warnings: Vec<String>,
+
     // ── Configs ──────────────────────────────────────────────────────────────
     pub ml_config: MLConfig,
     pub transform_config: TransformConfig,
@@ -131,6 +138,24 @@ impl PixelForgeApp {
             ModelManager::new().unwrap_or_default(),
         ));
 
+        // Apply persisted config defaults to the runtime configs so user
+        // preferences survive across app restarts. Previously the `config`
+        // field was stored but never read after construction (dead-code
+        // warning). Now we apply:
+        //  - `processing.default_output_size` → transform_config.output_size
+        //  - `processing.default_edge_thickness` → edge_config.thickness
+        //  - `ui.default_zoom` → preview_zoom
+        // The `config` field itself is retained so future code can read
+        // other persisted prefs (e.g. directories, model_quality) and so
+        // `AppConfig::save()` can be called on exit to persist changes.
+        let mut transform_config = TransformConfig::default();
+        transform_config.output_size = config.processing.default_output_size.max(16);
+
+        let mut edge_config = EdgeConfig::default();
+        edge_config.thickness = config.processing.default_edge_thickness.clamp(1, 4);
+
+        let preview_zoom = config.ui.default_zoom.max(0.25);
+
         Self {
             config,
             model_manager,
@@ -141,17 +166,18 @@ impl PixelForgeApp {
             output_image: None,
             ml_results: None,
             processing: ProcessingState::Idle,
+            pipeline_warnings: Vec::new(),
             ml_config: MLConfig::default(),
-            transform_config: TransformConfig::default(),
+            transform_config,
             depth_to_flat_config: DepthToFlatConfig::default(),
-            edge_config: EdgeConfig::default(),
+            edge_config,
             palette_config: PaletteConfig::default(),
             slic_config: SlicConfig::default(),
             aspect_mode: AspectRatioMode::Square,
             custom_output_width: 64,
             custom_output_height: 64,
             preview_tab: PreviewTab::Original,
-            preview_zoom: 1.0,
+            preview_zoom,
             ml_depth_texture: None,
             ml_edge_texture: None,
             ml_slic_texture: None,
