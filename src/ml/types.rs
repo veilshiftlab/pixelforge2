@@ -1,15 +1,15 @@
 //! ML data types and structures
 //!
-//! After the pipeline repurpose (see `plan.md`), PixelForge ships only two ML
-//! models: Depth-Anything V2 (depth) and TEED (edges). Face detection,
-//! landmarks, and segmentation were removed because BiSeNet does not segment
-//! anime-style images reliably, and YOLOv8n-Face had no consumer once BiSeNet
-//! was gone. Region classification is now model-free, via SLIC superpixels
-//! (`crate::processing::slic`).
+//! PixelForge ships three ML models: Depth-Anything V2 (depth), DexiNed
+//! (edges), and AnimeSegment (foreground/background mask for anime-style
+//! images). Face detection, landmarks, and semantic parsing were removed
+//! because BiSeNet doesn't segment anime reliably. Region classification
+//! now uses the segmentation mask when available (falls back to SLIC
+//! superpixels via `crate::processing::slic`).
 
 /// Results from ML analysis.
 ///
-/// Both maps are stored at the **original image resolution**, row-major, with
+/// All maps are stored at the **original image resolution**, row-major, with
 /// values normalized to `[0, 1]`. The pipeline resamples them to the
 /// post-transform resolution when needed (see `processing/pipeline.rs`).
 #[derive(Debug, Clone, Default)]
@@ -27,6 +27,13 @@ pub struct MLResults {
     /// Edge probability map from TEED (normalized 0.0–1.0, row-major,
     /// same dims as input image). `1.0 = strong edge`.
     pub edge_map: Option<Vec<f32>>,
+
+    /// Foreground probability mask from AnimeSegment (normalized 0.0–1.0,
+    /// row-major, same dims as input image). `1.0 = foreground (character),
+    /// 0.0 = background`. Used by `depth_to_flat` for accurate background
+    /// classification (replaces the SLIC-based heuristic). Falls back to
+    /// SLIC when this is `None`.
+    pub segmentation_mask: Option<Vec<f32>>,
 
     /// SLIC superpixel label map (one cluster ID per pixel, same dims as
     /// input image). Populated lazily by `processing::slic` and cached here so

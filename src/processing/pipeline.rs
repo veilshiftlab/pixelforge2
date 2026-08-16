@@ -301,6 +301,7 @@ fn resample_ml_maps(
             depth_map: ml.depth_map.clone(),
             filtered_depth_map: ml.filtered_depth_map.clone(),
             edge_map: ml.edge_map.clone(),
+            segmentation_mask: ml.segmentation_mask.clone(),
             slic_labels: ml.slic_labels.clone(), // Phase 2: carry through
             slic_labels_k: ml.slic_labels_k,
             slic_labels_s: ml.slic_labels_s,
@@ -313,6 +314,11 @@ fn resample_ml_maps(
 
     let resampled_edge = ml.edge_map.as_ref().map(|e| {
         resample_nearest(e, original_dims, target_dims)
+    });
+
+    // Segmentation mask is a continuous probability [0,1] — bilinear resample.
+    let resampled_seg = ml.segmentation_mask.as_ref().map(|s| {
+        resample_bilinear(s, original_dims, target_dims)
     });
 
     // Phase 2 — C9: resample SLIC labels via nearest-neighbor (labels are
@@ -334,6 +340,7 @@ fn resample_ml_maps(
         // raw `depth_map`.
         filtered_depth_map: None,
         edge_map: resampled_edge,
+        segmentation_mask: resampled_seg,
         slic_labels: resampled_slic,
         slic_labels_k: ml.slic_labels_k,
         slic_labels_s: ml.slic_labels_s,

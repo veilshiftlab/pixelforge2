@@ -7,8 +7,10 @@
 //! All models use [`crate::ml::preprocess`] for consistent input preparation
 //! and coordinate remapping.
 
+pub mod anime_segment;
 pub mod depth_anything;
 pub mod teed;
 
+pub use anime_segment::{AnimeSegmenter, PlaceholderSegmenter};
 pub use depth_anything::{DepthAnythingEstimator, PlaceholderDepthEstimator};
 pub use teed::{PlaceholderEdgeDetector, TeedEdgeDetector};

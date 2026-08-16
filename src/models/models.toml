@@ -8,12 +8,16 @@
 # 2. Download each model using the URL below
 # 3. Rename the downloaded file to match the 'filename' field
 #
-# After the pipeline repurpose, only two models are used:
+# Three models are used by the pipeline:
 #   - Depth-Anything V2 Small (depth estimation)
 #   - DexiNed (edge detection)
+#   - AnimeSegment (foreground/background segmentation for anime-style images)
 #
-# Both are hosted in the user's own HuggingFace repo:
+# Depth + edge are hosted in the user's HuggingFace repo:
 #   https://huggingface.co/SStahan/ONNX-exports-dpt-seg-edge-face
+#
+# AnimeSegment is from skytnt/anime-seg on HuggingFace:
+#   https://huggingface.co/skytnt/anime-seg
 
 [models.depth_anything]
 # Depth-Anything V2 Small (ViT-S): Monocular depth estimation
@@ -44,12 +48,35 @@ size_mb = 133.8
 description = "Perceptual edge detection for the outline pass"
 enabled = true
 
+[models.segmentation]
+# AnimeSegment: Foreground/background segmentation for anime-style images
+# Output: Single-channel probability mask [0,1] — 1.0 = foreground (character),
+# 0.0 = background. Trained specifically on anime illustrations, so it works
+# reliably on cel-shaded content where generic segmentation models fail.
+#
+# Used by the depth-to-flat stage to classify background pixels with 100%
+# accuracy (replaces the SLIC-based heuristic that misclassified dress
+# regions as background). Also available to the edge pass for true silhouette
+# detection and to palette extraction for foreground-only sampling.
+#
+# Architecture: IS-Net (Information Segmentation Network), ~168 MB, dynamic
+# input resolution. Falls back to SLIC-based classification when the model
+# is not available.
+#
+# Source: skytnt/anime-seg on HuggingFace (file: isnetis.onnx)
+name = "AnimeSegment"
+filename = "anime_segment.onnx"
+url = "https://huggingface.co/skytnt/anime-seg/resolve/main/isnetis.onnx"
+size_mb = 168.0
+description = "Anime foreground/background segmentation (replaces SLIC for bg classification)"
+enabled = true
+
 # ============================================================================
 # ADDITIONAL MODELS (available in the repo but NOT used by the pipeline)
 # ============================================================================
 # The following models were exported to ONNX by the user but are intentionally
 # disabled. The pipeline repurpose plan explicitly dropped face detection and
-# segmentation because:
+# semantic parsing because:
 #   - BiSeNet (face parsing) doesn't work on anime-style images
 #   - YOLOv8n-Face's only consumer was BiSeNet (for face cropping)
 #   - "Two logic paths for photo vs anime" was explicitly rejected

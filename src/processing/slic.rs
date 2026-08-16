@@ -62,6 +62,11 @@ use rand::SeedableRng;
 /// `(L, a, b, depth, dL/dx, dL/dy, dDepth/dx, dDepth/dy, x·s, y·s)`
 type Feature = [f32; 10];
 
+/// Sentinel label for background pixels when a segmentation mask is provided.
+/// Downstream code checks for this to skip background pixels in per-region
+/// operations (shading, flat-mask, edge classification).
+pub const BG_LABEL: u32 = u32::MAX;
+
 /// Run SLIC superpixel clustering on an image with an optional depth map.
 ///
 /// Returns a `Vec<u32>` of cluster IDs, one per pixel, row-major, at the
@@ -69,9 +74,16 @@ type Feature = [f32; 10];
 ///
 /// If `depth_map` is `None`, the depth component is set to 0.5 (mid-gray)
 /// for all pixels — SLIC still works, just without depth-informed boundaries.
+///
+/// If `seg_mask` is provided (foreground probability [0,1]), only foreground
+/// pixels (mask ≥ 0.5) are clustered. Background pixels get the sentinel
+/// `BG_LABEL` (`u32::MAX`). This speeds up SLIC significantly and produces
+/// better character region boundaries (background doesn't pull centroids
+/// away from the subject).
 pub fn slic(
     image: &DynamicImage,
     depth_map: Option<&[f32]>,
+    seg_mask: Option<&[f32]>,
     config: &SlicConfig,
 ) -> Result<Vec<u32>> {
     let (width, height) = image.dimensions();
@@ -84,31 +96,49 @@ pub fn slic(
     let k = config.k.clamp(5, 128) as usize;
     let s = config.spatial_weight.clamp(0.0, 1.0);
 
+    // ── Build foreground mask ───────────────────────────────────────────────
+    // If seg_mask is provided, foreground = mask ≥ 0.5. Otherwise all pixels
+    // are foreground (legacy behavior).
+    let fg_mask: Vec<bool> = match seg_mask {
+        Some(m) if m.len() >= n_pixels => {
+            m.iter().map(|&v| v >= 0.5).collect()
+        }
+        _ => vec![true; n_pixels],
+    };
+    let n_fg = fg_mask.iter().filter(|&&f| f).count();
+
     // ── Build feature vectors (10D, with gradient terms) ────────────────────
     let features = build_features(image, depth_map, width, height, s);
 
-    // ── Initialize cluster centers (deterministic random sampling) ──────────
+    // ── Initialize cluster centers from FOREGROUND pixels only ──────────────
+    // When seg_mask is provided, we only want centroids in the character area.
+    // Collect foreground feature vectors, then sample k from them.
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    let mut centroids: Vec<Feature> = if features.len() >= k {
-        features.choose_multiple(&mut rng, k).copied().collect()
+    let fg_indices: Vec<usize> = (0..n_pixels).filter(|&i| fg_mask[i]).collect();
+
+    let mut centroids: Vec<Feature> = if fg_indices.len() >= k {
+        // Sample k indices from the foreground set, deterministically.
+        let mut chosen_indices: Vec<usize> = fg_indices
+            .choose_multiple(&mut rng, k)
+            .copied()
+            .collect();
+        chosen_indices.iter().map(|&i| features[i]).collect()
+    } else if !fg_indices.is_empty() {
+        fg_indices.iter().map(|&i| features[i]).collect()
     } else {
-        features.clone()
+        // No foreground pixels — fall back to all pixels.
+        features.choose_multiple(&mut rng, k).copied().collect()
     };
     let actual_k = centroids.len();
 
     // ── Phase 6 — P2: SLIC 2S×2S search window setup ────────────────────────
-    // Standard SLIC: each centroid only searches pixels within a 2S×2S window
-    // where S = sqrt(N/K) is the expected cluster grid spacing. Reduces
-    // assignment complexity from O(N*K) to O(N * 4) per iteration.
-    // The windowed search requires tracking each centroid's pixel-space
-    // position separately (feature vector stores normalized spatial coords).
-    let grid_s = ((n_pixels as f32 / actual_k as f32).sqrt() as u32).max(1);
+    // Grid spacing is based on foreground pixel count, not total pixels,
+    // so the window size adapts to the character area size.
+    let grid_s = ((n_fg.max(1) as f32 / actual_k as f32).sqrt() as u32).max(1);
     let wi = width as i32;
     let hi = height as i32;
 
     // Recover initial centroid positions from their spatial feature components.
-    // spatial_x = (x / max_dim) * 2.0 - 1.0) * spatial_weight
-    // → x = ((spatial_x / spatial_weight) + 1.0) * 0.5 * max_dim
     let max_dim = width.max(height) as f32;
     let mut centroid_pos: Vec<(i32, i32)> = centroids.iter().map(|f| {
         let nx = if s > 1e-6 { (f[8] / s) + 1.0 } else { 1.0 };
@@ -118,19 +148,15 @@ pub fn slic(
         (x.clamp(0, wi - 1), y.clamp(0, hi - 1))
     }).collect();
 
-    // ── K-means iterations (windowed) ────────────────────────────────────────
-    let mut labels = vec![0u32; n_pixels];
+    // ── K-means iterations (windowed, foreground-only) ──────────────────────
+    // Background pixels are never assigned a cluster — they keep BG_LABEL.
+    let mut labels = vec![BG_LABEL; n_pixels];
 
-    // Performance: reuse the distances buffer across iterations instead of
-    // allocating 4MB per iteration.
     let mut distances = vec![f32::MAX; n_pixels];
     let w_usize = width as usize;
 
-    // Standard SLIC uses 3-5 iterations. Was 10, which is overkill and
-    // doubles runtime. Early-exit on convergence still applies.
     for _iteration in 0..5 {
-        // ── Assignment step: for each centroid, search only its 2S×2S window ─
-        // Track minimum distance per pixel across all centroids.
+        // ── Assignment step: only assign foreground pixels ───────────────────
         for d in distances.iter_mut() { *d = f32::MAX; }
         for (c_idx, centroid) in centroids.iter().enumerate() {
             let (cx, cy) = centroid_pos[c_idx];
@@ -143,6 +169,7 @@ pub fn slic(
                 let row_start = (y as usize) * w_usize;
                 for x in x_start..=x_end {
                     let i = row_start + (x as usize);
+                    if !fg_mask[i] { continue; }  // skip background
                     let d = squared_distance(&features[i], centroid);
                     if d < distances[i] {
                         distances[i] = d;
@@ -152,20 +179,22 @@ pub fn slic(
             }
         }
 
-        // ── Update step: recompute centroids as cluster means ────────────────
+        // ── Update step: recompute centroids from assigned foreground pixels ─
         let mut sums = vec![[0.0f64; 10]; actual_k];
         let mut counts = vec![0u64; actual_k];
         let mut pos_sums = vec![[0.0f64; 2]; actual_k];
 
-        for (i, feat) in features.iter().enumerate() {
+        for i in 0..n_pixels {
+            if !fg_mask[i] { continue; }
             let c = labels[i] as usize;
+            if c == BG_LABEL as usize { continue; }
+            let feat = &features[i];
             for j in 0..10 {
                 sums[c][j] += feat[j] as f64;
             }
             counts[c] += 1;
-            // Track pixel-space position for windowed search next iteration
-            let px = (i % (width as usize)) as f64;
-            let py = (i / (width as usize)) as f64;
+            let px = (i % w_usize) as f64;
+            let py = (i / w_usize) as f64;
             pos_sums[c][0] += px;
             pos_sums[c][1] += py;
         }
@@ -181,7 +210,6 @@ pub fn slic(
                     }
                     centroids[c][j] = new_val;
                 }
-                // Update centroid pixel position for next iteration's windowed search
                 centroid_pos[c] = (
                     ((pos_sums[c][0] / count).round() as i32).clamp(0, wi - 1),
                     ((pos_sums[c][1] / count).round() as i32).clamp(0, hi - 1),
@@ -189,7 +217,6 @@ pub fn slic(
             }
         }
 
-        // Early exit if converged
         if !changed && _iteration > 0 {
             break;
         }
@@ -344,16 +371,26 @@ fn split_disconnected_clusters(mut labels: Vec<u32>, width: u32, height: u32) ->
     }
 
     // Find the highest existing cluster ID so new IDs start above it.
-    let max_existing_id = labels.iter().copied().max().unwrap_or(0);
+    // Skip BG_LABEL (u32::MAX) — background pixels aren't clusters.
+    let max_existing_id = labels.iter()
+        .copied()
+        .filter(|&l| l != BG_LABEL)
+        .max()
+        .unwrap_or(0);
     let mut next_id = max_existing_id + 1;
 
     // Visited mask so we don't process the same pixel twice.
     let mut visited = vec![false; n];
 
     // For each pixel, if not yet visited, BFS its 8-connected component.
+    // Skip background pixels (BG_LABEL) — they don't need splitting.
     for seed in 0..n {
         if visited[seed] { continue; }
         let original_label = labels[seed];
+        if original_label == BG_LABEL {
+            visited[seed] = true;
+            continue;
+        }
 
         // BFS the connected component starting at `seed`.
         let mut queue: Vec<usize> = vec![seed];

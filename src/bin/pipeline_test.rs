@@ -118,13 +118,14 @@ fn test_case(
     let depth_map = synthesize_depth_map(w, h);
     let edge_map = synthesize_edge_map(&image);
 
-    let slic_labels = pixelforge::processing::slic::slic(&image, Some(&depth_map), &slic_config)
+    let slic_labels = pixelforge::processing::slic::slic(&image, Some(&depth_map), None, &slic_config)
         .expect("SLIC should not fail");
 
     let ml = MLResults {
         depth_map: Some(depth_map),
         filtered_depth_map: None,
         edge_map: Some(edge_map),
+        segmentation_mask: None,
         slic_labels: Some(slic_labels),
         slic_labels_k: Some(slic_config.k),
         slic_labels_s: Some(slic_config.spatial_weight),
@@ -171,13 +172,14 @@ fn test_case_with_edges(
     let (w, h) = image.dimensions();
     let depth_map = synthesize_depth_map(w, h);
     let edge_map = synthesize_edge_map(&image);
-    let slic_labels = pixelforge::processing::slic::slic(&image, Some(&depth_map), &SlicConfig::default())
+    let slic_labels = pixelforge::processing::slic::slic(&image, Some(&depth_map), None, &SlicConfig::default())
         .expect("SLIC should not fail");
 
     let ml = MLResults {
         depth_map: Some(depth_map),
         filtered_depth_map: None,
         edge_map: Some(edge_map),
+        segmentation_mask: None,
         slic_labels: Some(slic_labels),
         slic_labels_k: Some(5),
         slic_labels_s: Some(0.5),

@@ -101,6 +101,9 @@ pub struct PixelForgeApp {
     pub ml_depth_texture: Option<TextureHandle>,
     pub ml_edge_texture:  Option<TextureHandle>,
     pub ml_slic_texture:  Option<TextureHandle>,
+    /// Segmentation mask texture cache (AnimeSegment). Foreground=white,
+    /// background=black. Built lazily like the other ML map textures.
+    pub ml_seg_texture:   Option<TextureHandle>,
     /// 1:1 zoom toggle for the ML Maps tab (Phase 1 — C4). When true, maps
     /// display at native resolution (1 source pixel = 1 screen pixel) and
     /// the user can scroll/pan inside the scroll area.
@@ -181,6 +184,7 @@ impl PixelForgeApp {
             ml_depth_texture: None,
             ml_edge_texture: None,
             ml_slic_texture: None,
+            ml_seg_texture: None,
             ml_maps_native: false,
             current_preset: None,
             show_model_dialog: false,
@@ -225,6 +229,7 @@ impl eframe::App for PixelForgeApp {
                     self.ml_depth_texture = None;
                     self.ml_edge_texture  = None;
                     self.ml_slic_texture  = None;
+                    self.ml_seg_texture   = None;
                     self.processing = ProcessingState::Complete;
                 }
                 Ok(Err(e)) => {

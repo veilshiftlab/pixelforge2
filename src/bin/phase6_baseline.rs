@@ -19,7 +19,7 @@ fn main() {
     let image = test_image(w, h);
     let depth = depth_map(w, h);
     let edge = edge_map(w, h);
-    let slic = pixelforge::processing::slic::slic(&image, Some(&depth), &SlicConfig::default())
+    let slic = pixelforge::processing::slic::slic(&image, Some(&depth), None, &SlicConfig::default())
         .expect("SLIC should not fail");
 
     // Pre-Phase-6 path: no filtered_depth_map cache (depth_to_flat recomputes)
@@ -27,6 +27,7 @@ fn main() {
         depth_map: Some(depth.clone()),
         filtered_depth_map: None, // BASELINE
         edge_map: Some(edge.clone()),
+        segmentation_mask: None,
         slic_labels: Some(slic.clone()),
         slic_labels_k: Some(5),
         slic_labels_s: Some(0.5),
@@ -37,6 +38,7 @@ fn main() {
         depth_map: Some(depth.clone()),
         filtered_depth_map: Some(filtered), // PHASE 6
         edge_map: Some(edge.clone()),
+        segmentation_mask: None,
         slic_labels: Some(slic.clone()),
         slic_labels_k: Some(5),
         slic_labels_s: Some(0.5),

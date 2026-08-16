@@ -1,8 +1,8 @@
 //! ML Configuration Structures
 //!
-//! After the pipeline repurpose, the only ML models are Depth-Anything V2
-//! and TEED. Face-detection and segmentation configs were removed along with
-//! the models themselves.
+//! Three ML models: Depth-Anything V2 (depth), DexiNed (edges), and
+//! AnimeSegment (foreground/background mask). Face-detection and semantic
+//! parsing configs were removed along with those models.
 
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +63,30 @@ impl Default for EdgeConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Segmentation (AnimeSegment)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Configuration for the AnimeSegment foreground/background segmentation.
+///
+/// The model outputs a probability mask [0,1] per pixel. The `threshold`
+/// controls the foreground/background cutoff. Pixels above the threshold
+/// are foreground (character), below are background.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentationConfig {
+    /// Foreground probability threshold (default: 0.5).
+    /// Pixels with mask value ≥ threshold are classified as foreground.
+    /// Lower = more pixels classified as foreground (may include background bleed).
+    /// Higher = stricter foreground (may clip character edges).
+    pub threshold: f32,
+}
+
+impl Default for SegmentationConfig {
+    fn default() -> Self {
+        Self { threshold: 0.5 }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Combined ML configuration
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -70,11 +94,17 @@ impl Default for EdgeConfig {
 pub struct MLConfig {
     pub depth: DepthConfig,
     pub edge: EdgeConfig,
+    pub segmentation: SegmentationConfig,
 
     /// Enable depth estimation
     pub depth_estimation_enabled: bool,
     /// Enable TEED edge detection
     pub edge_detection_enabled: bool,
+    /// Enable AnimeSegment foreground/background segmentation.
+    /// When enabled and the model is available, the depth-to-flat stage uses
+    /// the mask for accurate background classification instead of the SLIC
+    /// heuristic.
+    pub segmentation_enabled: bool,
 
     /// Execution mode (CPU / GPU sequential / GPU parallel)
     pub execution: ExecutionConfig,
@@ -85,8 +115,10 @@ impl Default for MLConfig {
         Self {
             depth: DepthConfig::default(),
             edge: EdgeConfig::default(),
+            segmentation: SegmentationConfig::default(),
             depth_estimation_enabled: true,
             edge_detection_enabled: true,
+            segmentation_enabled: true,
             execution: ExecutionConfig::default(),
         }
     }
@@ -97,6 +129,7 @@ impl MLConfig {
         Self {
             depth_estimation_enabled: true,
             edge_detection_enabled: false,
+            segmentation_enabled: false,
             ..Default::default()
         }
     }
@@ -105,12 +138,15 @@ impl MLConfig {
         Self {
             depth_estimation_enabled: false,
             edge_detection_enabled: true,
+            segmentation_enabled: false,
             ..Default::default()
         }
     }
 
     pub fn any_enabled(&self) -> bool {
-        self.depth_estimation_enabled || self.edge_detection_enabled
+        self.depth_estimation_enabled
+            || self.edge_detection_enabled
+            || self.segmentation_enabled
     }
 }
 

@@ -117,20 +117,29 @@ fn models_section(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
 
 fn ml_section(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
     ui.collapsing("🤖 ML Analysis", |ui| {
-        // Enable toggles — one per remaining model
+        // Enable toggles — one per model
         ui.checkbox(&mut app.ml_config.depth_estimation_enabled, "Depth Estimation (Depth-Anything V2)");
         ui.checkbox(&mut app.ml_config.edge_detection_enabled,  "Edge Detection (DexiNed)");
+        ui.checkbox(&mut app.ml_config.segmentation_enabled,    "Segmentation (AnimeSegment)")
+            .on_hover_text(
+                "Anime foreground/background segmentation.\n\
+                 When enabled and the model is downloaded, the depth-to-flat stage\n\
+                 uses the mask for accurate background classification (replaces the\n\
+                 SLIC heuristic that misclassifies dress regions as background).\n\
+                 Falls back to SLIC when the model is unavailable."
+            );
 
         // Note: edge threshold is in the Edges panel (edge_config.teed_threshold).
         // It controls which pixels become outlines during the pixel-art pass.
 
         ui.separator();
 
-        // ML-result status badges (depth + edges only)
+        // ML-result status badges (depth + edges + segmentation)
         if let Some(ref r) = app.ml_results {
             ui.horizontal_wrapped(|ui| {
                 badge(ui, "📐", r.depth_map.is_some());
                 badge(ui, "✏",  r.edge_map.is_some());
+                badge(ui, "🎭",  r.segmentation_mask.is_some());
             });
         }
 

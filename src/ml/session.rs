@@ -241,10 +241,12 @@ fn best_directml_device_id() -> i32 {
 /// remain. FaceDetection and Segmentation were removed along with YOLOv8n-Face
 /// and BiSeNet. The dedicated `EdgeDetection` variant prevents the cache-key
 /// collision risk that existed when TEED reused `DepthEstimation`.
+/// `Segmentation` was added for AnimeSegment (foreground/background mask).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelType {
     DepthEstimation,
     EdgeDetection,
+    Segmentation,
 }
 
 impl ModelType {
@@ -257,6 +259,7 @@ impl ModelType {
         match self {
             Self::DepthEstimation => [1, 3, 384, 384],
             Self::EdgeDetection => [1, 3, 512, 512],
+            Self::Segmentation => [1, 3, 1024, 1024],
         }
     }
 }

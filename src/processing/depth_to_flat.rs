@@ -228,12 +228,19 @@ fn compute_per_region_shading(
             //
             // SLIC IDs may not be contiguous after Phase 3's
             // `split_disconnected_clusters`, so size by max(labels)+1.
-            let max_id = labels.iter().copied().max().unwrap_or(0) as usize;
+            // Background pixels have BG_LABEL (u32::MAX) — exclude them.
+            let max_id = labels.iter()
+                .copied()
+                .filter(|&l| l != crate::processing::slic::BG_LABEL)
+                .max()
+                .unwrap_or(0) as usize;
             let n_clusters = max_id + 1;
 
             let mut clusters: Vec<Vec<f32>> = vec![Vec::new(); n_clusters];
             for i in 0..n {
-                let c = labels[i] as usize;
+                let c = labels[i];
+                if c == crate::processing::slic::BG_LABEL { continue; }
+                let c = c as usize;
                 if c < n_clusters {
                     clusters[c].push(depth[i]);
                 }
@@ -253,7 +260,13 @@ fn compute_per_region_shading(
             let per_cluster_mad: Vec<f32> = stats.iter().map(|&(_, m)| m).collect();
 
             for i in 0..n {
-                let cluster = labels[i] as usize;
+                let cluster = labels[i];
+                if cluster == crate::processing::slic::BG_LABEL {
+                    // Background pixel — no per-region shading (gets bg treatment).
+                    shading[i] = 0.0;
+                    continue;
+                }
+                let cluster = cluster as usize;
                 if cluster < n_clusters {
                     let (median, mad) = stats[cluster];
                     if mad < config.mad_threshold {
@@ -328,7 +341,12 @@ fn compute_flat_mask(
     match &ml_results.slic_labels {
         Some(labels) if labels.len() >= n => {
             for i in 0..n {
-                let cluster = labels[i] as usize;
+                let cluster = labels[i];
+                if cluster == crate::processing::slic::BG_LABEL {
+                    // Background pixel — not flat (gets bg treatment anyway).
+                    continue;
+                }
+                let cluster = cluster as usize;
                 if cluster < per_cluster_mad.len() {
                     if per_cluster_mad[cluster] < config.mad_threshold {
                         mask[i] = 0.0;
@@ -349,12 +367,19 @@ fn compute_flat_mask(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Region-based background classification (C8, C13)
+// Background classification
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Build a per-pixel boolean mask: `true` = background, `false` = foreground.
 ///
-/// When SLIC labels are available, classification is per-cluster:
+/// **Priority 1 — Segmentation mask (AnimeSegment)**: when the segmentation
+/// model is available, background classification is simply
+/// `mask[i] < threshold`. This is the most accurate path — the model is
+/// trained on anime illustrations and reliably separates character from
+/// background regardless of color/depth. This replaces the SLIC heuristic
+/// that misclassified dress regions as background on flat-cel-shaded images.
+///
+/// **Priority 2 — SLIC region-based** (fallback when segmentation unavailable):
 /// ```text
 /// for each SLIC cluster:
 ///   mean_depth = mean(depth[cluster])
@@ -366,8 +391,8 @@ fn compute_flat_mask(
 /// This eliminates the depth-bleed leakage onto subject edges that the old
 /// per-pixel `d > threshold` produced.
 ///
-/// When SLIC labels are unavailable, falls back to per-pixel Otsu/manual
-/// threshold (the Phase 1 behavior).
+/// **Priority 3 — Per-pixel threshold** (fallback when SLIC also unavailable):
+/// Otsu or manual depth threshold (the Phase 1 behavior).
 fn classify_background(
     depth: &[f32],
     ml_results: &MLResults,
@@ -382,23 +407,57 @@ fn classify_background(
         return mask;
     }
 
+    // ── Priority 1: AnimeSegment mask ────────────────────────────────────────
+    // The segmentation mask is a foreground probability [0,1]. Background =
+    // mask value below threshold. Default threshold 0.5 (from SegmentationConfig).
+    if let Some(seg_mask) = &ml_results.segmentation_mask {
+        if seg_mask.len() >= n {
+            // Use the segmentation threshold from config if available, else 0.5.
+            // (The threshold is part of MLConfig.segmentation.threshold, but
+            // classify_background receives DepthToFlatConfig, not MLConfig.
+            // We hardcode 0.5 here — the threshold is also applied at the
+            // preview/visualization stage where MLConfig is available.)
+            let seg_threshold = 0.5f32;
+            for i in 0..n {
+                mask[i] = seg_mask[i] < seg_threshold;
+            }
+            log::debug!(
+                "Background classification: using AnimeSegment mask (threshold={})",
+                seg_threshold
+            );
+            return mask;
+        }
+    }
+
     let labels = match &ml_results.slic_labels {
         Some(l) if l.len() >= n => l,
         _ => {
-            // ── Fallback: per-pixel threshold (Otsu or manual) ─────────────────
+            // ── Priority 3: per-pixel threshold (Otsu or manual) ───────────────
             let threshold = compute_bg_threshold(depth, config);
             for i in 0..n {
                 mask[i] = depth[i] > threshold;
             }
+            log::debug!(
+                "Background classification: per-pixel threshold ({:.3}) — no SLIC, no segmentation",
+                threshold
+            );
             return mask;
         }
     };
 
+    log::debug!(
+        "Background classification: SLIC region-based (no segmentation mask)"
+    );
+
     // ── Region-based classification (Phase 3 — C8, C13) ───────────────────────
     // Phase 6 — P5: Vec-indexed by cluster ID instead of HashMap.
     // SLIC IDs may not be contiguous after Phase 3's split_disconnected_clusters,
-    // so size by max(labels)+1.
-    let max_id = labels.iter().copied().max().unwrap_or(0) as usize;
+    // so size by max(labels)+1. Background pixels have BG_LABEL — exclude.
+    let max_id = labels.iter()
+        .copied()
+        .filter(|&l| l != crate::processing::slic::BG_LABEL)
+        .max()
+        .unwrap_or(0) as usize;
     let n_clusters = max_id + 1;
     let mut cluster_sum:    Vec<f64> = vec![0.0; n_clusters];
     let mut cluster_count:  Vec<u32> = vec![0;    n_clusters];
@@ -407,7 +466,9 @@ fn classify_background(
     for y in 0..height {
         for x in 0..width {
             let i = (y * width + x) as usize;
-            let lbl = labels[i] as usize;
+            let lbl = labels[i];
+            if lbl == crate::processing::slic::BG_LABEL { continue; }
+            let lbl = lbl as usize;
             if lbl >= n_clusters { continue; }
             cluster_sum[lbl]   += depth[i] as f64;
             cluster_count[lbl] += 1;
@@ -448,7 +509,13 @@ fn classify_background(
 
     // Apply to per-pixel mask
     for i in 0..n {
-        let lbl = labels[i] as usize;
+        let lbl = labels[i];
+        if lbl == crate::processing::slic::BG_LABEL {
+            // Background pixel (from seg mask) — already classified as bg.
+            mask[i] = true;
+            continue;
+        }
+        let lbl = lbl as usize;
         if lbl < n_clusters {
             mask[i] = cluster_is_bg[lbl];
         }

@@ -58,7 +58,7 @@ pub fn draw(app: &mut PixelForgeApp, ctx: &egui::Context) {
 /// `app.pipeline_warnings`; the next `process_image` run repopulates it.
 fn warnings_banner(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
     egui::Frame::group(ui.style())
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 160, 0)))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 0)))
         .fill(egui::Color32::from_rgb(60, 50, 0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -211,10 +211,21 @@ fn ml_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
         }
     }
 
+    let needs_seg_tex = app.ml_seg_texture.is_none()
+        && app.ml_results.as_ref().and_then(|r| r.segmentation_mask.as_deref()).is_some();
+    if needs_seg_tex {
+        if let Some(mask) = app.ml_results.as_ref().and_then(|r| r.segmentation_mask.as_deref()) {
+            app.ml_seg_texture = Some(build_map_texture(
+                ctx, "ml_seg_cached", mask, img_w, img_h, MapKind::Gray,
+            ));
+        }
+    }
+
     // Snapshot lightweight state for the closures
     let has_depth = app.ml_results.as_ref().unwrap().depth_map.is_some();
     let has_edge  = app.ml_results.as_ref().unwrap().edge_map.is_some();
     let has_slic  = app.ml_results.as_ref().unwrap().slic_labels.is_some();
+    let has_seg   = app.ml_results.as_ref().unwrap().segmentation_mask.is_some();
 
     let depth_stats = app.ml_results.as_ref()
         .and_then(|r| r.depth_map.as_deref())
@@ -239,6 +250,7 @@ fn ml_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
     let depth_tex = app.ml_depth_texture.clone();
     let edge_tex  = app.ml_edge_texture.clone();
     let slic_tex  = app.ml_slic_texture.clone();
+    let seg_tex   = app.ml_seg_texture.clone();
     let native    = app.ml_maps_native;
 
     let mut rerun = false;
@@ -308,6 +320,28 @@ fn ml_panel(app: &mut PixelForgeApp, ui: &mut egui::Ui, ctx: &egui::Context) {
                 }
             } else {
                 ui.label("Not computed — run Process once first.");
+            }
+        });
+
+        // ── Segmentation mask ─────────────────────────────────────────────
+        ui.collapsing("🎭 Segmentation (AnimeSegment)", |ui| {
+            if has_seg {
+                ui.colored_label(egui::Color32::GREEN, "✅ Generated");
+                ui.label(egui::RichText::new(
+                    format!("{}×{} (AnimeSegment, foreground=white, background=black)", img_w, img_h)
+                ).small().weak());
+                ui.label(egui::RichText::new(
+                    "White = foreground (character), black = background.\n\
+                     Used by depth-to-flat for accurate background classification."
+                ).small().weak());
+                if let Some(ref tex) = seg_tex {
+                    map_image(ui, tex.id(), img_w, img_h, native);
+                }
+            } else {
+                ui.label("Not run");
+                ui.label(egui::RichText::new(
+                    "Enable Segmentation in the ML Analysis panel and re-run."
+                ).small().weak());
             }
         });
 
@@ -518,7 +552,7 @@ fn drop_zone(app: &mut PixelForgeApp, ui: &mut egui::Ui) {
         ui.painter().rect_stroke(
             rect,
             8.0,
-            egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 160, 255)),
+            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(100, 160, 255)),
         );
     }
 

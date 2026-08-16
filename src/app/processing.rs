@@ -45,6 +45,7 @@ pub fn load_image(app: &mut PixelForgeApp, path: &std::path::Path, ctx: &egui::C
             app.ml_depth_texture = None;
             app.ml_edge_texture  = None;
             app.ml_slic_texture  = None;
+            app.ml_seg_texture   = None;
             // Phase 8 — clear stale warnings from any previous image
             app.pipeline_warnings.clear();
 
@@ -66,6 +67,7 @@ pub fn clear_image(app: &mut PixelForgeApp) {
     app.ml_depth_texture = None;
     app.ml_edge_texture  = None;
     app.ml_slic_texture  = None;
+    app.ml_seg_texture   = None;
     // Phase 8 — clear stale warnings
     app.pipeline_warnings.clear();
 }
@@ -89,21 +91,40 @@ pub fn refresh_input_preview(app: &mut PixelForgeApp, ctx: &egui::Context) {
 }
 
 pub fn open_file_dialog(app: &mut PixelForgeApp) {
-    if let Some(path) = rfd::FileDialog::new()
-        .add_filter("Image", &["png", "jpg", "jpeg", "webp", "bmp"])
-        .pick_file()
-    {
+    // Phase 9 / Task 6 follow-up: use persisted `last_image_dir` as the
+    // dialog's starting directory. Reads `app.config.directories` so the
+    // `config` field is no longer dead code.
+    let mut dialog = rfd::FileDialog::new()
+        .add_filter("Image", &["png", "jpg", "jpeg", "webp", "bmp"]);
+    if let Some(dir) = &app.config.directories.last_image_dir {
+        if dir.is_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+    }
+    if let Some(path) = dialog.pick_file() {
+        // Persist the directory for next time.
+        if let Some(parent) = path.parent() {
+            app.config.directories.last_image_dir = Some(parent.to_path_buf());
+            let _ = app.config.save();
+        }
         app.pending_file_load = Some(path);
     }
 }
 
 pub fn export_image(app: &PixelForgeApp) {
     let Some(output) = &app.output_image else { return };
-    if let Some(path) = rfd::FileDialog::new()
+    // Read persisted `last_export_dir` (Task 6 follow-up: makes `app.config`
+    // actually used). Persistence-on-save would require `&mut self`; skipped
+    // to avoid changing the function signature.
+    let mut dialog = rfd::FileDialog::new()
         .add_filter("PNG",  &["png"])
-        .add_filter("JPEG", &["jpg", "jpeg"])
-        .save_file()
-    {
+        .add_filter("JPEG", &["jpg", "jpeg"]);
+    if let Some(dir) = &app.config.directories.last_export_dir {
+        if dir.is_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+    }
+    if let Some(path) = dialog.save_file() {
         let cfg = ExportConfig { scale: app.transform_config.export_scale, ..Default::default() };
         match ImageExporter::export(&output.image, &path, &cfg) {
             Ok(_)  => log::info!("Exported to {}", path.display()),
@@ -130,7 +151,7 @@ pub fn export_contact_sheet(app: &PixelForgeApp) {
     let (in_w, in_h) = input.image.dimensions();
 
     // ── Build rows ───────────────────────────────────────────────────────────
-    let mut rows: Vec<crate::image::ContactSheetRow<'_>> = Vec::with_capacity(7);
+    let mut rows: Vec<crate::image::ContactSheetRow<'_>> = Vec::with_capacity(8);
 
     // Row 1: Input image
     rows.push(crate::image::ContactSheetRow {
@@ -198,6 +219,22 @@ pub fn export_contact_sheet(app: &PixelForgeApp) {
         label:    "SLIC REGIONS",
         image:    slic_img,
         subtitle: slic_sub,
+        settings: None,
+    });
+
+    // Row 4b: Segmentation mask (AnimeSegment)
+    let seg_img = app.ml_results.as_ref()
+        .and_then(|r| r.segmentation_mask.as_deref())
+        .map(|m| ml_edge_to_image(m, in_w, in_h));  // reuse grayscale converter
+    let seg_sub: Option<&str> = if seg_img.is_some() {
+        Some(Box::leak(format!("{in_w}x{in_h}  anime-segment").into_boxed_str()) as &str)
+    } else {
+        Some("not run — enable segmentation and run ML analysis")
+    };
+    rows.push(crate::image::ContactSheetRow {
+        label:    "SEGMENTATION",
+        image:    seg_img,
+        subtitle: seg_sub,
         settings: None,
     });
 
@@ -375,9 +412,15 @@ pub fn ml_slic_to_image(labels: &[u32], w: u32, h: u32) -> image::DynamicImage {
     for y in 0..h {
         for x in 0..w {
             let idx = (y * w + x) as usize;
-            let label = labels.get(idx).copied().unwrap_or(0) as usize;
-            let c = PALETTE[label % PALETTE.len()];
-            img.put_pixel(x, y, image::Rgba([c[0], c[1], c[2], 255]));
+            let label = labels.get(idx).copied().unwrap_or(0);
+            // BG_LABEL (u32::MAX) = background pixel (not clustered).
+            // Render as dark gray to distinguish from foreground clusters.
+            if label == crate::processing::slic::BG_LABEL {
+                img.put_pixel(x, y, image::Rgba([30, 30, 30, 255]));
+            } else {
+                let c = PALETTE[(label as usize) % PALETTE.len()];
+                img.put_pixel(x, y, image::Rgba([c[0], c[1], c[2], 255]));
+            }
         }
     }
     image::DynamicImage::ImageRgba8(img)
@@ -546,8 +589,11 @@ pub fn process_image(app: &mut PixelForgeApp, ctx: &egui::Context) {
         if need_recompute {
             // Phase 1 — P6: invalidate cached SLIC texture before recompute
             app.ml_slic_texture = None;
+            // Pass segmentation mask to SLIC so it only clusters foreground
+            // pixels (character area). Background gets BG_LABEL sentinel.
+            let seg_mask = ml.segmentation_mask.as_deref();
             if let Some(ref depth) = ml.depth_map {
-                match crate::processing::slic::slic(&input, Some(depth), &app.slic_config) {
+                match crate::processing::slic::slic(&input, Some(depth), seg_mask, &app.slic_config) {
                     Ok(labels) => {
                         ml.slic_labels = Some(labels);
                         ml.slic_labels_k = Some(app.slic_config.k);
@@ -560,7 +606,7 @@ pub fn process_image(app: &mut PixelForgeApp, ctx: &egui::Context) {
                 }
             } else {
                 // No depth map — still run SLIC with depth=0.5 fallback
-                match crate::processing::slic::slic(&input, None, &app.slic_config) {
+                match crate::processing::slic::slic(&input, None, seg_mask, &app.slic_config) {
                     Ok(labels) => {
                         ml.slic_labels = Some(labels);
                         ml.slic_labels_k = Some(app.slic_config.k);

@@ -18,13 +18,14 @@ fn main() {
     let image = generate_test_image(128, 128);
     let depth_map = synthesize_depth_map(128, 128);
     let edge_map = synthesize_edge_map(&image);
-    let slic_labels = pixelforge::processing::slic::slic(&image, Some(&depth_map), &SlicConfig::default())
+    let slic_labels = pixelforge::processing::slic::slic(&image, Some(&depth_map), None, &SlicConfig::default())
         .expect("SLIC should not fail");
 
     let ml = MLResults {
         depth_map: Some(depth_map),
         filtered_depth_map: None,
         edge_map: Some(edge_map),
+        segmentation_mask: None,
         slic_labels: Some(slic_labels),
         slic_labels_k: Some(5),
         slic_labels_s: Some(0.5),

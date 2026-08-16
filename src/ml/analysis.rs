@@ -4,12 +4,14 @@
 //! Models are loaded once and cached via the global [`SessionManager`] — calling
 //! `MLAnalysis::analyze` multiple times on different images does not reload models.
 //!
-//! After the pipeline repurpose, only Depth-Anything V2 and TEED run here.
-//! ML outputs are **optional enhancements**: if either model fails to load or
-//! to produce a map, the downstream pipeline degrades gracefully.
+//! Three ML models run here: Depth-Anything V2 (depth), DexiNed (edges), and
+//! AnimeSegment (foreground/background mask). ML outputs are **optional
+//! enhancements**: if any model fails to load or produce a map, the downstream
+//! pipeline degrades gracefully (SLIC fallback for background classification).
 
 use super::{MLConfig, MLResults};
 use super::models::{
+    AnimeSegmenter, PlaceholderSegmenter,
     DepthAnythingEstimator, PlaceholderDepthEstimator,
     TeedEdgeDetector, PlaceholderEdgeDetector,
 };
@@ -56,6 +58,10 @@ impl MLAnalysis {
             results.edge_map = Some(run_edge_detection(image, model_manager)?);
         }
 
+        if config.segmentation_enabled {
+            results.segmentation_mask = Some(run_segmentation(image, model_manager)?);
+        }
+
         Ok(results)
     }
 }
@@ -97,5 +103,23 @@ fn run_edge_detection(
     } else {
         log::warn!("Edge detection model unavailable — using Sobel placeholder");
         PlaceholderEdgeDetector.detect(image)
+    }
+}
+
+fn run_segmentation(
+    image: &DynamicImage,
+    model_manager: &Arc<RwLock<ModelManager>>,
+) -> Result<Vec<f32>> {
+    let model_path = model_manager.read().get_model_path("segmentation");
+
+    if let Some(path) = model_path {
+        log::info!("Running segmentation (AnimeSegment)");
+        AnimeSegmenter::new(&path)?.segment(image)
+    } else {
+        log::warn!(
+            "Segmentation model unavailable — using placeholder. \
+             Background classification will fall back to SLIC heuristic."
+        );
+        PlaceholderSegmenter.segment(image)
     }
 }

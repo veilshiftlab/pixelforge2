@@ -139,14 +139,16 @@ pub fn draw_edges(
     // and fewer broken-line gaps. Output is a binary mask (255 = edge, 0 = bg).
     let cleaned = cleanup_edge_mask(&skeleton, width, height, config.min_segment_length);
 
-    // ── Edge-mode classification (C9) — Internal vs Outlines ────────────────
-    // If SLIC labels are available at the post-transform resolution, classify
-    // each edge pixel: outline if its 3×3 neighborhood spans ≥2 labels.
-    // Phase 8: pass `warnings` so the Phase 7 Internal-mode fallback can push.
+    // ── Edge-mode classification — Internal vs Outlines ─────────────────────
+    // Priority 1: segmentation mask (foreground/bg boundary = outline).
+    // Priority 2: SLIC labels (label span ≥2 = outline).
+    // Phase 8: pass `warnings` so the Internal-mode fallback can push.
     let slic_labels: Option<&[u32]> = ml_results
         .and_then(|ml| ml.slic_labels.as_deref());
+    let seg_mask: Option<&[f32]> = ml_results
+        .and_then(|ml| ml.segmentation_mask.as_deref());
     let classification = classify_edges(
-        &cleaned, slic_labels, width, height, config.edge_mode, warnings,
+        &cleaned, slic_labels, seg_mask, width, height, config.edge_mode, warnings,
     );
 
     // ── Phase 4 — Compositing with chosen outline style ─────────────────────
@@ -628,6 +630,7 @@ fn zhang_suen_pass(img: &[u8], w: usize, h: usize, sub_a: bool) -> Vec<usize> {
 fn classify_edges(
     skeleton: &[u8],
     slic_labels: Option<&[u32]>,
+    seg_mask: Option<&[f32]>,
     width: u32,
     height: u32,
     mode: EdgeMode,
@@ -639,6 +642,50 @@ fn classify_edges(
     let w = width as i32;
     let h = height as i32;
 
+    // ── Priority 1: Segmentation mask ──────────────────────────────────────
+    // When the segmentation mask is available, outline = edge pixel whose 3×3
+    // neighborhood spans the foreground/background boundary. Internal = edge
+    // pixel entirely within foreground. This is far more reliable than SLIC
+    // label span because the mask directly encodes the character boundary.
+    if let Some(mask) = seg_mask {
+        if mask.len() >= n {
+            for y in 0..h {
+                for x in 0..w {
+                    let idx = (y as usize) * (w as usize) + (x as usize);
+                    if skeleton[idx] == 0 { continue; }
+
+                    // Check if 3×3 neighborhood spans fg/bg boundary.
+                    let mut has_fg = false;
+                    let mut has_bg = false;
+                    for dy in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            let nx = x + dx;
+                            let ny = y + dy;
+                            if nx < 0 || ny < 0 || nx >= w || ny >= h { continue; }
+                            let nidx = (ny as usize) * (w as usize) + (nx as usize);
+                            if mask[nidx] >= 0.5 {
+                                has_fg = true;
+                            } else {
+                                has_bg = true;
+                            }
+                        }
+                    }
+
+                    let is_outline = has_fg && has_bg;
+                    let keep_it = match mode {
+                        EdgeMode::None     => false,
+                        EdgeMode::Outlines => is_outline,
+                        EdgeMode::Internal => !is_outline && has_fg,
+                        EdgeMode::Both     => true,
+                    };
+                    keep[idx] = keep_it;
+                }
+            }
+            return keep;
+        }
+    }
+
+    // ── Priority 2: SLIC labels (fallback) ──────────────────────────────────
     let labels = match slic_labels {
         Some(l) if l.len() >= n => l,
         _ => {
@@ -656,7 +703,7 @@ fn classify_edges(
                     // without SLIC) and warn. Phase 7 fix: previously
                     // this silently behaved like Both.
                     // Phase 8: also push to `warnings` so the UI surfaces it.
-                    let msg = "EdgeMode::Internal requires SLIC labels; \
+                    let msg = "EdgeMode::Internal requires SLIC labels or segmentation mask; \
                                falling back to border-touching edges only.";
                     log::warn!("{}", msg);
                     warnings.push(msg.into());

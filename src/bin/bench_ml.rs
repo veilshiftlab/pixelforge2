@@ -26,14 +26,14 @@ fn main() {
 
     // ── SLIC superpixels ──
     let t0 = Instant::now();
-    let _labels = slic(&input, Some(&depth_map), &SlicConfig::default()).expect("slic failed");
+    let _labels = slic(&input, Some(&depth_map), None, &SlicConfig::default()).expect("slic failed");
     println!("slic (default K={}): {:.1}ms", SlicConfig::default().k, t0.elapsed().as_secs_f32() * 1000.0);
 
     // ── SLIC with higher K (like the user might use) ──
     for &k in &[32u32, 64, 128] {
         let cfg = SlicConfig { k, spatial_weight: 0.7 };
         let t0 = Instant::now();
-        let _labels = slic(&input, Some(&depth_map), &cfg).expect("slic failed");
+        let _labels = slic(&input, Some(&depth_map), None, &cfg).expect("slic failed");
         println!("slic (K={}): {:.1}ms", k, t0.elapsed().as_secs_f32() * 1000.0);
     }
 }

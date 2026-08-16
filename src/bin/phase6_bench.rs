@@ -27,7 +27,7 @@ fn main() {
         let image = test_image(w, h);
         let depth = depth_map(w, h);
         let edge = edge_map(w, h);
-        let slic = pixelforge::processing::slic::slic(&image, Some(&depth), &SlicConfig::default())
+        let slic = pixelforge::processing::slic::slic(&image, Some(&depth), None, &SlicConfig::default())
             .expect("SLIC should not fail");
         // Simulate MLResults WITH filtered_depth_map cache (Phase 6 P1)
         let filtered = pixelforge::processing::median_filter_5x5(&depth, w, h);
@@ -35,6 +35,7 @@ fn main() {
             depth_map: Some(depth),
             filtered_depth_map: Some(filtered),
             edge_map: Some(edge),
+            segmentation_mask: None,
             slic_labels: Some(slic),
             slic_labels_k: Some(5),
             slic_labels_s: Some(0.5),
